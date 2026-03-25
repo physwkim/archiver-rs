@@ -58,6 +58,7 @@ pub fn build_router(state: AppState) -> Router {
     }
 
     router
+        .layer(middleware::from_fn(http_metrics))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -75,6 +76,22 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
         }
         None => (StatusCode::NOT_FOUND, "Metrics not enabled").into_response(),
     }
+}
+
+/// Middleware that records HTTP request metrics.
+async fn http_metrics(
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let start = std::time::Instant::now();
+    let resp = next.run(request).await;
+    let duration = start.elapsed().as_secs_f64();
+    let status = resp.status().as_u16().to_string();
+    metrics::counter!("archiver_http_requests_total", "method" => method.clone(), "path" => path.clone(), "status" => status).increment(1);
+    metrics::histogram!("archiver_http_request_duration_seconds", "method" => method, "path" => path).record(duration);
+    resp
 }
 
 /// Middleware that checks API keys on mgmt write endpoints.

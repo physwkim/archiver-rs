@@ -19,22 +19,25 @@ pub enum PvStatus {
     Active,
     Paused,
     Error,
+    Inactive,
 }
 
 impl PvStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::Paused => "paused",
             Self::Error => "error",
+            Self::Inactive => "inactive",
         }
     }
 
-    fn from_str(s: &str) -> Self {
+    pub fn from_str(s: &str) -> Self {
         match s {
             "active" => Self::Active,
             "paused" => Self::Paused,
             "error" => Self::Error,
+            "inactive" => Self::Inactive,
             _ => Self::Active,
         }
     }
@@ -331,6 +334,45 @@ impl PvRegistry {
             params![prec, egu, now, pv_name],
         )?;
         Ok(rows > 0)
+    }
+
+    /// Import a PV with all fields in a single SQL operation.
+    /// Used during config import to atomically set status, created_at, and metadata.
+    pub fn import_pv(
+        &self,
+        pv_name: &str,
+        dbr_type: ArchDbType,
+        sample_mode: &SampleMode,
+        element_count: i32,
+        status: PvStatus,
+        created_at: Option<&str>,
+        prec: Option<&str>,
+        egu: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let (mode_str, period) = sample_mode.to_db();
+        let created = created_at.unwrap_or(&now);
+
+        conn.execute(
+            "INSERT OR REPLACE INTO pv_info
+             (pv_name, dbr_type, sample_mode, sample_period, status, element_count,
+              created_at, updated_at, prec, egu)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                pv_name,
+                dbr_type as i32,
+                mode_str,
+                period,
+                status.as_str(),
+                element_count,
+                created,
+                now,
+                prec,
+                egu,
+            ],
+        )?;
+        Ok(())
     }
 
     /// Get all PV records (for export).

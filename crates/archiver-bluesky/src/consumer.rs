@@ -12,7 +12,7 @@ use archiver_core::registry::{PvRegistry, SampleMode};
 use archiver_core::storage::traits::{AppendMeta, StoragePlugin};
 use archiver_core::types::{ArchDbType, ArchiverValue};
 
-use crate::documents::BlueskyDocument;
+use crate::documents::{BlueskyDocument, TypedDocument};
 use crate::pv_mapper::PvMapper;
 
 /// Kafka consumer that reads Bluesky documents and converts them to PV samples.
@@ -131,6 +131,13 @@ impl BlueskyConsumer {
             }
         };
 
+        // Extract descriptor UID for event metadata lookup.
+        let event_descriptor_uid = match doc.parse() {
+            Some(TypedDocument::Event(ref e)) => Some(e.descriptor.clone()),
+            Some(TypedDocument::EventPage(ref p)) => Some(p.descriptor.clone()),
+            _ => None,
+        };
+
         let samples = mapper.map_document(&doc);
 
         for (pv_name, dbr_type, sample) in samples {
@@ -138,9 +145,37 @@ impl BlueskyConsumer {
             self.ensure_registered(&pv_name, dbr_type, registered_pvs);
 
             let element_count = element_count_for_value(&sample.value);
+
+            // Build headers from DataKey metadata if available.
+            let mut headers = Vec::new();
+            if let Some(ref desc_uid) = event_descriptor_uid {
+                // Extract the data key name from the PV name suffix.
+                // PV names are like EXP:BL:motor:name:readback or EXP:BL:det:name:value
+                let key_name = pv_name
+                    .rsplit(':')
+                    .nth(1)
+                    .unwrap_or("");
+                if let Some(meta) = mapper.get_data_key_meta(desc_uid, key_name) {
+                    if let Some(ref units) = meta.units {
+                        headers.push(("EGU".to_string(), units.clone()));
+                        // Also update registry metadata (once per PV).
+                        if registered_pvs.contains(&pv_name) {
+                            let _ = self.registry.update_metadata(
+                                &pv_name,
+                                meta.precision.as_ref().map(|p| p.to_string()).as_deref(),
+                                Some(units.as_str()),
+                            );
+                        }
+                    }
+                    if let Some(prec) = meta.precision {
+                        headers.push(("PREC".to_string(), prec.to_string()));
+                    }
+                }
+            }
+
             let meta = AppendMeta {
                 element_count: Some(element_count),
-                ..Default::default()
+                headers,
             };
             let ts = sample.timestamp;
             if let Err(e) = self

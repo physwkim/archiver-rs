@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use archiver_core::registry::{PvStatus, SampleMode};
 
+use crate::cluster::ClusterClient;
 use crate::pv_input::{parse_pv_list, PvListInput};
 use crate::AppState;
 
@@ -41,7 +42,7 @@ pub fn routes() -> Router<AppState> {
 
 // --- Shared types ---
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct BulkResult {
     #[serde(rename = "pvName")]
     pv_name: String,
@@ -146,6 +147,7 @@ async fn get_pv_status(
                 PvStatus::Active => "Being archived",
                 PvStatus::Paused => "Paused",
                 PvStatus::Error => "Error",
+                PvStatus::Inactive => "Inactive",
             };
             let sample_mode_str = match &record.sample_mode {
                 SampleMode::Monitor => "Monitor".to_string(),
@@ -187,7 +189,7 @@ async fn get_pv_status(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ArchivePvRequest {
     pv: Option<String>,
     #[serde(default)]
@@ -220,49 +222,167 @@ async fn archive_pv(
         }
     }
 
-    // Try as bulk PV list.
+    // Try as JSON array of ArchivePvRequest objects (with per-PV appliance + sampling).
+    if let Ok(reqs) = serde_json::from_str::<Vec<ArchivePvRequest>>(&body_str) {
+        let reqs: Vec<_> = reqs.into_iter().filter(|r| r.pv.is_some()).collect();
+        if !reqs.is_empty() {
+            return bulk_archive_requests(&state, &reqs, &headers).await;
+        }
+    }
+
+    // Fallback: plain PV list (string array or newline-delimited).
     let pvs = parse_pv_list(&body_str);
     if pvs.is_empty() {
         return (StatusCode::BAD_REQUEST, "No PVs specified").into_response();
     }
+    let reqs: Vec<_> = pvs
+        .into_iter()
+        .map(|pv| ArchivePvRequest {
+            pv: Some(pv),
+            sampling_period: None,
+            sampling_method: None,
+            appliance: None,
+        })
+        .collect();
+    bulk_archive_requests(&state, &reqs, &headers).await
+}
 
+/// Process a batch of archive requests, distributing to peers by appliance.
+async fn bulk_archive_requests(
+    state: &AppState,
+    reqs: &[ArchivePvRequest],
+    headers: &HeaderMap,
+) -> Response {
     let is_proxied = headers.get("X-Archiver-Proxied").is_some();
-    let mut results = Vec::with_capacity(pvs.len());
+    let mut results = Vec::with_capacity(reqs.len());
 
-    // In cluster mode, check for duplicates before archiving locally.
-    if !is_proxied {
-        if let Some(ref cluster) = state.cluster {
-            for pv in &pvs {
-                if cluster.resolve_peer(pv).await.is_some() {
-                    results.push(BulkResult {
-                        pv_name: pv.clone(),
-                        status: "Already archived on peer".to_string(),
-                    });
+    // Group requests by target: None = local, Some(name) = peer appliance.
+    let mut local_reqs = Vec::new();
+    // peer name → Vec<(pv, ArchivePvRequest)>
+    let mut peer_batches: std::collections::HashMap<String, Vec<&ArchivePvRequest>> =
+        std::collections::HashMap::new();
+
+    for req in reqs {
+        let pv = req.pv.as_deref().unwrap();
+
+        // Determine target appliance.
+        let target = if is_proxied {
+            // Proxied request — always handle locally, skip cluster logic.
+            None
+        } else if let Some(ref target_name) = req.appliance {
+            if let Some(ref cluster) = state.cluster {
+                if target_name != &cluster.identity().name {
+                    Some(target_name.clone())
                 } else {
-                    let status = match state.channel_mgr.archive_pv(pv, &SampleMode::Monitor).await {
-                        Ok(()) => "Archive request submitted".to_string(),
-                        Err(e) => e.to_string(),
-                    };
-                    results.push(BulkResult {
-                        pv_name: pv.clone(),
-                        status,
-                    });
+                    None // targeting self
                 }
+            } else {
+                None // no cluster
             }
-            return axum::Json(results).into_response();
+        } else if let Some(ref cluster) = state.cluster {
+            // No explicit appliance: check if already archived on a peer.
+            if cluster.resolve_peer(pv).await.is_some() {
+                results.push(BulkResult {
+                    pv_name: pv.to_string(),
+                    status: "Already archived on peer".to_string(),
+                });
+                continue;
+            }
+            None
+        } else {
+            None
+        };
+
+        match target {
+            Some(peer_name) => {
+                peer_batches
+                    .entry(peer_name)
+                    .or_default()
+                    .push(req);
+            }
+            None => local_reqs.push(req),
         }
     }
 
-    for pv in &pvs {
-        let status = match state.channel_mgr.archive_pv(pv, &SampleMode::Monitor).await {
+    // Archive local PVs.
+    for req in &local_reqs {
+        let pv = req.pv.as_deref().unwrap();
+        let sample_mode = parse_sample_mode(req.sampling_method.as_deref(), req.sampling_period);
+        let status = match state.channel_mgr.archive_pv(pv, &sample_mode).await {
             Ok(()) => "Archive request submitted".to_string(),
             Err(e) => e.to_string(),
         };
         results.push(BulkResult {
-            pv_name: pv.clone(),
+            pv_name: pv.to_string(),
             status,
         });
     }
+
+    // Forward batches to peers.
+    if let Some(ref cluster) = state.cluster {
+        for (peer_name, batch) in &peer_batches {
+            let peer = match cluster.find_peer_by_name(peer_name) {
+                Some(p) => p,
+                None => {
+                    for req in batch {
+                        results.push(BulkResult {
+                            pv_name: req.pv.clone().unwrap_or_default(),
+                            status: format!("Appliance '{peer_name}' not found in cluster"),
+                        });
+                    }
+                    continue;
+                }
+            };
+
+            // Build JSON array body for the peer.
+            let peer_body: Vec<serde_json::Value> = batch
+                .iter()
+                .map(|req| {
+                    let mut obj = serde_json::json!({ "pv": req.pv });
+                    let sm = parse_sample_mode(req.sampling_method.as_deref(), req.sampling_period);
+                    if let SampleMode::Scan { period_secs } = sm {
+                        obj["sampling_method"] = serde_json::json!("scan");
+                        obj["sampling_period"] = serde_json::json!(period_secs);
+                    }
+                    obj
+                })
+                .collect();
+
+            let bytes = axum::body::Bytes::from(serde_json::to_string(&peer_body).unwrap());
+            match cluster.proxy_mgmt_post(&peer.mgmt_url, "archivePV", bytes).await {
+                Ok(resp) => {
+                    // Try to parse peer response as BulkResult array.
+                    let status_code = resp.status();
+                    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    if let Ok(peer_results) =
+                        serde_json::from_slice::<Vec<BulkResult>>(&body_bytes)
+                    {
+                        results.extend(peer_results);
+                    } else {
+                        // Peer returned non-array response; report per-PV.
+                        let msg = String::from_utf8_lossy(&body_bytes);
+                        for req in batch {
+                            results.push(BulkResult {
+                                pv_name: req.pv.clone().unwrap_or_default(),
+                                status: format!("Forwarded to {peer_name} ({status_code}): {msg}"),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    for req in batch {
+                        results.push(BulkResult {
+                            pv_name: req.pv.clone().unwrap_or_default(),
+                            status: format!("Failed to forward to {peer_name}: {e}"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     axum::Json(results).into_response()
 }
 
@@ -403,6 +523,48 @@ async fn resume_archiving_pv(
     }
 }
 
+// --- Bulk peer forwarding helper ---
+
+/// Forward a batch of PV names to a peer and parse the response as Vec<BulkResult>.
+async fn forward_pv_batch_to_peer(
+    cluster: &ClusterClient,
+    mgmt_url: &str,
+    endpoint: &str,
+    pv_names: &[String],
+) -> Vec<BulkResult> {
+    let body = pv_names.join("\n");
+    match cluster
+        .proxy_mgmt_post(mgmt_url, endpoint, body.into())
+        .await
+    {
+        Ok(resp) => {
+            let status_code = resp.status();
+            let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap_or_default();
+            if let Ok(peer_results) = serde_json::from_slice::<Vec<BulkResult>>(&body_bytes) {
+                peer_results
+            } else {
+                let msg = String::from_utf8_lossy(&body_bytes);
+                pv_names
+                    .iter()
+                    .map(|pv| BulkResult {
+                        pv_name: pv.clone(),
+                        status: format!("Peer response ({status_code}): {msg}"),
+                    })
+                    .collect()
+            }
+        }
+        Err(e) => pv_names
+            .iter()
+            .map(|pv| BulkResult {
+                pv_name: pv.clone(),
+                status: format!("Peer connection failed: {e}"),
+            })
+            .collect(),
+    }
+}
+
 // --- Bulk pause/resume (POST with body) ---
 
 async fn bulk_pause_archiving_pv(
@@ -432,23 +594,14 @@ async fn bulk_pause_archiving_pv(
                 }
             }
 
-            // Dispatch remote batches.
+            // Dispatch remote batches and parse responses.
             let futs: Vec<_> = remote_batches
                 .into_iter()
                 .map(|(mgmt_url, batch)| {
-                    let body = batch.join("\n");
                     let cluster = cluster.clone();
                     async move {
-                        let _ = cluster
-                            .proxy_mgmt_post(&mgmt_url, "pauseArchivingPV", body.into())
-                            .await;
-                        batch
-                            .into_iter()
-                            .map(|pv| BulkResult {
-                                pv_name: pv,
-                                status: "Forwarded to peer".to_string(),
-                            })
-                            .collect::<Vec<_>>()
+                        forward_pv_batch_to_peer(&cluster, &mgmt_url, "pauseArchivingPV", &batch)
+                            .await
                     }
                 })
                 .collect();
@@ -515,19 +668,10 @@ async fn bulk_resume_archiving_pv(
             let futs: Vec<_> = remote_batches
                 .into_iter()
                 .map(|(mgmt_url, batch)| {
-                    let body = batch.join("\n");
                     let cluster = cluster.clone();
                     async move {
-                        let _ = cluster
-                            .proxy_mgmt_post(&mgmt_url, "resumeArchivingPV", body.into())
-                            .await;
-                        batch
-                            .into_iter()
-                            .map(|pv| BulkResult {
-                                pv_name: pv,
-                                status: "Forwarded to peer".to_string(),
-                            })
-                            .collect::<Vec<_>>()
+                        forward_pv_batch_to_peer(&cluster, &mgmt_url, "resumeArchivingPV", &batch)
+                            .await
                     }
                 })
                 .collect();
@@ -811,6 +955,7 @@ fn record_to_report_entry(r: archiver_core::registry::PvRecord) -> ReportEntry {
         PvStatus::Active => "Being archived",
         PvStatus::Paused => "Paused",
         PvStatus::Error => "Error",
+        PvStatus::Inactive => "Inactive",
     };
     ReportEntry {
         pv_name: r.pv_name,
@@ -869,6 +1014,7 @@ fn record_to_type_info(r: &archiver_core::registry::PvRecord) -> PvTypeInfoRespo
         PvStatus::Active => "Being archived",
         PvStatus::Paused => "Paused",
         PvStatus::Error => "Error",
+        PvStatus::Inactive => "Inactive",
     };
     PvTypeInfoResponse {
         pv_name: r.pv_name.clone(),
@@ -941,8 +1087,8 @@ async fn abort_archiving_pv(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 
-    // Destroy the PV handle but keep data.
-    if let Err(e) = state.channel_mgr.destroy_pv(&params.pv) {
+    // Stop the PV (channel destroyed, registry status → Inactive, data retained).
+    if let Err(e) = state.channel_mgr.stop_pv(&params.pv) {
         let msg = format!("Failed to abort archiving PV {}: {e}", params.pv);
         return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
     }
@@ -967,6 +1113,10 @@ struct ExportRecord {
     prec: Option<String>,
     #[serde(rename = "EGU", skip_serializing_if = "Option::is_none")]
     egu: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(rename = "createdAt", skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
 }
 
 async fn export_config(State(state): State<AppState>) -> Response {
@@ -982,6 +1132,7 @@ async fn export_config(State(state): State<AppState>) -> Response {
                 SampleMode::Monitor => ("Monitor".to_string(), 0.0),
                 SampleMode::Scan { period_secs } => ("Scan".to_string(), *period_secs),
             };
+            let status_str = r.status.as_str().to_string();
             ExportRecord {
                 pv_name: r.pv_name,
                 dbr_type: r.dbr_type as i32,
@@ -990,6 +1141,8 @@ async fn export_config(State(state): State<AppState>) -> Response {
                 element_count: r.element_count,
                 prec: r.prec,
                 egu: r.egu,
+                status: Some(status_str),
+                created_at: Some(r.created_at.to_rfc3339()),
             }
         })
         .collect();
@@ -1016,18 +1169,21 @@ async fn import_config(
             Some(r.sampling_method.as_str()),
             if r.sampling_period > 0.0 { Some(r.sampling_period) } else { None },
         );
-        match state.registry.register_pv(&r.pv_name, dbr_type, &sample_mode, r.element_count) {
-            Ok(()) => {
-                // Update metadata if present.
-                if r.prec.is_some() || r.egu.is_some() {
-                    let _ = state.registry.update_metadata(
-                        &r.pv_name,
-                        r.prec.as_deref(),
-                        r.egu.as_deref(),
-                    );
-                }
-                imported += 1;
-            }
+        let status = r.status.as_deref()
+            .map(PvStatus::from_str)
+            .unwrap_or(PvStatus::Active);
+
+        match state.registry.import_pv(
+            &r.pv_name,
+            dbr_type,
+            &sample_mode,
+            r.element_count,
+            status,
+            r.created_at.as_deref(),
+            r.prec.as_deref(),
+            r.egu.as_deref(),
+        ) {
+            Ok(()) => imported += 1,
             Err(e) => errors.push(format!("{}: {e}", r.pv_name)),
         }
     }

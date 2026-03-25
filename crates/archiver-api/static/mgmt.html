@@ -9,6 +9,7 @@
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #333; }
   .header { background: #1a237e; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
   .header h1 { font-size: 20px; font-weight: 500; }
+  .header .version { font-size: 12px; opacity: 0.7; }
   .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
   .tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
   .tab { padding: 8px 16px; border: 1px solid #ddd; background: white; cursor: pointer; border-radius: 4px 4px 0 0; font-size: 14px; }
@@ -26,6 +27,7 @@
   .btn-danger:hover { background: #d32f2f; }
   .btn-secondary { background: #757575; color: white; }
   .btn-secondary:hover { background: #616161; }
+  .btn-sm { padding: 4px 8px; font-size: 12px; }
   table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
   th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; }
   th { background: #fafafa; font-weight: 600; position: sticky; top: 0; }
@@ -34,6 +36,7 @@
   .status-active { background: #e8f5e9; color: #2e7d32; }
   .status-paused { background: #fff3e0; color: #e65100; }
   .status-error { background: #ffebee; color: #c62828; }
+  .status-inactive { background: #e0e0e0; color: #616161; }
   .status-disconnected { background: #fce4ec; color: #880e4f; }
   .stats { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
   .stat-card { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 16px 24px; text-align: center; min-width: 120px; }
@@ -43,13 +46,20 @@
   .msg-ok { background: #e8f5e9; color: #2e7d32; }
   .msg-err { background: #ffebee; color: #c62828; }
   .loading { color: #666; font-style: italic; }
-  #results { margin-top: 12px; }
+  .modal-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.4); z-index:100; }
+  .modal { background:white; border-radius:8px; max-width:600px; margin:60px auto; padding:24px; max-height:80vh; overflow-y:auto; }
+  .modal h2 { font-size:18px; margin-bottom:16px; }
+  .modal .detail-row { display:flex; padding:6px 0; border-bottom:1px solid #f0f0f0; }
+  .modal .detail-label { font-weight:600; width:160px; flex-shrink:0; color:#555; }
+  .modal .detail-value { flex:1; }
+  .modal .close-btn { margin-top:16px; }
 </style>
 </head>
 <body>
 
 <div class="header">
   <h1>EPICS Archiver Appliance - Management Console</h1>
+  <span class="version" id="version-info"></span>
 </div>
 
 <div class="container">
@@ -61,6 +71,7 @@
     <div class="tab" data-tab="archive">Archive PV</div>
     <div class="tab" data-tab="bulk">Bulk Operations</div>
     <div class="tab" data-tab="reports">Reports</div>
+    <div class="tab" data-tab="config">Config</div>
     <div class="tab" data-tab="cluster">Cluster</div>
   </div>
 
@@ -122,10 +133,37 @@
     <div id="report-results"></div>
   </div>
 
+  <!-- Config Export/Import -->
+  <div class="panel" id="panel-config">
+    <h3 style="margin-bottom:12px">Export Configuration</h3>
+    <div class="form-row">
+      <button class="btn-primary" onclick="exportConfig()">Export as JSON</button>
+      <button class="btn-secondary" onclick="downloadConfig()">Download File</button>
+    </div>
+    <div id="export-results"></div>
+
+    <h3 style="margin:20px 0 12px">Import Configuration</h3>
+    <textarea id="import-json" placeholder="Paste exported JSON here or use the file picker below..."></textarea>
+    <div class="form-row" style="margin-top:8px">
+      <input type="file" id="import-file" accept=".json" onchange="loadImportFile(this)" style="font-size:14px" />
+      <button class="btn-primary" onclick="importConfig()">Import</button>
+    </div>
+    <div id="import-msg"></div>
+  </div>
+
   <!-- Cluster -->
   <div class="panel" id="panel-cluster">
     <button class="btn-primary" onclick="loadClusterInfo()">Refresh</button>
     <div id="cluster-results"><p style="color:#666">Click Refresh to load cluster information.</p></div>
+  </div>
+</div>
+
+<!-- PV Detail Modal -->
+<div class="modal-overlay" id="pv-detail-modal" onclick="if(event.target===this)closePvDetail()">
+  <div class="modal">
+    <h2 id="pv-detail-title">PV Details</h2>
+    <div id="pv-detail-content"></div>
+    <button class="btn-secondary close-btn" onclick="closePvDetail()">Close</button>
   </div>
 </div>
 
@@ -148,8 +186,25 @@ async function api(path, opts) {
 }
 
 function statusBadge(s) {
-  const cls = s && s.includes('archived') ? 'active' : s === 'Paused' ? 'paused' : s === 'Error' ? 'error' : 'disconnected';
+  const map = {
+    'Being archived': 'active',
+    'Paused': 'paused',
+    'Error': 'error',
+    'Inactive': 'inactive',
+    'Never connected': 'disconnected',
+    'Disconnected': 'disconnected',
+  };
+  const cls = map[s] || 'disconnected';
   return `<span class="status-badge status-${cls}">${s || 'Unknown'}</span>`;
+}
+
+// Version
+async function loadVersion() {
+  try {
+    const r = await api('getVersions');
+    const d = await r.json();
+    document.getElementById('version-info').textContent = `v${d.version}`;
+  } catch(e) { console.error(e); }
 }
 
 // Stats
@@ -165,7 +220,7 @@ async function loadStats() {
   } catch(e) { console.error(e); }
 }
 
-// PV List
+// PV List — fetch status for each PV to show in table
 async function loadAllPVs() {
   const el = document.getElementById('pv-list-results');
   el.innerHTML = '<p class="loading">Loading...</p>';
@@ -174,25 +229,88 @@ async function loadAllPVs() {
     const r = await api('getAllPVs' + clusterFlag);
     const pvs = await r.json();
     if (!pvs.length) { el.innerHTML = '<p>No PVs found.</p>'; return; }
-    let html = '<div class="table-wrap"><table><tr><th>PV Name</th><th>Actions</th></tr>';
+
+    // Render table with status column (fetched in parallel).
+    let html = '<div class="table-wrap"><table><tr><th>PV Name</th><th>Status</th><th>Actions</th></tr>';
     for (const pv of pvs) {
-      html += `<tr><td>${esc(pv)}</td><td>
-        <button class="btn-primary" onclick="showStatus('${esc(pv)}')" style="padding:4px 8px;font-size:12px">Status</button>
-        <button class="btn-secondary" onclick="pausePV('${esc(pv)}')" style="padding:4px 8px;font-size:12px">Pause</button>
-        <button class="btn-secondary" onclick="resumePV('${esc(pv)}')" style="padding:4px 8px;font-size:12px">Resume</button>
+      html += `<tr id="pvrow-${css(pv)}"><td>${esc(pv)}</td><td class="pv-status" data-pv="${esc(pv)}"><span class="loading">...</span></td><td>
+        <button class="btn-primary btn-sm" onclick="showPvDetail('${esc(pv)}')">Details</button>
+        <button class="btn-secondary btn-sm" onclick="pausePV('${esc(pv)}')">Pause</button>
+        <button class="btn-secondary btn-sm" onclick="resumePV('${esc(pv)}')">Resume</button>
+        <button class="btn-danger btn-sm" onclick="deletePV('${esc(pv)}')">Delete</button>
       </td></tr>`;
     }
     html += '</table></div>';
     el.innerHTML = html;
+
+    // Fetch statuses in parallel (batched).
+    fetchPvStatuses(pvs);
   } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
 }
 
-async function showStatus(pv) {
+async function fetchPvStatuses(pvs) {
+  const batchSize = 20;
+  for (let i = 0; i < pvs.length; i += batchSize) {
+    const batch = pvs.slice(i, i + batchSize);
+    const promises = batch.map(pv =>
+      api('getPVStatus?pv=' + encodeURIComponent(pv))
+        .then(r => r.json())
+        .then(d => ({ pv, status: d.status }))
+        .catch(() => ({ pv, status: 'Unknown' }))
+    );
+    const results = await Promise.all(promises);
+    for (const { pv, status } of results) {
+      const cells = document.querySelectorAll(`.pv-status[data-pv="${css(pv)}"]`);
+      cells.forEach(cell => { cell.innerHTML = statusBadge(status); });
+    }
+  }
+}
+
+// PV Detail Modal
+async function showPvDetail(pv) {
+  const modal = document.getElementById('pv-detail-modal');
+  const title = document.getElementById('pv-detail-title');
+  const content = document.getElementById('pv-detail-content');
+  title.textContent = pv;
+  content.innerHTML = '<p class="loading">Loading details...</p>';
+  modal.style.display = 'block';
+
   try {
-    const r = await api('getPVStatus?pv=' + encodeURIComponent(pv));
+    const r = await api('getPVDetails?pv=' + encodeURIComponent(pv));
     const d = await r.json();
-    alert(JSON.stringify(d, null, 2));
-  } catch(e) { alert('Error: ' + e); }
+    let html = '';
+    const fields = [
+      ['Status', statusBadge(d.status)],
+      ['DBR Type', d.DBRType],
+      ['Sampling Method', d.samplingMethod],
+      ['Sampling Period', d.samplingPeriod],
+      ['Element Count', d.elementCount],
+      ['PREC', d.PREC || '-'],
+      ['EGU', d.EGU || '-'],
+      ['Connected', d.isConnected ? 'Yes' : 'No'],
+      ['Connected Since', d.connectedSince || '-'],
+      ['Created At', d.createdAt || '-'],
+    ];
+    for (const [label, value] of fields) {
+      html += `<div class="detail-row"><div class="detail-label">${label}</div><div class="detail-value">${value}</div></div>`;
+    }
+
+    // Action buttons
+    html += '<div style="margin-top:16px;display:flex;gap:8px">';
+    html += `<button class="btn-secondary btn-sm" onclick="pausePV('${esc(pv)}');closePvDetail()">Pause</button>`;
+    html += `<button class="btn-secondary btn-sm" onclick="resumePV('${esc(pv)}');closePvDetail()">Resume</button>`;
+    html += `<button class="btn-secondary btn-sm" onclick="abortPV('${esc(pv)}');closePvDetail()">Abort</button>`;
+    html += `<button class="btn-danger btn-sm" onclick="deletePV('${esc(pv)}');closePvDetail()">Delete</button>`;
+    html += '</div>';
+
+    content.innerHTML = html;
+  } catch(e) {
+    content.innerHTML = `<div class="msg msg-err">${e}</div>`;
+  }
+}
+
+function closePvDetail() {
+  document.getElementById('pv-detail-modal').style.display = 'none';
 }
 
 async function pausePV(pv) {
@@ -200,6 +318,7 @@ async function pausePV(pv) {
   const t = await r.text();
   alert(t);
   loadStats();
+  loadAllPVs();
 }
 
 async function resumePV(pv) {
@@ -207,6 +326,28 @@ async function resumePV(pv) {
   const t = await r.text();
   alert(t);
   loadStats();
+  loadAllPVs();
+}
+
+async function deletePV(pv) {
+  if (!confirm('Delete PV ' + pv + '? This removes it from the registry.')) return;
+  const deleteData = confirm('Also delete archived data files?');
+  let qs = 'pv=' + encodeURIComponent(pv);
+  if (deleteData) qs += '&deleteData=true';
+  const r = await api('deletePV?' + qs);
+  const t = await r.text();
+  alert(t);
+  loadStats();
+  loadAllPVs();
+}
+
+async function abortPV(pv) {
+  if (!confirm('Abort archiving ' + pv + '? Data is retained but archiving stops.')) return;
+  const r = await api('abortArchivingPV?pv=' + encodeURIComponent(pv));
+  const t = await r.text();
+  alert(t);
+  loadStats();
+  loadAllPVs();
 }
 
 // Search
@@ -220,8 +361,10 @@ async function searchPVs() {
     const r = await api('getMatchingPVs?pv=' + encodeURIComponent(pattern) + clusterFlag);
     const pvs = await r.json();
     if (!pvs.length) { el.innerHTML = '<p>No matches.</p>'; return; }
-    let html = '<div class="table-wrap"><table><tr><th>PV Name</th></tr>';
-    for (const pv of pvs) html += `<tr><td>${esc(pv)}</td></tr>`;
+    let html = '<div class="table-wrap"><table><tr><th>PV Name</th><th>Actions</th></tr>';
+    for (const pv of pvs) {
+      html += `<tr><td>${esc(pv)}</td><td><button class="btn-primary btn-sm" onclick="showPvDetail('${esc(pv)}')">Details</button></td></tr>`;
+    }
     html += '</table></div>';
     el.innerHTML = html;
   } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
@@ -289,6 +432,68 @@ async function loadReport(endpoint, title) {
   } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
 }
 
+// Config Export/Import
+async function exportConfig() {
+  const el = document.getElementById('export-results');
+  el.innerHTML = '<p class="loading">Exporting...</p>';
+  try {
+    const r = await api('exportConfig');
+    const data = await r.json();
+    el.innerHTML = `<div class="msg msg-ok">Exported ${data.length} PVs</div>
+      <textarea style="margin-top:8px" readonly>${esc(JSON.stringify(data, null, 2))}</textarea>`;
+  } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
+}
+
+async function downloadConfig() {
+  try {
+    const r = await api('exportConfig');
+    const data = await r.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'archiver-config.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch(e) { alert('Export failed: ' + e); }
+}
+
+function loadImportFile(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => { document.getElementById('import-json').value = reader.result; };
+  reader.readAsText(file);
+}
+
+async function importConfig() {
+  const text = document.getElementById('import-json').value.trim();
+  const el = document.getElementById('import-msg');
+  if (!text) { el.innerHTML = '<div class="msg msg-err">Paste or load JSON first</div>'; return; }
+  try {
+    JSON.parse(text); // validate
+  } catch(e) { el.innerHTML = '<div class="msg msg-err">Invalid JSON: ' + esc(e.message) + '</div>'; return; }
+  el.innerHTML = '<p class="loading">Importing...</p>';
+  try {
+    const r = await api('importConfig', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: text,
+    });
+    const d = await r.json();
+    let html = `<div class="msg ${d.errors && d.errors.length ? 'msg-err' : 'msg-ok'}">
+      Imported ${d.imported} of ${d.total} PVs`;
+    if (d.errors && d.errors.length) {
+      html += '<br>Errors:<ul>';
+      for (const e of d.errors) html += `<li>${esc(e)}</li>`;
+      html += '</ul>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+    loadStats();
+  } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
+}
+
 // Cluster
 async function loadClusterInfo() {
   const el = document.getElementById('cluster-results');
@@ -307,9 +512,11 @@ async function loadClusterInfo() {
   } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
 }
 
-function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function esc(s) { if (s == null) return ''; const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }
+function css(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
 
 // Init
+loadVersion();
 loadStats();
 loadAllPVs();
 </script>

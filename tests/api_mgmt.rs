@@ -357,8 +357,9 @@ async fn test_abort_archiving_pv() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    // PV should be removed from registry after abort.
-    assert!(reg.get_pv("TEST:Counter").unwrap().is_none());
+    // PV should remain in registry with Inactive status after abort.
+    let record = reg.get_pv("TEST:Counter").unwrap().expect("PV should still exist");
+    assert_eq!(record.status, archiver_core::registry::PvStatus::Inactive);
 }
 
 #[tokio::test]
@@ -380,6 +381,8 @@ async fn test_export_import_roundtrip() {
 
     // Update metadata for one PV.
     reg.update_metadata("SIM:Sine", Some("3"), Some("mm")).unwrap();
+    // Pause one PV to test status preservation.
+    reg.set_status("SIM:Cosine", PvStatus::Paused).unwrap();
 
     // Export.
     let resp = app
@@ -397,6 +400,11 @@ async fn test_export_import_roundtrip() {
     assert_eq!(sine["PREC"], "3");
     assert_eq!(sine["EGU"], "mm");
 
+    // Verify status and created_at are exported.
+    let cosine = export_arr.iter().find(|r| r["pvName"] == "SIM:Cosine").unwrap();
+    assert_eq!(cosine["status"], "paused");
+    assert!(cosine["createdAt"].is_string());
+
     // Import into a fresh app.
     let (app2, _dir2) = build_test_app().await;
     let import_body = serde_json::to_string(&export_arr).unwrap();
@@ -413,6 +421,69 @@ async fn test_export_import_roundtrip() {
 }
 
 #[tokio::test]
+async fn test_export_import_preserves_status() {
+    use axum::body::Body;
+    use axum::http::Request;
+
+    let (app, reg, _dir) = build_test_app_with_pvs().await;
+    reg.set_status("SIM:Cosine", PvStatus::Paused).unwrap();
+
+    // Export.
+    let resp = app
+        .clone()
+        .oneshot(get_request("/mgmt/bpl/exportConfig"))
+        .await
+        .unwrap();
+    let export_json = body_to_json(resp.into_body()).await;
+    let export_arr = export_json.as_array().unwrap();
+
+    // Import into a fresh app and verify status is preserved.
+    let dir2 = tempfile::tempdir().unwrap();
+    let storage2 = Arc::new(PlainPbStoragePlugin::new(
+        "sts",
+        dir2.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    ));
+    let registry2 = Arc::new(PvRegistry::in_memory().unwrap());
+    let (channel_mgr2, _rx2) = ChannelManager::new(storage2.clone(), registry2.clone(), None)
+        .await
+        .unwrap();
+    let state2 = AppState {
+        storage: storage2,
+        channel_mgr: Arc::new(channel_mgr2),
+        registry: registry2.clone(),
+        cluster: None,
+        api_keys: None,
+        metrics_handle: None,
+    };
+    let app2 = build_router(state2);
+
+    let import_body = serde_json::to_string(&export_arr).unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/importConfig")
+        .header("content-type", "application/json")
+        .body(Body::from(import_body))
+        .unwrap();
+    let resp = app2.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify SIM:Cosine is paused in the new registry.
+    let record = registry2.get_pv("SIM:Cosine").unwrap().unwrap();
+    assert_eq!(record.status, PvStatus::Paused);
+
+    // Verify SIM:Sine is still active.
+    let record = registry2.get_pv("SIM:Sine").unwrap().unwrap();
+    assert_eq!(record.status, PvStatus::Active);
+
+    // Verify created_at is preserved (should match original, not import time).
+    let orig_sine = export_arr.iter().find(|r| r["pvName"] == "SIM:Sine").unwrap();
+    let orig_created = orig_sine["createdAt"].as_str().unwrap();
+    let imported_created = record.created_at.to_rfc3339();
+    assert_eq!(orig_created, imported_created, "created_at should be preserved across export/import");
+}
+
+#[tokio::test]
 async fn test_export_empty() {
     let (app, _dir) = build_test_app().await;
     let resp = app
@@ -422,6 +493,88 @@ async fn test_export_empty() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_to_json(resp.into_body()).await;
     assert_eq!(json, serde_json::json!([]));
+}
+
+// --- R5: Auth middleware tests ---
+
+async fn build_test_app_with_auth() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(PlainPbStoragePlugin::new(
+        "sts",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    ));
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry
+        .register_pv("SIM:Sine", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
+        .await
+        .unwrap();
+    let state = AppState {
+        storage,
+        channel_mgr: Arc::new(channel_mgr),
+        registry,
+        cluster: None,
+        api_keys: Some(vec!["test-secret-key".to_string()]),
+        metrics_handle: None,
+    };
+    (build_router(state), dir)
+}
+
+#[tokio::test]
+async fn test_auth_blocks_write_without_key() {
+    let (app, _dir) = build_test_app_with_auth().await;
+    // POST archivePV without API key should be rejected.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/archivePV")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"pv":"NEW:PV"}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_auth_allows_write_with_valid_key() {
+    let (app, _dir) = build_test_app_with_auth().await;
+    // POST archivePV with valid Bearer token should succeed (or at least not 401).
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/archivePV")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test-secret-key")
+        .body(Body::from(r#"{"pv":"NEW:PV"}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    // Should not be 401 — the request is authenticated.
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_auth_allows_read_without_key() {
+    let (app, _dir) = build_test_app_with_auth().await;
+    // GET getAllPVs should work without API key (read-only exempt).
+    let resp = app
+        .oneshot(get_request("/mgmt/bpl/getAllPVs"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_auth_rejects_invalid_key() {
+    let (app, _dir) = build_test_app_with_auth().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/archivePV")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer wrong-key")
+        .body(Body::from(r#"{"pv":"NEW:PV"}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // --- G3: Metadata tests ---

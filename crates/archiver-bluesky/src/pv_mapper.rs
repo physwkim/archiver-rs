@@ -22,6 +22,13 @@ use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
 
 use crate::documents::{BlueskyDocument, EventDescriptor, TypedDocument};
 
+/// Metadata extracted from a Bluesky DataKey for a PV.
+#[derive(Debug, Clone)]
+pub struct DataKeyMeta {
+    pub units: Option<String>,
+    pub precision: Option<i32>,
+}
+
 /// Converts Bluesky documents to (pv_name, dbr_type, sample) tuples.
 pub struct PvMapper {
     beamline: String,
@@ -31,6 +38,8 @@ pub struct PvMapper {
     detector_names: HashMap<String, Vec<String>>,
     /// Map descriptor UID → descriptor info.
     descriptors: HashMap<String, DescriptorInfo>,
+    /// Map descriptor UID → per-key metadata (units, precision from DataKey).
+    descriptor_meta: HashMap<String, HashMap<String, DataKeyMeta>>,
     /// Current run UID.
     current_run_uid: Option<String>,
     /// Motor names from RunStart hints (applied to subsequent descriptors).
@@ -50,9 +59,17 @@ impl PvMapper {
             motor_names: HashMap::new(),
             detector_names: HashMap::new(),
             descriptors: HashMap::new(),
+            descriptor_meta: HashMap::new(),
             current_run_uid: None,
             run_motor_hints: HashSet::new(),
         }
+    }
+
+    /// Get the DataKey metadata (units, precision) for a PV key under a descriptor.
+    pub fn get_data_key_meta(&self, descriptor_uid: &str, key: &str) -> Option<&DataKeyMeta> {
+        self.descriptor_meta
+            .get(descriptor_uid)?
+            .get(key)
     }
 
     /// Convert a Bluesky document into a list of PV samples.
@@ -210,6 +227,23 @@ impl PvMapper {
             } else {
                 detectors.push(key.clone());
             }
+        }
+
+        // Store DataKey metadata (units, precision) for later use in events.
+        let mut meta_map = HashMap::new();
+        for (key, dk) in &desc.data_keys {
+            if dk.units.is_some() || dk.precision.is_some() {
+                meta_map.insert(
+                    key.clone(),
+                    DataKeyMeta {
+                        units: dk.units.clone(),
+                        precision: dk.precision,
+                    },
+                );
+            }
+        }
+        if !meta_map.is_empty() {
+            self.descriptor_meta.insert(desc.uid.clone(), meta_map);
         }
 
         self.motor_names.insert(desc.uid.clone(), motors);
@@ -407,6 +441,7 @@ impl PvMapper {
             self.descriptors.remove(&uid);
             self.motor_names.remove(&uid);
             self.detector_names.remove(&uid);
+            self.descriptor_meta.remove(&uid);
         }
         self.current_run_uid = None;
         self.run_motor_hints.clear();
@@ -477,6 +512,14 @@ fn json_value_to_archiver(val: &serde_json::Value) -> Option<(ArchDbType, Archiv
                 _ => None,
             }
         }
+        serde_json::Value::Bool(b) => Some((
+            ArchDbType::ScalarEnum,
+            ArchiverValue::ScalarEnum(if *b { 1 } else { 0 }),
+        )),
+        serde_json::Value::Object(_) => Some((
+            ArchDbType::ScalarString,
+            ArchiverValue::ScalarString(val.to_string()),
+        )),
         _ => None,
     }
 }
@@ -608,6 +651,82 @@ mod tests {
         let val = serde_json::json!([1, 2, 3]);
         let result = json_value_to_archiver(&val);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_json_value_to_archiver_bool() {
+        let val_true = serde_json::json!(true);
+        let result = json_value_to_archiver(&val_true);
+        assert!(result.is_some());
+        let (dbr, av) = result.unwrap();
+        assert_eq!(dbr, ArchDbType::ScalarEnum);
+        assert_eq!(av, ArchiverValue::ScalarEnum(1));
+
+        let val_false = serde_json::json!(false);
+        let result = json_value_to_archiver(&val_false);
+        assert!(result.is_some());
+        let (dbr, av) = result.unwrap();
+        assert_eq!(dbr, ArchDbType::ScalarEnum);
+        assert_eq!(av, ArchiverValue::ScalarEnum(0));
+    }
+
+    #[test]
+    fn test_json_value_to_archiver_object() {
+        let val = serde_json::json!({"key": "value", "num": 42});
+        let result = json_value_to_archiver(&val);
+        assert!(result.is_some());
+        let (dbr, av) = result.unwrap();
+        assert_eq!(dbr, ArchDbType::ScalarString);
+        // Should serialize the object to a JSON string.
+        if let ArchiverValue::ScalarString(s) = av {
+            assert!(s.contains("key"));
+            assert!(s.contains("value"));
+        } else {
+            panic!("Expected ScalarString");
+        }
+    }
+
+    #[test]
+    fn test_descriptor_metadata_extraction() {
+        let mut mapper = PvMapper::new("BL1");
+
+        // Start a run.
+        let start_doc = BlueskyDocument::Tuple(
+            "start".to_string(),
+            serde_json::json!({
+                "uid": "run-1",
+                "time": 1700000000.0,
+            }),
+        );
+        mapper.map_document(&start_doc);
+
+        // Send a descriptor with DataKey metadata.
+        let desc_doc = BlueskyDocument::Tuple(
+            "descriptor".to_string(),
+            serde_json::json!({
+                "uid": "desc-1",
+                "run_start": "run-1",
+                "time": 1700000001.0,
+                "data_keys": {
+                    "det1": {
+                        "source": "DET:det1",
+                        "dtype": "number",
+                        "shape": [],
+                        "units": "counts",
+                        "precision": 3
+                    }
+                },
+                "configuration": {}
+            }),
+        );
+        mapper.map_document(&desc_doc);
+
+        // Verify metadata was captured.
+        let meta = mapper.get_data_key_meta("desc-1", "det1");
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.units.as_deref(), Some("counts"));
+        assert_eq!(meta.precision, Some(3));
     }
 
     #[test]

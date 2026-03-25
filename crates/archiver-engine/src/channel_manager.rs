@@ -145,6 +145,7 @@ impl ChannelManager {
         let record = self.registry.get_pv(pv_name)?.unwrap();
         self.start_archiving_internal(&record).await?;
 
+        metrics::gauge!("archiver_pvs_active").increment(1.0);
         info!(pv = pv_name, ?dbr_type, element_count, "Started archiving");
         Ok(())
     }
@@ -226,12 +227,25 @@ impl ChannelManager {
         Ok(())
     }
 
+    /// Stop archiving a PV without removing it from the registry.
+    /// Sets the PV status to Inactive (data retained, monitoring stopped).
+    pub fn stop_pv(&self, pv_name: &str) -> anyhow::Result<()> {
+        if let Some((_key, handle)) = self.channels.remove(pv_name) {
+            handle.cancel_token.cancel();
+        }
+        self.registry.set_status(pv_name, PvStatus::Inactive)?;
+        metrics::gauge!("archiver_pvs_active").decrement(1.0);
+        info!(pv = pv_name, "Stopped archiving (inactive)");
+        Ok(())
+    }
+
     /// Remove a PV from archiving entirely.
     pub fn destroy_pv(&self, pv_name: &str) -> anyhow::Result<()> {
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
             handle.cancel_token.cancel();
         }
         self.registry.remove_pv(pv_name)?;
+        metrics::gauge!("archiver_pvs_active").decrement(1.0);
         info!(pv = pv_name, "Destroyed archiving channel");
         Ok(())
     }
@@ -504,6 +518,7 @@ pub async fn write_loop(
                 {
                     error!(pv = pv_sample.pv_name, "Write error: {e}");
                 } else {
+                    metrics::counter!("archiver_events_stored_total").increment(1);
                     ts_updates.push((pv_sample.pv_name, ts));
                 }
 
