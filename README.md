@@ -12,6 +12,7 @@ A high-performance EPICS Channel Access archiver written in Rust, compatible wit
 - **Bluesky integration** — archive scan metadata from Kafka as EPICS-style PVs
 - **Management UI** — web console for PV management, search, bulk operations, and reports
 - **Java-compatible REST API** — drop-in replacement for archiver viewer tools
+- **Built-in security** — optional TLS, API key authentication, CORS restriction, rate limiting, security headers, request body size limits, and internal error hiding — features the Java archiver relies on reverse proxies or network segmentation for
 
 ## Prerequisites
 
@@ -125,6 +126,9 @@ Navigate to `http://localhost:17665/mgmt/ui/` in your browser.
 | `engine` | object | defaults | EPICS engine settings |
 | `bluesky` | object | *disabled* | Kafka Bluesky integration |
 | `cluster` | object | *disabled* | Multi-appliance cluster mode |
+| `security` | object | defaults | Security settings (CORS, rate limiting, body limits) |
+| `tls` | object | *disabled* | TLS certificate configuration |
+| `api_keys` | string[] | *disabled* | API keys for write-endpoint authentication |
 
 ### `[storage.sts]` / `[storage.mts]` / `[storage.lts]`
 
@@ -161,6 +165,54 @@ Recommended setup:
 ### `[cluster]`
 
 See [Cluster Mode](#cluster-mode) below.
+
+### `[security]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cors_origins` | string[] | `[]` (permissive) | Allowed CORS origins. Empty = allow all. |
+| `rate_limit_rps` | u32 | `0` (disabled) | Per-IP requests per second limit |
+| `rate_limit_burst` | u32 | `50` | Burst capacity for rate limiter |
+| `max_body_size` | usize | `10485760` (10 MB) | Maximum request body size in bytes |
+
+### `[tls]`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `cert_path` | path | Path to PEM certificate file |
+| `key_path` | path | Path to PEM private key file |
+
+## Security
+
+The archiver includes built-in security features that the Java Archiver Appliance typically delegates to reverse proxies or network segmentation:
+
+- **TLS** — native HTTPS support via rustls (no need for a reverse proxy just for TLS)
+- **API key authentication** — write endpoints (archive, pause, resume, delete) require an `X-API-Key` header when `api_keys` is configured; read endpoints remain open
+- **Timing-safe key comparison** — API keys are compared using constant-time equality to prevent timing attacks
+- **CORS restriction** — configurable allowed origins (default: permissive for development; restrict in production)
+- **Rate limiting** — per-IP token bucket rate limiter to mitigate abuse
+- **Security headers** — `X-Content-Type-Options`, `X-Frame-Options`, `Content-Security-Policy`, `Referrer-Policy` added to all responses
+- **Request body size limits** — prevents oversized payloads from consuming memory
+- **Error information hiding** — internal errors are logged server-side but only generic messages are returned to clients
+
+### Example: Production Security Configuration
+
+```toml
+# API key authentication
+api_keys = ["your-secret-key-here"]
+
+# TLS
+[tls]
+cert_path = "/etc/ssl/archiver/cert.pem"
+key_path = "/etc/ssl/archiver/key.pem"
+
+# Security settings
+[security]
+cors_origins = ["https://your-app.example.com"]
+rate_limit_rps = 100
+rate_limit_burst = 200
+max_body_size = 5242880  # 5 MB
+```
 
 ## EPICS CA Environment Variables
 
@@ -538,6 +590,21 @@ gather = 5
 [engine]
 write_period_secs = 10
 policy_file = "/etc/archiver/policies.toml"
+
+# Optional: API key authentication
+api_keys = ["change-me-to-a-real-secret"]
+
+# Optional: TLS
+[tls]
+cert_path = "/etc/ssl/archiver/cert.pem"
+key_path = "/etc/ssl/archiver/key.pem"
+
+# Optional: Security hardening
+[security]
+cors_origins = ["https://controls.example.com"]
+rate_limit_rps = 100
+rate_limit_burst = 200
+max_body_size = 10485760
 
 # Optional: Bluesky Kafka integration
 [bluesky]
