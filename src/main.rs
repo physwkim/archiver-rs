@@ -154,12 +154,20 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(ClusterClient::new(cc))
     });
 
+    // Install Prometheus metrics recorder.
+    let metrics_handle = {
+        let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+        builder.install_recorder().ok()
+    };
+
     // Build REST API.
     let app_state = AppState {
         storage: storage.clone(),
         channel_mgr: channel_mgr.clone(),
         registry: registry.clone(),
         cluster,
+        api_keys: config.api_keys.clone(),
+        metrics_handle,
     };
     let app = archiver_api::build_router(app_state);
 

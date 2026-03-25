@@ -18,6 +18,11 @@ pub struct ArchiverConfig {
     pub bluesky: Option<BlueskyConfig>,
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
+    /// Optional API keys for management endpoint authentication.
+    /// If set, mgmt write endpoints require `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+    /// Retrieval GET endpoints remain open.
+    #[serde(default)]
+    pub api_keys: Option<Vec<String>>,
 }
 
 fn default_listen_addr() -> String {

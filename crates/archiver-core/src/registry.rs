@@ -74,6 +74,8 @@ pub struct PvRecord {
     pub last_timestamp: Option<SystemTime>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub prec: Option<String>,
+    pub egu: Option<String>,
 }
 
 /// SQLite-backed PV metadata registry.
@@ -115,13 +117,20 @@ impl PvRegistry {
                 element_count   INTEGER NOT NULL DEFAULT 1,
                 last_timestamp  TEXT,
                 created_at      TEXT NOT NULL,
-                updated_at      TEXT NOT NULL
+                updated_at      TEXT NOT NULL,
+                prec            TEXT,
+                egu             TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_pv_status ON pv_info(status);
             CREATE INDEX IF NOT EXISTS idx_pv_prefix ON pv_info(pv_name COLLATE NOCASE);
             ",
         )?;
+        // Migration: add prec/egu columns if table was created with old schema.
+        let _ = conn.execute_batch(
+            "ALTER TABLE pv_info ADD COLUMN prec TEXT;
+             ALTER TABLE pv_info ADD COLUMN egu TEXT;",
+        );
         info!("PV registry schema initialized");
         Ok(())
     }
@@ -186,7 +195,7 @@ impl PvRegistry {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-                    last_timestamp, created_at, updated_at
+                    last_timestamp, created_at, updated_at, prec, egu
              FROM pv_info WHERE pv_name = ?1",
             params![pv_name],
             |row| Ok(row_to_record(row)),
@@ -210,7 +219,7 @@ impl PvRegistry {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-                    last_timestamp, created_at, updated_at
+                    last_timestamp, created_at, updated_at, prec, egu
              FROM pv_info WHERE status = ?1 ORDER BY pv_name",
         )?;
         let records = stmt
@@ -272,7 +281,7 @@ impl PvRegistry {
         let since_str = DateTime::<Utc>::from(since).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-                    last_timestamp, created_at, updated_at
+                    last_timestamp, created_at, updated_at, prec, egu
              FROM pv_info WHERE created_at >= ?1 ORDER BY created_at DESC",
         )?;
         let records = stmt
@@ -287,7 +296,7 @@ impl PvRegistry {
         let since_str = DateTime::<Utc>::from(since).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-                    last_timestamp, created_at, updated_at
+                    last_timestamp, created_at, updated_at, prec, egu
              FROM pv_info WHERE updated_at >= ?1 ORDER BY updated_at DESC",
         )?;
         let records = stmt
@@ -308,6 +317,36 @@ impl PvRegistry {
         Ok(rows > 0)
     }
 
+    /// Update PREC and EGU metadata for a PV.
+    pub fn update_metadata(
+        &self,
+        pv_name: &str,
+        prec: Option<&str>,
+        egu: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE pv_info SET prec = COALESCE(?1, prec), egu = COALESCE(?2, egu), updated_at = ?3 WHERE pv_name = ?4",
+            params![prec, egu, now, pv_name],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Get all PV records (for export).
+    pub fn all_records(&self) -> anyhow::Result<Vec<PvRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
+                    last_timestamp, created_at, updated_at, prec, egu
+             FROM pv_info ORDER BY pv_name",
+        )?;
+        let records = stmt
+            .query_map([], |row| Ok(row_to_record(row)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
     /// Get PVs that have not received events for longer than the threshold duration.
     /// Only returns PVs that have a last_timestamp (have received at least one event).
     pub fn silent_pvs(&self, threshold: Duration) -> anyhow::Result<Vec<PvRecord>> {
@@ -318,7 +357,7 @@ impl PvRegistry {
         let cutoff_str = DateTime::<Utc>::from(cutoff).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-                    last_timestamp, created_at, updated_at
+                    last_timestamp, created_at, updated_at, prec, egu
              FROM pv_info WHERE last_timestamp IS NOT NULL AND last_timestamp < ?1
              ORDER BY last_timestamp ASC",
         )?;
@@ -339,6 +378,8 @@ fn row_to_record(row: &rusqlite::Row) -> PvRecord {
     let last_ts_str: Option<String> = row.get(6).unwrap();
     let created_str: String = row.get(7).unwrap();
     let updated_str: String = row.get(8).unwrap();
+    let prec: Option<String> = row.get(9).unwrap_or(None);
+    let egu: Option<String> = row.get(10).unwrap_or(None);
 
     let last_timestamp = last_ts_str.and_then(|s| {
         DateTime::parse_from_rfc3339(&s)
@@ -359,6 +400,8 @@ fn row_to_record(row: &rusqlite::Row) -> PvRecord {
         updated_at: DateTime::parse_from_rfc3339(&updated_str)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
+        prec,
+        egu,
     }
 }
 

@@ -16,7 +16,14 @@ use crate::AppState;
 /// Cached peer routing entry for a PV.
 struct CachedPeer {
     retrieval_url: String,
+    mgmt_url: String,
     expires_at: Instant,
+}
+
+/// Resolved peer info returned by resolve_peer.
+pub struct ResolvedPeer {
+    pub retrieval_url: String,
+    pub mgmt_url: String,
 }
 
 /// Client for cluster-mode operations: PV routing, proxying, and aggregation.
@@ -51,13 +58,21 @@ impl ClusterClient {
         &self.peers
     }
 
+    /// Find a peer by appliance name.
+    pub fn find_peer_by_name(&self, name: &str) -> Option<&PeerConfig> {
+        self.peers.iter().find(|p| p.name == name)
+    }
+
     /// Resolve which peer archives the given PV.
-    /// Returns the peer's retrieval URL, or None if no peer archives it.
-    pub async fn resolve_peer(&self, pv: &str) -> Option<String> {
+    /// Returns the peer's retrieval and mgmt URLs, or None if no peer archives it.
+    pub async fn resolve_peer(&self, pv: &str) -> Option<ResolvedPeer> {
         // Check cache first.
         if let Some(entry) = self.pv_cache.get(pv) {
             if entry.expires_at > Instant::now() {
-                return Some(entry.retrieval_url.clone());
+                return Some(ResolvedPeer {
+                    retrieval_url: entry.retrieval_url.clone(),
+                    mgmt_url: entry.mgmt_url.clone(),
+                });
             }
             // Expired — drop ref before removing.
             drop(entry);
@@ -75,13 +90,14 @@ impl ClusterClient {
                     urlencoding::encode(pv)
                 );
                 let retrieval_url = peer.retrieval_url.clone();
+                let mgmt_url = peer.mgmt_url.clone();
                 let client = self.http_client.clone();
                 async move {
                     let resp = client.get(&url).send().await.ok()?;
                     let body: serde_json::Value = resp.json().await.ok()?;
                     let status = body.get("status")?.as_str()?;
                     if status == "Being archived" {
-                        Some(retrieval_url)
+                        Some((retrieval_url, mgmt_url))
                     } else {
                         None
                     }
@@ -91,15 +107,19 @@ impl ClusterClient {
 
         let results = futures::future::join_all(futures).await;
         for result in results {
-            if let Some(retrieval_url) = result {
+            if let Some((retrieval_url, mgmt_url)) = result {
                 self.pv_cache.insert(
                     pv.to_string(),
                     CachedPeer {
                         retrieval_url: retrieval_url.clone(),
+                        mgmt_url: mgmt_url.clone(),
                         expires_at: Instant::now() + self.cache_ttl,
                     },
                 );
-                return Some(retrieval_url);
+                return Some(ResolvedPeer {
+                    retrieval_url,
+                    mgmt_url,
+                });
             }
         }
 
@@ -142,6 +162,112 @@ impl ClusterClient {
         let stream = resp.bytes_stream();
         let body = axum::body::Body::from_stream(stream);
         Ok(builder.body(body).unwrap().into_response())
+    }
+
+    /// Proxy a management GET request to a remote peer.
+    pub async fn proxy_mgmt_get(
+        &self,
+        peer_mgmt_url: &str,
+        endpoint: &str,
+        query_string: &str,
+    ) -> anyhow::Result<Response> {
+        let url = if query_string.is_empty() {
+            format!("{peer_mgmt_url}/{endpoint}")
+        } else {
+            format!("{peer_mgmt_url}/{endpoint}?{query_string}")
+        };
+
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("X-Archiver-Proxied", "true")
+            .send()
+            .await?;
+
+        let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+            .unwrap_or(StatusCode::BAD_GATEWAY);
+
+        let mut builder = axum::http::Response::builder().status(status);
+        if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
+            if let Ok(ct_str) = ct.to_str() {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, ct_str);
+            }
+        }
+
+        let stream = resp.bytes_stream();
+        let body = axum::body::Body::from_stream(stream);
+        Ok(builder.body(body).unwrap().into_response())
+    }
+
+    /// Proxy a management POST request to a remote peer.
+    pub async fn proxy_mgmt_post(
+        &self,
+        peer_mgmt_url: &str,
+        endpoint: &str,
+        body: axum::body::Bytes,
+    ) -> anyhow::Result<Response> {
+        let url = format!("{peer_mgmt_url}/{endpoint}");
+
+        let resp = self
+            .http_client
+            .post(&url)
+            .header("X-Archiver-Proxied", "true")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await?;
+
+        let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+            .unwrap_or(StatusCode::BAD_GATEWAY);
+
+        let mut builder = axum::http::Response::builder().status(status);
+        if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
+            if let Ok(ct_str) = ct.to_str() {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, ct_str);
+            }
+        }
+
+        let stream = resp.bytes_stream();
+        let body = axum::body::Body::from_stream(stream);
+        Ok(builder.body(body).unwrap().into_response())
+    }
+
+    /// Aggregate PV count from all peers.
+    pub async fn aggregate_pv_count(&self) -> (u64, u64, u64) {
+        let futures: Vec<_> = self
+            .peers
+            .iter()
+            .map(|peer| {
+                let url = format!("{}/getPVCount", peer.mgmt_url);
+                let client = self.http_client.clone();
+                async move {
+                    match client.get(&url).send().await {
+                        Ok(resp) => {
+                            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                            let total = body.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let active = body.get("active").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let paused = body.get("paused").and_then(|v| v.as_u64()).unwrap_or(0);
+                            (total, active, paused)
+                        }
+                        Err(e) => {
+                            warn!(peer = url, "Failed to get PV count from peer: {e}");
+                            (0, 0, 0)
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+        let mut total = 0u64;
+        let mut active = 0u64;
+        let mut paused = 0u64;
+        for (t, a, p) in results {
+            total += t;
+            active += a;
+            paused += p;
+        }
+        (total, active, paused)
     }
 
     /// Aggregate all PV names from all peers + dedup + sort.
@@ -362,6 +488,7 @@ mod tests {
             "TEST:PV".to_string(),
             CachedPeer {
                 retrieval_url: "http://app1:17665/retrieval".to_string(),
+                mgmt_url: "http://app1:17665/mgmt/bpl".to_string(),
                 expires_at: Instant::now() + Duration::from_secs(60),
             },
         );
@@ -369,6 +496,7 @@ mod tests {
         // Should find it.
         let entry = client.pv_cache.get("TEST:PV").unwrap();
         assert_eq!(entry.retrieval_url, "http://app1:17665/retrieval");
+        assert_eq!(entry.mgmt_url, "http://app1:17665/mgmt/bpl");
     }
 
     #[test]
@@ -380,6 +508,7 @@ mod tests {
             "TEST:EXPIRED".to_string(),
             CachedPeer {
                 retrieval_url: "http://app1:17665/retrieval".to_string(),
+                mgmt_url: "http://app1:17665/mgmt/bpl".to_string(),
                 expires_at: Instant::now() - Duration::from_secs(1),
             },
         );

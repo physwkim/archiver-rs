@@ -1,11 +1,13 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
+use std::time::SystemTime;
 
 use archiver_proto::epics_event::{self, PayloadInfo};
 use prost::Message;
 
 use crate::storage::plainpb::codec;
+use crate::storage::plainpb::search::binary_search_pb_file;
 use crate::storage::traits::EventStream;
 use crate::types::{ArchDbType, ArchiverSample, ArchiverValue, EventStreamDesc};
 
@@ -33,6 +35,34 @@ impl PbFileReader {
         let header_bytes = codec::unescape(&header_line);
         let payload_info = PayloadInfo::decode(header_bytes.as_slice())?;
         let desc = EventStreamDesc::from_payload_info(&payload_info);
+
+        Ok(Self { desc, reader })
+    }
+
+    /// Open a PB file and seek to the first sample >= start_time using binary search.
+    /// Falls back to reading from the beginning if binary search finds nothing or fails.
+    pub fn open_seeked(path: &Path, start_time: SystemTime) -> anyhow::Result<Self> {
+        // First, run binary search on a separate file handle.
+        let offset = binary_search_pb_file(path, start_time).ok().flatten();
+
+        // Open the file normally (reads header).
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        // Read header.
+        let mut header_line = Vec::new();
+        reader.read_until(codec::NEWLINE, &mut header_line)?;
+        if header_line.last() == Some(&codec::NEWLINE) {
+            header_line.pop();
+        }
+        let header_bytes = codec::unescape(&header_line);
+        let payload_info = PayloadInfo::decode(header_bytes.as_slice())?;
+        let desc = EventStreamDesc::from_payload_info(&payload_info);
+
+        // Seek to the binary search result if found.
+        if let Some(off) = offset {
+            reader.seek(SeekFrom::Start(off))?;
+        }
 
         Ok(Self { desc, reader })
     }

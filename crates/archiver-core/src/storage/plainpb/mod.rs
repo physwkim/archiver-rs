@@ -131,7 +131,7 @@ impl StoragePlugin for PlainPbStoragePlugin {
         let files = self.list_files_for_range(pv, start, end);
         let mut streams: Vec<Box<dyn EventStream>> = Vec::new();
         for file in files {
-            let reader = PbFileReader::open(&file)?;
+            let reader = PbFileReader::open_seeked(&file, start)?;
             streams.push(Box::new(reader));
         }
         Ok(streams)

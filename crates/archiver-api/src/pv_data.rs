@@ -7,6 +7,7 @@ use axum::routing::get;
 use axum::Router;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::ReceiverStream;
 
 use archiver_core::retrieval::query::{parse_post_processor, query_data};
 use archiver_core::storage::traits::EventStream;
@@ -37,10 +38,10 @@ async fn try_cluster_proxy(
     }
 
     // Resolve the peer that archives this PV.
-    let peer_url = cluster.resolve_peer(pv_name).await?;
+    let resolved = cluster.resolve_peer(pv_name).await?;
     let qs = uri.query().unwrap_or("");
 
-    match cluster.proxy_retrieval(&peer_url, path, qs).await {
+    match cluster.proxy_retrieval(&resolved.retrieval_url, path, qs).await {
         Ok(resp) => Some(resp),
         Err(e) => {
             tracing::warn!(pv = pv_name, "Cluster proxy failed: {e}");
@@ -62,13 +63,6 @@ struct GetDataParams {
     from: Option<String>,
     to: Option<String>,
     limit: Option<usize>,
-}
-
-/// JSON response compatible with the Java archiver viewer tools.
-#[derive(Serialize)]
-struct JsonPvData {
-    meta: JsonMeta,
-    data: Vec<JsonSample>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +92,10 @@ fn parse_iso8601(s: &str) -> Option<SystemTime> {
         return Some(dt.and_utc().into());
     }
     if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(dt.and_utc().into());
+    }
+    // Handle nanosecond-precision timestamps like %Y-%m-%dT%H:%M:%S.%fZ
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ") {
         return Some(dt.and_utc().into());
     }
     None
@@ -135,27 +133,64 @@ fn sample_to_json_value(value: &ArchiverValue) -> serde_json::Value {
     }
 }
 
-fn collect_samples(
-    stream: &mut dyn EventStream,
+fn sample_to_json(s: &ArchiverSample) -> JsonSample {
+    let dt = DateTime::<Utc>::from(s.timestamp);
+    JsonSample {
+        secs: dt.timestamp(),
+        nanos: dt.timestamp_subsec_nanos() as i32,
+        val: sample_to_json_value(&s.value),
+        severity: s.severity,
+        status: s.status,
+    }
+}
+
+fn sample_to_csv_row(s: &ArchiverSample) -> String {
+    let dt = DateTime::<Utc>::from(s.timestamp);
+    let val_str = match &s.value {
+        ArchiverValue::ScalarDouble(v) => v.to_string(),
+        ArchiverValue::ScalarFloat(v) => v.to_string(),
+        ArchiverValue::ScalarInt(v) => v.to_string(),
+        ArchiverValue::ScalarShort(v) => v.to_string(),
+        ArchiverValue::ScalarEnum(v) => v.to_string(),
+        ArchiverValue::ScalarString(v) => format!("\"{v}\""),
+        other => format!("{other:?}"),
+    };
+    format!(
+        "{},{},{},{},{}\n",
+        dt.timestamp(),
+        dt.timestamp_subsec_nanos(),
+        val_str,
+        s.severity,
+        s.status,
+    )
+}
+
+/// Iterate an EventStream, sending each sample through the channel.
+/// Runs synchronously (EventStream::next_event is sync) inside spawn_blocking.
+fn drain_stream(
+    mut stream: Box<dyn EventStream>,
     start: SystemTime,
     end: SystemTime,
     limit: Option<usize>,
-) -> Vec<ArchiverSample> {
-    let mut samples = Vec::new();
+    tx: std::sync::mpsc::Sender<ArchiverSample>,
+) {
+    let mut count = 0usize;
     while let Ok(Some(sample)) = stream.next_event() {
         if sample.timestamp > end {
-            break; // Stream is time-ordered; no more valid samples.
+            break;
         }
         if sample.timestamp >= start {
-            samples.push(sample);
+            if tx.send(sample).is_err() {
+                break;
+            }
+            count += 1;
             if let Some(max) = limit {
-                if samples.len() >= max {
+                if count >= max {
                     break;
                 }
             }
         }
     }
-    samples
 }
 
 async fn get_data_json(
@@ -186,7 +221,7 @@ async fn get_data_json(
     let (pv_name, pp_spec) = parse_pv_spec(&params.pv);
     let post_processor = pp_spec.and_then(|s| parse_post_processor(&s));
 
-    let mut stream = match query_data(state.storage.as_ref(), &pv_name, start, end, post_processor)
+    let stream = match query_data(state.storage.as_ref(), &pv_name, start, end, post_processor)
         .await
     {
         Ok(s) => s,
@@ -195,31 +230,64 @@ async fn get_data_json(
         }
     };
 
-    let samples = collect_samples(stream.as_mut(), start, end, params.limit);
-    let data: Vec<JsonSample> = samples
-        .iter()
-        .map(|s| {
-            let dt = DateTime::<Utc>::from(s.timestamp);
-            JsonSample {
-                secs: dt.timestamp(),
-                nanos: dt.timestamp_subsec_nanos() as i32,
-                val: sample_to_json_value(&s.value),
-                severity: s.severity,
-                status: s.status,
+    let limit = params.limit;
+    let pv_name_clone = pv_name.clone();
+
+    // Stream JSON: [{"meta":...,"data":[sample,sample,...]}]
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(64);
+
+    // Look up metadata from registry.
+    let (prec, egu) = state
+        .registry
+        .get_pv(&pv_name)
+        .ok()
+        .flatten()
+        .map(|r| (r.prec, r.egu))
+        .unwrap_or((None, None));
+
+    tokio::spawn(async move {
+        let meta = JsonMeta {
+            name: pv_name_clone,
+            prec,
+            egu,
+        };
+        let meta_json = serde_json::to_string(&meta).unwrap_or_default();
+        let header = format!("[{{\"meta\":{meta_json},\"data\":[");
+        if chunk_tx.send(Ok(header)).await.is_err() {
+            return;
+        }
+
+        // Drain the EventStream in a blocking task.
+        let (sample_tx, sample_rx) = std::sync::mpsc::channel::<ArchiverSample>();
+        tokio::task::spawn_blocking(move || {
+            drain_stream(stream, start, end, limit, sample_tx);
+        });
+
+        let mut first = true;
+        while let Ok(sample) = sample_rx.recv() {
+            let js = sample_to_json(&sample);
+            let json_str = serde_json::to_string(&js).unwrap_or_default();
+            let chunk = if first {
+                first = false;
+                json_str
+            } else {
+                format!(",{json_str}")
+            };
+            if chunk_tx.send(Ok(chunk)).await.is_err() {
+                break;
             }
-        })
-        .collect();
+        }
 
-    let result = vec![JsonPvData {
-        meta: JsonMeta {
-            name: pv_name,
-            prec: None,
-            egu: None,
-        },
-        data,
-    }];
+        let _ = chunk_tx.send(Ok("]}]".to_string())).await;
+    });
 
-    axum::Json(result).into_response()
+    let stream = ReceiverStream::new(chunk_rx);
+    let body = axum::body::Body::from_stream(stream);
+    Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .unwrap()
+        .into_response()
 }
 
 async fn get_data_csv(
@@ -248,7 +316,7 @@ async fn get_data_csv(
     let (pv_name, pp_spec) = parse_pv_spec(&params.pv);
     let post_processor = pp_spec.and_then(|s| parse_post_processor(&s));
 
-    let mut stream = match query_data(state.storage.as_ref(), &pv_name, start, end, post_processor)
+    let stream = match query_data(state.storage.as_ref(), &pv_name, start, end, post_processor)
         .await
     {
         Ok(s) => s,
@@ -257,34 +325,38 @@ async fn get_data_csv(
         }
     };
 
-    let samples = collect_samples(stream.as_mut(), start, end, params.limit);
+    let limit = params.limit;
 
-    let mut csv = String::from("seconds,nanos,val,severity,status\n");
-    for s in &samples {
-        let dt = DateTime::<Utc>::from(s.timestamp);
-        let val_str = match &s.value {
-            ArchiverValue::ScalarDouble(v) => v.to_string(),
-            ArchiverValue::ScalarFloat(v) => v.to_string(),
-            ArchiverValue::ScalarInt(v) => v.to_string(),
-            ArchiverValue::ScalarShort(v) => v.to_string(),
-            ArchiverValue::ScalarEnum(v) => v.to_string(),
-            ArchiverValue::ScalarString(v) => format!("\"{v}\""),
-            other => format!("{other:?}"),
-        };
-        csv.push_str(&format!(
-            "{},{},{},{},{}\n",
-            dt.timestamp(),
-            dt.timestamp_subsec_nanos(),
-            val_str,
-            s.severity,
-            s.status,
-        ));
-    }
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(64);
 
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/csv")],
-        csv,
-    )
+    tokio::spawn(async move {
+        if chunk_tx
+            .send(Ok("seconds,nanos,val,severity,status\n".to_string()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let (sample_tx, sample_rx) = std::sync::mpsc::channel::<ArchiverSample>();
+        tokio::task::spawn_blocking(move || {
+            drain_stream(stream, start, end, limit, sample_tx);
+        });
+
+        while let Ok(sample) = sample_rx.recv() {
+            let row = sample_to_csv_row(&sample);
+            if chunk_tx.send(Ok(row)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(chunk_rx);
+    let body = axum::body::Body::from_stream(stream);
+    Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "text/csv")
+        .body(body)
+        .unwrap()
         .into_response()
 }
 
@@ -320,65 +392,69 @@ async fn get_data_raw(
         }
     };
 
-    // Raw PB format: header line + sample lines from each stream.
-    let mut body = Vec::new();
-    for mut stream in streams {
-        // Write PayloadInfo header.
-        let desc = stream.description().clone();
-        let header = archiver_proto::epics_event::PayloadInfo {
-            r#type: desc.db_type as i32,
-            pvname: desc.pv_name.clone(),
-            year: desc.year,
-            element_count: desc.element_count,
-            unused00: None,
-            unused01: None,
-            unused02: None,
-            unused03: None,
-            unused04: None,
-            unused05: None,
-            unused06: None,
-            unused07: None,
-            unused08: None,
-            unused09: None,
-            headers: desc
-                .headers
-                .iter()
-                .map(|(n, v)| archiver_proto::epics_event::FieldValue {
-                    name: n.clone(),
-                    val: v.clone(),
-                })
-                .collect(),
-        };
-        use prost::Message;
-        let header_bytes = header.encode_to_vec();
-        let escaped_header = archiver_core::storage::plainpb::codec::escape(&header_bytes);
-        body.extend_from_slice(&escaped_header);
-        body.push(archiver_core::storage::plainpb::codec::NEWLINE);
+    // Raw PB: stream header + samples from each partition file.
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
 
-        // Write samples.
-        while let Ok(Some(sample)) = stream.next_event() {
-            if sample.timestamp > end {
-                break;
+    tokio::task::spawn_blocking(move || {
+        for mut stream in streams {
+            let desc = stream.description().clone();
+            let header = archiver_proto::epics_event::PayloadInfo {
+                r#type: desc.db_type as i32,
+                pvname: desc.pv_name.clone(),
+                year: desc.year,
+                element_count: desc.element_count,
+                unused00: None,
+                unused01: None,
+                unused02: None,
+                unused03: None,
+                unused04: None,
+                unused05: None,
+                unused06: None,
+                unused07: None,
+                unused08: None,
+                unused09: None,
+                headers: desc
+                    .headers
+                    .iter()
+                    .map(|(n, v)| archiver_proto::epics_event::FieldValue {
+                        name: n.clone(),
+                        val: v.clone(),
+                    })
+                    .collect(),
+            };
+            use prost::Message;
+            let header_bytes = header.encode_to_vec();
+            let mut chunk = archiver_core::storage::plainpb::codec::escape(&header_bytes);
+            chunk.push(archiver_core::storage::plainpb::codec::NEWLINE);
+            if chunk_tx.blocking_send(Ok(chunk)).is_err() {
+                return;
             }
-            if sample.timestamp >= start {
-                if let Ok(sample_bytes) =
-                    archiver_core::storage::plainpb::writer::encode_sample(desc.db_type, &sample)
-                {
-                    let escaped =
-                        archiver_core::storage::plainpb::codec::escape(&sample_bytes);
-                    body.extend_from_slice(&escaped);
-                    body.push(archiver_core::storage::plainpb::codec::NEWLINE);
+
+            while let Ok(Some(sample)) = stream.next_event() {
+                if sample.timestamp > end {
+                    break;
+                }
+                if sample.timestamp >= start {
+                    if let Ok(sample_bytes) =
+                        archiver_core::storage::plainpb::writer::encode_sample(desc.db_type, &sample)
+                    {
+                        let mut escaped =
+                            archiver_core::storage::plainpb::codec::escape(&sample_bytes);
+                        escaped.push(archiver_core::storage::plainpb::codec::NEWLINE);
+                        if chunk_tx.blocking_send(Ok(escaped)).is_err() {
+                            return;
+                        }
+                    }
                 }
             }
         }
-    }
+    });
 
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/x-protobuf",
-        )],
-        body,
-    )
+    let stream = ReceiverStream::new(chunk_rx);
+    let body = axum::body::Body::from_stream(stream);
+    Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/x-protobuf")
+        .body(body)
+        .unwrap()
         .into_response()
 }

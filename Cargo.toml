@@ -27,8 +27,13 @@ serde_json = "1"
 
 # HTTP
 axum = "0.8"
+hyper = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 
 # Kafka
 rdkafka = { version = "0.37", features = ["cmake-build"] }
@@ -71,6 +76,7 @@ futures = "0.3"
 
 # Testing
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
 
 # Internal crates
 archiver-proto = { path = "crates/archiver-proto" }
@@ -96,8 +102,18 @@ toml = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+tower = { workspace = true }
+archiver-api = { workspace = true }
+archiver-core = { workspace = true }
+archiver-engine = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
