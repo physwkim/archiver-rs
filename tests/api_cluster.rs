@@ -11,6 +11,7 @@ use archiver_core::storage::plainpb::PlainPbStoragePlugin;
 use archiver_engine::channel_manager::ChannelManager;
 use archiver_api::cluster::ClusterClient;
 use archiver_api::{build_router, AppState};
+use archiver_api::services::impls::{ChannelArchiverControl, ClusterClientRouter, RegistryRepository};
 
 /// Start a mock peer appliance on a random port.
 /// Returns (base_url, JoinHandle).
@@ -21,10 +22,11 @@ async fn start_mock_peer(
     let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
         .await
         .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
     let state = AppState {
         storage,
-        channel_mgr: Arc::new(channel_mgr),
-        registry,
+        pv_repo: Arc::new(RegistryRepository::new(registry)),
+        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr)),
         cluster: None,
         api_keys: None,
         metrics_handle: None,
@@ -47,6 +49,7 @@ async fn build_cluster_test_app(
     let (channel_mgr, _rx) = ChannelManager::new(local_storage.clone(), local_registry.clone(), None)
         .await
         .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
 
     let cluster_config = ClusterConfig {
         identity: ApplianceIdentity {
@@ -67,9 +70,9 @@ async fn build_cluster_test_app(
 
     let state = AppState {
         storage: local_storage,
-        channel_mgr: Arc::new(channel_mgr),
-        registry: local_registry,
-        cluster: Some(Arc::new(ClusterClient::new(&cluster_config))),
+        pv_repo: Arc::new(RegistryRepository::new(local_registry)),
+        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr)),
+        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
         api_keys: None,
         metrics_handle: None,
     };

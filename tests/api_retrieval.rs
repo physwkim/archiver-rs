@@ -13,6 +13,7 @@ use archiver_core::storage::traits::{EventStream, StoragePlugin};
 use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
 use archiver_engine::channel_manager::ChannelManager;
 use archiver_api::{build_router, AppState};
+use archiver_api::services::impls::{RegistryRepository, ChannelArchiverControl};
 
 /// Build a test app with sample data pre-populated in storage.
 async fn build_retrieval_app() -> (axum::Router, SystemTime, SystemTime, tempfile::TempDir) {
@@ -47,8 +48,8 @@ async fn build_retrieval_app() -> (axum::Router, SystemTime, SystemTime, tempfil
         .unwrap();
     let state = AppState {
         storage,
-        channel_mgr: Arc::new(channel_mgr),
-        registry,
+        pv_repo: Arc::new(RegistryRepository::new(registry)),
+        archiver: Arc::new(ChannelArchiverControl::new(Arc::new(channel_mgr))),
         cluster: None,
         api_keys: None,
         metrics_handle: None,

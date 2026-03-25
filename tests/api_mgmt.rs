@@ -10,6 +10,7 @@ use archiver_core::storage::partition::PartitionGranularity;
 use archiver_core::storage::plainpb::PlainPbStoragePlugin;
 use archiver_engine::channel_manager::ChannelManager;
 use archiver_api::{build_router, AppState};
+use archiver_api::services::impls::{ChannelArchiverControl, RegistryRepository};
 
 async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -22,10 +23,11 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
     let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
         .await
         .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
     let state = AppState {
         storage,
-        channel_mgr: Arc::new(channel_mgr),
-        registry,
+        pv_repo: Arc::new(RegistryRepository::new(registry)),
+        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr)),
         cluster: None,
         api_keys: None,
         metrics_handle: None,
@@ -56,10 +58,11 @@ async fn build_test_app_with_pvs() -> (axum::Router, Arc<PvRegistry>, tempfile::
     let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
         .await
         .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
     let state = AppState {
         storage,
-        channel_mgr: Arc::new(channel_mgr),
-        registry: registry.clone(),
+        pv_repo: Arc::new(RegistryRepository::new(registry.clone())),
+        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr)),
         cluster: None,
         api_keys: None,
         metrics_handle: None,
@@ -448,10 +451,11 @@ async fn test_export_import_preserves_status() {
     let (channel_mgr2, _rx2) = ChannelManager::new(storage2.clone(), registry2.clone(), None)
         .await
         .unwrap();
+    let channel_mgr2 = Arc::new(channel_mgr2);
     let state2 = AppState {
         storage: storage2,
-        channel_mgr: Arc::new(channel_mgr2),
-        registry: registry2.clone(),
+        pv_repo: Arc::new(RegistryRepository::new(registry2.clone())),
+        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr2)),
         cluster: None,
         api_keys: None,
         metrics_handle: None,
@@ -511,10 +515,11 @@ async fn build_test_app_with_auth() -> (axum::Router, tempfile::TempDir) {
     let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
         .await
         .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
     let state = AppState {
         storage,
-        channel_mgr: Arc::new(channel_mgr),
-        registry,
+        pv_repo: Arc::new(RegistryRepository::new(registry)),
+        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr)),
         cluster: None,
         api_keys: Some(vec!["test-secret-key".to_string()]),
         metrics_handle: None,

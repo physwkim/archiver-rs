@@ -317,6 +317,7 @@ pub fn decode_sample(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_from_parts(
     year: i32,
     seconds_into_year: u32,

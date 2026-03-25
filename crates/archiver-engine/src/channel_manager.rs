@@ -15,22 +15,13 @@ use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
 use crate::policy::PolicyConfig;
 
 /// Connection state tracked per PV.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ConnectionInfo {
     pub connected_since: Option<SystemTime>,
     pub last_event_time: Option<SystemTime>,
     pub is_connected: bool,
 }
 
-impl Default for ConnectionInfo {
-    fn default() -> Self {
-        Self {
-            connected_since: None,
-            last_event_time: None,
-            is_connected: false,
-        }
-    }
-}
 
 /// Handle for a running PV archiving task.
 struct PvHandle {
@@ -396,6 +387,7 @@ async fn monitor_loop(
 }
 
 /// Scan loop: periodically read a channel value.
+#[allow(clippy::too_many_arguments)]
 async fn scan_loop(
     pv_name: String,
     dbr_type: ArchDbType,

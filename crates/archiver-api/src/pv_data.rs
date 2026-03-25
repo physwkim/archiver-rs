@@ -33,7 +33,7 @@ async fn try_cluster_proxy(
     let cluster = state.cluster.as_ref()?;
 
     // Don't proxy if PV is local.
-    if state.registry.get_pv(pv_name).ok().flatten().is_some() {
+    if state.pv_repo.get_pv(pv_name).ok().flatten().is_some() {
         return None;
     }
 
@@ -238,7 +238,7 @@ async fn get_data_json(
 
     // Look up metadata from registry.
     let (prec, egu) = state
-        .registry
+        .pv_repo
         .get_pv(&pv_name)
         .ok()
         .flatten()

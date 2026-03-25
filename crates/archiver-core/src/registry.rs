@@ -31,15 +31,19 @@ impl PvStatus {
             Self::Inactive => "inactive",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl std::str::FromStr for PvStatus {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "active" => Self::Active,
             "paused" => Self::Paused,
             "error" => Self::Error,
             "inactive" => Self::Inactive,
             _ => Self::Active,
-        }
+        })
     }
 }
 
@@ -338,6 +342,7 @@ impl PvRegistry {
 
     /// Import a PV with all fields in a single SQL operation.
     /// Used during config import to atomically set status, created_at, and metadata.
+    #[allow(clippy::too_many_arguments)]
     pub fn import_pv(
         &self,
         pv_name: &str,
@@ -433,7 +438,7 @@ fn row_to_record(row: &rusqlite::Row) -> PvRecord {
         pv_name,
         dbr_type: ArchDbType::from_i32(dbr_type_i).unwrap_or(ArchDbType::ScalarDouble),
         sample_mode: SampleMode::from_db(&sample_mode_str, sample_period),
-        status: PvStatus::from_str(&status_str),
+        status: status_str.parse().unwrap_or(PvStatus::Active),
         element_count,
         last_timestamp,
         created_at: DateTime::parse_from_rfc3339(&created_str)

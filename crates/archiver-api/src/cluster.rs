@@ -106,21 +106,19 @@ impl ClusterClient {
             .collect();
 
         let results = futures::future::join_all(futures).await;
-        for result in results {
-            if let Some((retrieval_url, mgmt_url)) = result {
-                self.pv_cache.insert(
-                    pv.to_string(),
-                    CachedPeer {
-                        retrieval_url: retrieval_url.clone(),
-                        mgmt_url: mgmt_url.clone(),
-                        expires_at: Instant::now() + self.cache_ttl,
-                    },
-                );
-                return Some(ResolvedPeer {
-                    retrieval_url,
-                    mgmt_url,
-                });
-            }
+        if let Some((retrieval_url, mgmt_url)) = results.into_iter().flatten().next() {
+            self.pv_cache.insert(
+                pv.to_string(),
+                CachedPeer {
+                    retrieval_url: retrieval_url.clone(),
+                    mgmt_url: mgmt_url.clone(),
+                    expires_at: Instant::now() + self.cache_ttl,
+                },
+            );
+            return Some(ResolvedPeer {
+                retrieval_url,
+                mgmt_url,
+            });
         }
 
         None
@@ -389,20 +387,20 @@ async fn get_appliances_in_cluster(State(state): State<AppState>) -> Response {
         return axum::Json(Vec::<ApplianceInfoResponse>::new()).into_response();
     };
 
-    let identity = cluster.identity();
+    let id = cluster.identity();
     let mut appliances = vec![ApplianceInfoResponse {
-        identity: identity.name.clone(),
-        mgmt_url: identity.mgmt_url.clone(),
-        retrieval_url: identity.retrieval_url.clone(),
-        engine_url: identity.engine_url.clone(),
-        etl_url: identity.etl_url.clone(),
+        identity: id.name,
+        mgmt_url: id.mgmt_url,
+        retrieval_url: id.retrieval_url,
+        engine_url: id.engine_url,
+        etl_url: id.etl_url,
     }];
 
     for peer in cluster.peers() {
         appliances.push(ApplianceInfoResponse {
-            identity: peer.name.clone(),
-            mgmt_url: peer.mgmt_url.clone(),
-            retrieval_url: peer.retrieval_url.clone(),
+            identity: peer.name,
+            mgmt_url: peer.mgmt_url,
+            retrieval_url: peer.retrieval_url,
             engine_url: String::new(),
             etl_url: String::new(),
         });
@@ -425,26 +423,26 @@ async fn get_appliance_info(
         return (StatusCode::NOT_FOUND, "Cluster not configured").into_response();
     };
 
-    let identity = cluster.identity();
-    let target = params.id.as_deref().unwrap_or(&identity.name);
+    let id = cluster.identity();
+    let target_name = params.id.unwrap_or_else(|| id.name.clone());
 
-    if target == identity.name {
+    if target_name == id.name {
         let resp = ApplianceInfoResponse {
-            identity: identity.name.clone(),
-            mgmt_url: identity.mgmt_url.clone(),
-            retrieval_url: identity.retrieval_url.clone(),
-            engine_url: identity.engine_url.clone(),
-            etl_url: identity.etl_url.clone(),
+            identity: id.name,
+            mgmt_url: id.mgmt_url,
+            retrieval_url: id.retrieval_url,
+            engine_url: id.engine_url,
+            etl_url: id.etl_url,
         };
         return axum::Json(resp).into_response();
     }
 
     for peer in cluster.peers() {
-        if peer.name == target {
+        if peer.name == target_name {
             let resp = ApplianceInfoResponse {
-                identity: peer.name.clone(),
-                mgmt_url: peer.mgmt_url.clone(),
-                retrieval_url: peer.retrieval_url.clone(),
+                identity: peer.name,
+                mgmt_url: peer.mgmt_url,
+                retrieval_url: peer.retrieval_url,
                 engine_url: String::new(),
                 etl_url: String::new(),
             };

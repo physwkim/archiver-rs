@@ -121,6 +121,7 @@ dependencies = [
  "archiver-core",
  "archiver-engine",
  "archiver-proto",
+ "async-trait",
  "axum",
  "chrono",
  "dashmap",

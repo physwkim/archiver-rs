@@ -323,12 +323,7 @@ impl PvMapper {
         for motor_name in &motors {
             if let Some(val) = event.data.get(motor_name) {
                 if let Some((dbr_type, archiver_val)) = json_value_to_archiver(val) {
-                    // Use motor:readback for the primary value.
-                    let pv_suffix = if matches!(dbr_type, ArchDbType::ScalarDouble | ArchDbType::ScalarFloat) {
-                        format!("motor:{motor_name}:readback")
-                    } else {
-                        format!("motor:{motor_name}:readback")
-                    };
+                    let pv_suffix = format!("motor:{motor_name}:readback");
                     samples.push((
                         self.pv(&pv_suffix),
                         dbr_type,
@@ -413,21 +408,20 @@ impl PvMapper {
         stop: &crate::documents::RunStop,
     ) -> Vec<(String, ArchDbType, ArchiverSample)> {
         let ts = stop.time;
-        let mut samples = Vec::new();
-
-        // run:active = 0
-        samples.push((
-            self.pv("run:active"),
-            ArchDbType::ScalarEnum,
-            ArchiverSample::from_unix_timestamp(ts, ArchiverValue::ScalarEnum(0)),
-        ));
-
-        // run:uid = "" (cleared)
-        samples.push((
-            self.pv("run:uid"),
-            ArchDbType::ScalarString,
-            ArchiverSample::from_unix_timestamp(ts, ArchiverValue::ScalarString(String::new())),
-        ));
+        let samples = vec![
+            // run:active = 0
+            (
+                self.pv("run:active"),
+                ArchDbType::ScalarEnum,
+                ArchiverSample::from_unix_timestamp(ts, ArchiverValue::ScalarEnum(0)),
+            ),
+            // run:uid = "" (cleared)
+            (
+                self.pv("run:uid"),
+                ArchDbType::ScalarString,
+                ArchiverSample::from_unix_timestamp(ts, ArchiverValue::ScalarString(String::new())),
+            ),
+        ];
 
         // Clean up descriptor state for this run.
         let run_uid = &stop.run_start;
@@ -466,10 +460,8 @@ fn json_value_to_archiver(val: &serde_json::Value) -> Option<(ArchDbType, Archiv
                         ArchiverValue::ScalarDouble(n.as_f64().unwrap_or(i as f64)),
                     ))
                 }
-            } else if let Some(f) = n.as_f64() {
-                Some((ArchDbType::ScalarDouble, ArchiverValue::ScalarDouble(f)))
             } else {
-                None
+                n.as_f64().map(|f| (ArchDbType::ScalarDouble, ArchiverValue::ScalarDouble(f)))
             }
         }
         serde_json::Value::String(s) => Some((

@@ -18,7 +18,7 @@ pub async fn query_data(
         let desc = EventStreamDesc {
             pv_name: pv.to_string(),
             db_type: crate::types::ArchDbType::ScalarDouble,
-            year: chrono::Utc::now().year() as i32,
+            year: chrono::Utc::now().year(),
             element_count: None,
             headers: Vec::new(),
         };

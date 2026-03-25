@@ -6,6 +6,8 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 use archiver_api::cluster::ClusterClient;
+use archiver_api::services::impls::{ChannelArchiverControl, ClusterClientRouter, RegistryRepository};
+use archiver_api::services::traits::ClusterRouter;
 use archiver_api::AppState;
 use archiver_bluesky::consumer::BlueskyConsumer;
 use archiver_core::config::ArchiverConfig;
@@ -145,13 +147,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize cluster client if configured.
-    let cluster = config.cluster.as_ref().map(|cc| {
+    let cluster: Option<Arc<dyn ClusterRouter>> = config.cluster.as_ref().map(|cc| {
         info!(
             identity = cc.identity.name,
             peers = cc.peers.len(),
             "Cluster mode enabled"
         );
-        Arc::new(ClusterClient::new(cc))
+        let client = Arc::new(ClusterClient::new(cc));
+        Arc::new(ClusterClientRouter::new(client)) as Arc<dyn ClusterRouter>
     });
 
     // Install Prometheus metrics recorder.
@@ -163,8 +166,8 @@ async fn main() -> anyhow::Result<()> {
     // Build REST API.
     let app_state = AppState {
         storage: storage.clone(),
-        channel_mgr: channel_mgr.clone(),
-        registry: registry.clone(),
+        pv_repo: Arc::new(RegistryRepository::new(registry.clone())),
+        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr.clone())),
         cluster,
         api_keys: config.api_keys.clone(),
         metrics_handle,
