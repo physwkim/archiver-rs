@@ -12,6 +12,7 @@ use archiver_core::storage::plainpb::PlainPbStoragePlugin;
 use archiver_core::storage::traits::{EventStream, StoragePlugin};
 use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
 use archiver_engine::channel_manager::ChannelManager;
+use archiver_core::config::SecurityConfig;
 use archiver_api::{build_router, AppState};
 use archiver_api::services::impls::{RegistryRepository, ChannelArchiverControl};
 
@@ -53,8 +54,9 @@ async fn build_retrieval_app() -> (axum::Router, SystemTime, SystemTime, tempfil
         cluster: None,
         api_keys: None,
         metrics_handle: None,
+        rate_limiter: None,
     };
-    (build_router(state), data_start, data_end, dir)
+    (build_router(state, &SecurityConfig::default()), data_start, data_end, dir)
 }
 
 fn get_request(uri: &str) -> Request<Body> {

@@ -5,6 +5,7 @@ use axum::response::{IntoResponse, Response};
 use archiver_core::registry::{PvStatus, SampleMode};
 
 use crate::dto::mgmt::*;
+use crate::errors::internal_error;
 use crate::AppState;
 
 pub async fn get_all_pvs(
@@ -13,7 +14,7 @@ pub async fn get_all_pvs(
 ) -> Response {
     let mut pvs = match state.pv_repo.all_pv_names() {
         Ok(pvs) => pvs,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error(e),
     };
 
     if cp.cluster.unwrap_or(false) {
@@ -34,7 +35,7 @@ pub async fn get_matching_pvs(
 ) -> Response {
     let mut pvs = match state.pv_repo.matching_pvs(&params.pv) {
         Ok(pvs) => pvs,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error(e),
     };
 
     if params.cluster.unwrap_or(false) {
@@ -97,7 +98,7 @@ pub async fn get_pv_status(
             };
             axum::Json(resp).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => internal_error(e),
     }
 }
 
@@ -133,7 +134,7 @@ pub async fn get_pv_type_info(
     match state.pv_repo.get_pv(&params.pv) {
         Ok(Some(record)) => axum::Json(record_to_type_info(&record)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, format!("PV {} not found", params.pv)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => internal_error(e),
     }
 }
 
@@ -144,7 +145,7 @@ pub async fn get_pv_details(
     let record = match state.pv_repo.get_pv(&params.pv) {
         Ok(Some(r)) => r,
         Ok(None) => return (StatusCode::NOT_FOUND, format!("PV {} not found", params.pv)).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error(e),
     };
 
     let conn_info = state.archiver.get_connection_info(&params.pv);

@@ -6,6 +6,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 use archiver_api::cluster::ClusterClient;
+use archiver_api::security::RateLimiter;
 use archiver_api::services::impls::{ChannelArchiverControl, ClusterClientRouter, RegistryRepository};
 use archiver_api::services::traits::ClusterRouter;
 use archiver_api::AppState;
@@ -163,6 +164,31 @@ async fn main() -> anyhow::Result<()> {
         builder.install_recorder().ok()
     };
 
+    // Build rate limiter if configured.
+    let rate_limiter = if config.security.rate_limit_rps > 0 {
+        let limiter = Arc::new(RateLimiter::new(
+            config.security.rate_limit_rps,
+            config.security.rate_limit_burst,
+        ));
+        // Periodic cleanup of stale entries.
+        let cleanup_limiter = limiter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                cleanup_limiter.cleanup();
+            }
+        });
+        info!(
+            rps = config.security.rate_limit_rps,
+            burst = config.security.rate_limit_burst,
+            "Rate limiting enabled"
+        );
+        Some(limiter)
+    } else {
+        None
+    };
+
     // Build REST API.
     let app_state = AppState {
         storage: storage.clone(),
@@ -171,21 +197,50 @@ async fn main() -> anyhow::Result<()> {
         cluster,
         api_keys: config.api_keys.clone(),
         metrics_handle,
+        rate_limiter,
     };
-    let app = archiver_api::build_router(app_state);
+    let app = archiver_api::build_router(app_state, &config.security);
 
     let addr = format!("{}:{}", config.listen_addr, config.listen_port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!(addr, "REST API listening");
 
-    // Graceful shutdown on Ctrl+C.
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("Shutdown signal received");
-        let _ = shutdown_tx.send(true);
-    });
+    // Serve with optional TLS.
+    if let Some(ref tls) = config.tls {
+        // Install ring crypto provider for rustls.
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("Failed to install rustls crypto provider");
 
-    server.await?;
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+                .await
+                .context("Failed to load TLS certificate/key")?;
+
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Shutdown signal received");
+            let _ = shutdown_tx.send(true);
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
+        });
+
+        info!(addr, "REST API listening (TLS)");
+        axum_server::bind_rustls(addr.parse()?, rustls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        info!(addr, "REST API listening");
+
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Shutdown signal received");
+            let _ = shutdown_tx.send(true);
+        });
+        server.await?;
+    }
+
     info!("Archiver stopped");
     Ok(())
 }

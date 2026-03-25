@@ -25,3 +25,4 @@ tokio-stream = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 async-trait = { workspace = true }
+subtle = { workspace = true }

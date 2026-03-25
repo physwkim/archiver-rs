@@ -4,7 +4,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use archiver_core::config::{ApplianceIdentity, ClusterConfig, PeerConfig};
+use archiver_core::config::{ApplianceIdentity, ClusterConfig, PeerConfig, SecurityConfig};
 use archiver_core::registry::{PvRegistry, SampleMode};
 use archiver_core::storage::partition::PartitionGranularity;
 use archiver_core::storage::plainpb::PlainPbStoragePlugin;
@@ -30,8 +30,9 @@ async fn start_mock_peer(
         cluster: None,
         api_keys: None,
         metrics_handle: None,
+        rate_limiter: None,
     };
-    let app = build_router(state);
+    let app = build_router(state, &SecurityConfig::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
@@ -75,8 +76,9 @@ async fn build_cluster_test_app(
         cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
         api_keys: None,
         metrics_handle: None,
+        rate_limiter: None,
     };
-    build_router(state)
+    build_router(state, &SecurityConfig::default())
 }
 
 fn get_request(uri: &str) -> Request<Body> {

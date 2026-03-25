@@ -91,12 +91,15 @@ async fn forward_pv_batch_to_peer(
                     .collect()
             }
         }
-        Err(e) => pv_names
-            .iter()
-            .map(|pv| BulkResult {
-                pv_name: pv.clone(),
-                status: format!("Peer connection failed: {e}"),
-            })
-            .collect(),
+        Err(e) => {
+            tracing::warn!(mgmt_url, endpoint, "Peer connection failed: {e}");
+            pv_names
+                .iter()
+                .map(|pv| BulkResult {
+                    pv_name: pv.clone(),
+                    status: "Peer connection failed".to_string(),
+                })
+                .collect()
+        }
     }
 }

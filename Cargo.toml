@@ -58,6 +58,11 @@ dashmap = "6"
 # Async trait
 async-trait = "0.1"
 
+# Security
+subtle = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+
 # Stream utilities
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -102,7 +107,9 @@ toml = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
+axum-server = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+rustls = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

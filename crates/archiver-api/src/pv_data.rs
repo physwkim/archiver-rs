@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use axum::extract::{OriginalUri, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -13,6 +13,7 @@ use archiver_core::retrieval::query::{parse_post_processor, query_data};
 use archiver_core::storage::traits::EventStream;
 use archiver_core::types::{ArchiverSample, ArchiverValue};
 
+use crate::errors::internal_error;
 use crate::AppState;
 
 /// Try to proxy a data request to the correct cluster peer.
@@ -226,7 +227,7 @@ async fn get_data_json(
     {
         Ok(s) => s,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return internal_error(e);
         }
     };
 
@@ -321,7 +322,7 @@ async fn get_data_csv(
     {
         Ok(s) => s,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return internal_error(e);
         }
     };
 
@@ -388,7 +389,7 @@ async fn get_data_raw(
     let streams = match state.storage.get_data(&pv_name, start, end).await {
         Ok(s) => s,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return internal_error(e);
         }
     };
 

@@ -4,9 +4,11 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use subtle::ConstantTimeEq;
 
 use archiver_core::storage::traits::StoragePlugin;
 
+use crate::security::RateLimiter;
 use crate::services::traits::{ArchiverControl, ClusterRouter, PvRepository};
 
 /// Shared application state for API handlers.
@@ -18,6 +20,7 @@ pub struct AppState {
     pub cluster: Option<Arc<dyn ClusterRouter>>,
     pub api_keys: Option<Vec<String>>,
     pub metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    pub rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 /// Middleware that records HTTP request metrics.
@@ -37,7 +40,7 @@ pub(crate) async fn http_metrics(
 }
 
 /// Middleware that checks API keys on mgmt write endpoints.
-/// Retrieval GET endpoints and health/metrics are exempt.
+/// Uses constant-time comparison to prevent timing attacks.
 pub(crate) async fn api_key_auth(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -88,7 +91,9 @@ pub(crate) async fn api_key_auth(
             });
 
         match provided_key {
-            Some(key) if keys.iter().any(|k| k == key) => {}
+            Some(key) if keys.iter().any(|k| {
+                bool::from(k.as_bytes().ct_eq(key.as_bytes()))
+            }) => {}
             _ => return (StatusCode::UNAUTHORIZED, "Invalid or missing API key").into_response(),
         }
     }

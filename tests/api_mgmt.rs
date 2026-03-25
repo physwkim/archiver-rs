@@ -9,6 +9,7 @@ use archiver_core::registry::{PvRegistry, PvStatus, SampleMode};
 use archiver_core::storage::partition::PartitionGranularity;
 use archiver_core::storage::plainpb::PlainPbStoragePlugin;
 use archiver_engine::channel_manager::ChannelManager;
+use archiver_core::config::SecurityConfig;
 use archiver_api::{build_router, AppState};
 use archiver_api::services::impls::{ChannelArchiverControl, RegistryRepository};
 
@@ -31,8 +32,9 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         cluster: None,
         api_keys: None,
         metrics_handle: None,
+        rate_limiter: None,
     };
-    (build_router(state), dir)
+    (build_router(state, &SecurityConfig::default()), dir)
 }
 
 async fn build_test_app_with_pvs() -> (axum::Router, Arc<PvRegistry>, tempfile::TempDir) {
@@ -66,8 +68,9 @@ async fn build_test_app_with_pvs() -> (axum::Router, Arc<PvRegistry>, tempfile::
         cluster: None,
         api_keys: None,
         metrics_handle: None,
+        rate_limiter: None,
     };
-    (build_router(state), registry, dir)
+    (build_router(state, &SecurityConfig::default()), registry, dir)
 }
 
 fn get_request(uri: &str) -> Request<Body> {
@@ -459,8 +462,9 @@ async fn test_export_import_preserves_status() {
         cluster: None,
         api_keys: None,
         metrics_handle: None,
+        rate_limiter: None,
     };
-    let app2 = build_router(state2);
+    let app2 = build_router(state2, &SecurityConfig::default());
 
     let import_body = serde_json::to_string(&export_arr).unwrap();
     let req = Request::builder()
@@ -523,8 +527,9 @@ async fn build_test_app_with_auth() -> (axum::Router, tempfile::TempDir) {
         cluster: None,
         api_keys: Some(vec!["test-secret-key".to_string()]),
         metrics_handle: None,
+        rate_limiter: None,
     };
-    (build_router(state), dir)
+    (build_router(state, &SecurityConfig::default()), dir)
 }
 
 #[tokio::test]

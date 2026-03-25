@@ -5,6 +5,7 @@ use axum::response::{IntoResponse, Response};
 use archiver_core::registry::{PvStatus, SampleMode};
 
 use crate::dto::mgmt::*;
+use crate::errors::{bad_gateway, internal_error};
 use crate::pv_input::{parse_pv_list, PvListInput};
 use crate::AppState;
 
@@ -116,7 +117,10 @@ async fn bulk_archive_requests(
         let sample_mode = parse_sample_mode(req.sampling_method.as_deref(), req.sampling_period);
         let status = match state.archiver.archive_pv(pv, &sample_mode).await {
             Ok(()) => "Archive request submitted".to_string(),
-            Err(e) => e.to_string(),
+            Err(e) => {
+                tracing::warn!(pv, "Failed to archive: {e}");
+                "Failed to archive".to_string()
+            }
         };
         results.push(BulkResult {
             pv_name: pv.to_string(),
@@ -175,10 +179,11 @@ async fn bulk_archive_requests(
                     }
                 }
                 Err(e) => {
+                    tracing::warn!(peer_name, "Failed to forward archive batch: {e}");
                     for req in batch {
                         results.push(BulkResult {
                             pv_name: req.pv.clone().unwrap_or_default(),
-                            status: format!("Failed to forward to {peer_name}: {e}"),
+                            status: format!("Failed to forward to {peer_name}"),
                         });
                     }
                 }
@@ -211,7 +216,7 @@ async fn archive_single_pv(
                         let bytes = axum::body::Bytes::from(body.to_string());
                         return match cluster.proxy_mgmt_post(&peer.mgmt_url, "archivePV", bytes).await {
                             Ok(resp) => resp,
-                            Err(e) => (StatusCode::BAD_GATEWAY, format!("Failed to forward to peer: {e}")).into_response(),
+                            Err(e) => bad_gateway(e),
                         };
                     }
                     return (StatusCode::NOT_FOUND, format!("Appliance '{target}' not found in cluster")).into_response();
@@ -232,8 +237,8 @@ async fn archive_single_pv(
             (StatusCode::OK, msg).into_response()
         }
         Err(e) => {
-            let msg = format!("Failed to archive PV {pv}: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+            tracing::error!(pv, "Failed to archive PV: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to archive PV {pv}")).into_response()
         }
     }
 }
@@ -255,8 +260,8 @@ pub async fn pause_archiving_pv(
             (StatusCode::OK, msg).into_response()
         }
         Err(e) => {
-            let msg = format!("Failed to pause PV {}: {e}", params.pv);
-            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+            tracing::error!(pv = params.pv, "Failed to pause PV: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to pause PV {}", params.pv)).into_response()
         }
     }
 }
@@ -276,8 +281,8 @@ pub async fn resume_archiving_pv(
             (StatusCode::OK, msg).into_response()
         }
         Err(e) => {
-            let msg = format!("Failed to resume PV {}: {e}", params.pv);
-            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+            tracing::error!(pv = params.pv, "Failed to resume PV: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resume PV {}", params.pv)).into_response()
         }
     }
 }
@@ -328,7 +333,10 @@ pub async fn bulk_pause_archiving_pv(
             for pv in &local_pvs {
                 let status = match state.archiver.pause_pv(pv) {
                     Ok(()) => "Successfully paused".to_string(),
-                    Err(e) => e.to_string(),
+                    Err(e) => {
+                        tracing::warn!(pv, "Failed to pause: {e}");
+                        "Failed to pause".to_string()
+                    }
                 };
                 results.push(BulkResult {
                     pv_name: pv.clone(),
@@ -396,7 +404,10 @@ pub async fn bulk_resume_archiving_pv(
             for pv in &local_pvs {
                 let status = match state.archiver.resume_pv(pv).await {
                     Ok(()) => "Successfully resumed".to_string(),
-                    Err(e) => e.to_string(),
+                    Err(e) => {
+                        tracing::warn!(pv, "Failed to resume: {e}");
+                        "Failed to resume".to_string()
+                    }
                 };
                 results.push(BulkResult {
                     pv_name: pv.clone(),
@@ -435,8 +446,8 @@ pub async fn delete_pv(
         return resp;
     }
     if let Err(e) = state.archiver.destroy_pv(&params.pv) {
-        let msg = format!("Failed to delete PV {}: {e}", params.pv);
-        return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+        tracing::error!(pv = params.pv, "Failed to delete PV: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete PV {}", params.pv)).into_response();
     }
 
     let mut files_deleted = 0u64;
@@ -444,11 +455,8 @@ pub async fn delete_pv(
         match state.storage.delete_pv_data(&params.pv).await {
             Ok(n) => files_deleted = n,
             Err(e) => {
-                let msg = format!(
-                    "PV {} removed from registry but failed to delete data: {e}",
-                    params.pv
-                );
-                return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+                tracing::error!(pv = params.pv, "Failed to delete PV data: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("PV {} removed but failed to delete data", params.pv)).into_response();
             }
         }
     }
@@ -488,8 +496,8 @@ pub async fn change_archival_parameters(
             return (StatusCode::NOT_FOUND, msg).into_response();
         }
         Err(e) => {
-            let msg = format!("Failed to update parameters for {}: {e}", params.pv);
-            return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+            tracing::error!(pv = params.pv, "Failed to update parameters: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update parameters for {}", params.pv)).into_response();
         }
         Ok(true) => {}
     }
@@ -508,11 +516,8 @@ pub async fn change_archival_parameters(
     if record.status == PvStatus::Active {
         let _ = state.archiver.pause_pv(&params.pv);
         if let Err(e) = state.archiver.resume_pv(&params.pv).await {
-            let msg = format!(
-                "Updated parameters but failed to restart {}: {e}",
-                params.pv
-            );
-            return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+            tracing::error!(pv = params.pv, "Updated parameters but failed to restart: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Updated parameters but failed to restart {}", params.pv)).into_response();
         }
     }
 
@@ -539,12 +544,12 @@ pub async fn abort_archiving_pv(
             }
         }
         Ok(None) => return (StatusCode::NOT_FOUND, format!("PV {} not found", params.pv)).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error(e),
     }
 
     if let Err(e) = state.archiver.stop_pv(&params.pv) {
-        let msg = format!("Failed to abort archiving PV {}: {e}", params.pv);
-        return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+        tracing::error!(pv = params.pv, "Failed to abort archiving: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to abort archiving PV {}", params.pv)).into_response();
     }
 
     let msg = format!("Successfully aborted archiving PV {} (data retained)", params.pv);

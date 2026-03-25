@@ -5,12 +5,13 @@ use axum::response::{IntoResponse, Response};
 use archiver_core::registry::{PvStatus, SampleMode};
 
 use crate::dto::mgmt::*;
+use crate::errors::internal_error;
 use crate::AppState;
 
 pub async fn export_config(State(state): State<AppState>) -> Response {
     let records = match state.pv_repo.all_records() {
         Ok(r) => r,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error(e),
     };
 
     let exports: Vec<ExportRecord> = records
@@ -72,7 +73,10 @@ pub async fn import_config(
             r.egu.as_deref(),
         ) {
             Ok(()) => imported += 1,
-            Err(e) => errors.push(format!("{}: {e}", r.pv_name)),
+            Err(e) => {
+                tracing::warn!(pv = r.pv_name, "Import failed: {e}");
+                errors.push(format!("Failed to import {}", r.pv_name));
+            }
         }
     }
 

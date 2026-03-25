@@ -1,12 +1,12 @@
 use std::time::{Duration, SystemTime};
 
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use archiver_core::registry::PvStatus;
 
 use crate::dto::mgmt::*;
+use crate::errors::internal_error;
 use crate::AppState;
 
 pub async fn get_paused_pvs_report(State(state): State<AppState>) -> Response {
@@ -24,7 +24,7 @@ pub async fn get_paused_pvs_report(State(state): State<AppState>) -> Response {
                 .collect();
             axum::Json(entries).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => internal_error(e),
     }
 }
 
@@ -64,7 +64,7 @@ pub async fn get_recently_added_pvs(State(state): State<AppState>) -> Response {
                 .collect();
             axum::Json(entries).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => internal_error(e),
     }
 }
 
@@ -78,7 +78,7 @@ pub async fn get_recently_modified_pvs(State(state): State<AppState>) -> Respons
                 .collect();
             axum::Json(entries).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => internal_error(e),
     }
 }
 
@@ -92,6 +92,6 @@ pub async fn get_silent_pvs_report(State(state): State<AppState>) -> Response {
                 .collect();
             axum::Json(entries).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => internal_error(e),
     }
 }
