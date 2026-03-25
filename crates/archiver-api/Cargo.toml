@@ -1,0 +1,23 @@
+[package]
+name = "archiver-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+archiver-core = { workspace = true }
+archiver-proto = { workspace = true }
+prost = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+archiver-engine = { workspace = true }
+reqwest = { workspace = true }
+dashmap = { workspace = true }
+urlencoding = { workspace = true }
+futures = { workspace = true }

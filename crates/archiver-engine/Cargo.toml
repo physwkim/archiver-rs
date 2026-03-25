@@ -1,0 +1,18 @@
+[package]
+name = "archiver-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+archiver-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+dashmap = { workspace = true }
+chrono = { workspace = true }
+epics-base-rs = { workspace = true }
+tokio-util = { workspace = true }

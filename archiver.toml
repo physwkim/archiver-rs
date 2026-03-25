@@ -1,0 +1,30 @@
+listen_addr = "0.0.0.0"
+listen_port = 17665
+
+[storage.sts]
+root_folder = "/tmp/archiver/sts"
+partition_granularity = "hour"
+hold = 5
+gather = 3
+
+[storage.mts]
+root_folder = "/tmp/archiver/mts"
+partition_granularity = "day"
+hold = 30
+gather = 10
+
+[storage.lts]
+root_folder = "/tmp/archiver/lts"
+partition_granularity = "year"
+hold = 10
+gather = 5
+
+[engine]
+write_period_secs = 10
+
+# Uncomment to enable Bluesky Kafka integration
+# [bluesky]
+# bootstrap_servers = "localhost:9092"
+# topic = "bluesky.documents"
+# group_id = "archiver-bluesky"
+# beamline = "BL1"

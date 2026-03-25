@@ -1,0 +1,10 @@
+[package]
+name = "archiver-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }

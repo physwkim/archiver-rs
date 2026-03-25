@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EPICS Archiver - Management</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #333; }
+  .header { background: #1a237e; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+  .header h1 { font-size: 20px; font-weight: 500; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tab { padding: 8px 16px; border: 1px solid #ddd; background: white; cursor: pointer; border-radius: 4px 4px 0 0; font-size: 14px; }
+  .tab.active { background: #1a237e; color: white; border-color: #1a237e; }
+  .panel { display: none; background: white; border: 1px solid #ddd; border-radius: 0 4px 4px 4px; padding: 20px; }
+  .panel.active { display: block; }
+  .form-row { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+  input[type="text"], textarea, select { padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+  input[type="text"] { width: 300px; }
+  textarea { width: 100%; min-height: 100px; font-family: monospace; }
+  button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
+  .btn-primary { background: #1a237e; color: white; }
+  .btn-primary:hover { background: #283593; }
+  .btn-danger { background: #c62828; color: white; }
+  .btn-danger:hover { background: #d32f2f; }
+  .btn-secondary { background: #757575; color: white; }
+  .btn-secondary:hover { background: #616161; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; }
+  th { background: #fafafa; font-weight: 600; position: sticky; top: 0; }
+  .table-wrap { max-height: 500px; overflow-y: auto; }
+  .status-badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 500; }
+  .status-active { background: #e8f5e9; color: #2e7d32; }
+  .status-paused { background: #fff3e0; color: #e65100; }
+  .status-error { background: #ffebee; color: #c62828; }
+  .status-disconnected { background: #fce4ec; color: #880e4f; }
+  .stats { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+  .stat-card { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 16px 24px; text-align: center; min-width: 120px; }
+  .stat-card .value { font-size: 28px; font-weight: 700; color: #1a237e; }
+  .stat-card .label { font-size: 12px; color: #666; margin-top: 4px; }
+  .msg { padding: 12px; border-radius: 4px; margin-top: 12px; font-size: 14px; }
+  .msg-ok { background: #e8f5e9; color: #2e7d32; }
+  .msg-err { background: #ffebee; color: #c62828; }
+  .loading { color: #666; font-style: italic; }
+  #results { margin-top: 12px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>EPICS Archiver Appliance - Management Console</h1>
+</div>
+
+<div class="container">
+  <div class="stats" id="stats"></div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="pvs">PV List</div>
+    <div class="tab" data-tab="search">Search</div>
+    <div class="tab" data-tab="archive">Archive PV</div>
+    <div class="tab" data-tab="bulk">Bulk Operations</div>
+    <div class="tab" data-tab="reports">Reports</div>
+    <div class="tab" data-tab="cluster">Cluster</div>
+  </div>
+
+  <!-- PV List -->
+  <div class="panel active" id="panel-pvs">
+    <div class="form-row">
+      <button class="btn-primary" onclick="loadAllPVs()">Refresh</button>
+      <label style="font-size:14px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="pvlist-cluster"> Include cluster</label>
+    </div>
+    <div id="pv-list-results"></div>
+  </div>
+
+  <!-- Search -->
+  <div class="panel" id="panel-search">
+    <div class="form-row">
+      <input type="text" id="search-pattern" placeholder="Pattern (e.g. SIM:*)" />
+      <button class="btn-primary" onclick="searchPVs()">Search</button>
+      <label style="font-size:14px;display:flex;align-items:center;gap:4px"><input type="checkbox" id="search-cluster"> Include cluster</label>
+    </div>
+    <div id="search-results"></div>
+  </div>
+
+  <!-- Archive PV -->
+  <div class="panel" id="panel-archive">
+    <div class="form-row">
+      <input type="text" id="archive-pv" placeholder="PV Name" />
+      <select id="archive-method">
+        <option value="monitor">Monitor</option>
+        <option value="scan">Scan</option>
+      </select>
+      <input type="text" id="archive-period" placeholder="Period (s)" style="width:100px" />
+      <button class="btn-primary" onclick="archivePV()">Archive</button>
+    </div>
+    <div id="archive-msg"></div>
+  </div>
+
+  <!-- Bulk Operations -->
+  <div class="panel" id="panel-bulk">
+    <p style="margin-bottom:8px;font-size:14px;color:#666">Enter PV names, one per line:</p>
+    <textarea id="bulk-pvs" placeholder="PV:A&#10;PV:B&#10;PV:C"></textarea>
+    <div class="form-row" style="margin-top:8px">
+      <button class="btn-primary" onclick="bulkOp('archivePV')">Archive All</button>
+      <button class="btn-secondary" onclick="bulkOp('pauseArchivingPV')">Pause All</button>
+      <button class="btn-secondary" onclick="bulkOp('resumeArchivingPV')">Resume All</button>
+    </div>
+    <div id="bulk-results"></div>
+  </div>
+
+  <!-- Reports -->
+  <div class="panel" id="panel-reports">
+    <div class="form-row">
+      <button class="btn-primary" onclick="loadReport('getPausedPVsReport','Paused PVs')">Paused</button>
+      <button class="btn-primary" onclick="loadReport('getNeverConnectedPVs','Never Connected')">Never Connected</button>
+      <button class="btn-primary" onclick="loadReport('getCurrentlyDisconnectedPVs','Disconnected')">Disconnected</button>
+      <button class="btn-primary" onclick="loadReport('getRecentlyAddedPVs','Recently Added')">Recently Added</button>
+      <button class="btn-primary" onclick="loadReport('getRecentlyModifiedPVs','Recently Modified')">Recently Modified</button>
+      <button class="btn-primary" onclick="loadReport('getSilentPVsReport','Silent PVs')">Silent</button>
+    </div>
+    <div id="report-results"></div>
+  </div>
+
+  <!-- Cluster -->
+  <div class="panel" id="panel-cluster">
+    <button class="btn-primary" onclick="loadClusterInfo()">Refresh</button>
+    <div id="cluster-results"><p style="color:#666">Click Refresh to load cluster information.</p></div>
+  </div>
+</div>
+
+<script>
+const BASE = '/mgmt/bpl';
+
+// Tabs
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById('panel-' + t.dataset.tab).classList.add('active');
+  });
+});
+
+async function api(path, opts) {
+  const r = await fetch(BASE + '/' + path, opts);
+  return r;
+}
+
+function statusBadge(s) {
+  const cls = s && s.includes('archived') ? 'active' : s === 'Paused' ? 'paused' : s === 'Error' ? 'error' : 'disconnected';
+  return `<span class="status-badge status-${cls}">${s || 'Unknown'}</span>`;
+}
+
+// Stats
+async function loadStats() {
+  try {
+    const r = await api('getPVCount');
+    const d = await r.json();
+    document.getElementById('stats').innerHTML = `
+      <div class="stat-card"><div class="value">${d.total}</div><div class="label">Total PVs</div></div>
+      <div class="stat-card"><div class="value">${d.active}</div><div class="label">Active</div></div>
+      <div class="stat-card"><div class="value">${d.paused}</div><div class="label">Paused</div></div>
+    `;
+  } catch(e) { console.error(e); }
+}
+
+// PV List
+async function loadAllPVs() {
+  const el = document.getElementById('pv-list-results');
+  el.innerHTML = '<p class="loading">Loading...</p>';
+  try {
+    const clusterFlag = document.getElementById('pvlist-cluster').checked ? '?cluster=true' : '';
+    const r = await api('getAllPVs' + clusterFlag);
+    const pvs = await r.json();
+    if (!pvs.length) { el.innerHTML = '<p>No PVs found.</p>'; return; }
+    let html = '<div class="table-wrap"><table><tr><th>PV Name</th><th>Actions</th></tr>';
+    for (const pv of pvs) {
+      html += `<tr><td>${esc(pv)}</td><td>
+        <button class="btn-primary" onclick="showStatus('${esc(pv)}')" style="padding:4px 8px;font-size:12px">Status</button>
+        <button class="btn-secondary" onclick="pausePV('${esc(pv)}')" style="padding:4px 8px;font-size:12px">Pause</button>
+        <button class="btn-secondary" onclick="resumePV('${esc(pv)}')" style="padding:4px 8px;font-size:12px">Resume</button>
+      </td></tr>`;
+    }
+    html += '</table></div>';
+    el.innerHTML = html;
+  } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
+}
+
+async function showStatus(pv) {
+  try {
+    const r = await api('getPVStatus?pv=' + encodeURIComponent(pv));
+    const d = await r.json();
+    alert(JSON.stringify(d, null, 2));
+  } catch(e) { alert('Error: ' + e); }
+}
+
+async function pausePV(pv) {
+  const r = await api('pauseArchivingPV?pv=' + encodeURIComponent(pv));
+  const t = await r.text();
+  alert(t);
+  loadStats();
+}
+
+async function resumePV(pv) {
+  const r = await api('resumeArchivingPV?pv=' + encodeURIComponent(pv));
+  const t = await r.text();
+  alert(t);
+  loadStats();
+}
+
+// Search
+async function searchPVs() {
+  const pattern = document.getElementById('search-pattern').value;
+  const el = document.getElementById('search-results');
+  if (!pattern) { el.innerHTML = '<div class="msg msg-err">Enter a pattern</div>'; return; }
+  el.innerHTML = '<p class="loading">Searching...</p>';
+  try {
+    const clusterFlag = document.getElementById('search-cluster').checked ? '&cluster=true' : '';
+    const r = await api('getMatchingPVs?pv=' + encodeURIComponent(pattern) + clusterFlag);
+    const pvs = await r.json();
+    if (!pvs.length) { el.innerHTML = '<p>No matches.</p>'; return; }
+    let html = '<div class="table-wrap"><table><tr><th>PV Name</th></tr>';
+    for (const pv of pvs) html += `<tr><td>${esc(pv)}</td></tr>`;
+    html += '</table></div>';
+    el.innerHTML = html;
+  } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
+}
+
+// Archive
+async function archivePV() {
+  const pv = document.getElementById('archive-pv').value;
+  const method = document.getElementById('archive-method').value;
+  const period = document.getElementById('archive-period').value;
+  const el = document.getElementById('archive-msg');
+  if (!pv) { el.innerHTML = '<div class="msg msg-err">Enter a PV name</div>'; return; }
+  try {
+    const body = { pv, sampling_method: method };
+    if (period) body.sampling_period = parseFloat(period);
+    const r = await api('archivePV', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const t = await r.text();
+    el.innerHTML = `<div class="msg ${r.ok ? 'msg-ok' : 'msg-err'}">${esc(t)}</div>`;
+    loadStats();
+  } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
+}
+
+// Bulk
+async function bulkOp(endpoint) {
+  const text = document.getElementById('bulk-pvs').value.trim();
+  const el = document.getElementById('bulk-results');
+  if (!text) { el.innerHTML = '<div class="msg msg-err">Enter PV names</div>'; return; }
+  el.innerHTML = '<p class="loading">Processing...</p>';
+  try {
+    const r = await api(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: text,
+    });
+    const data = await r.json();
+    let html = '<div class="table-wrap"><table><tr><th>PV Name</th><th>Result</th></tr>';
+    for (const item of data) {
+      html += `<tr><td>${esc(item.pvName)}</td><td>${esc(item.status)}</td></tr>`;
+    }
+    html += '</table></div>';
+    el.innerHTML = html;
+    loadStats();
+  } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
+}
+
+// Reports
+async function loadReport(endpoint, title) {
+  const el = document.getElementById('report-results');
+  el.innerHTML = '<p class="loading">Loading ' + title + '...</p>';
+  try {
+    const r = await api(endpoint);
+    const data = await r.json();
+    if (!data.length) { el.innerHTML = `<p>No ${title.toLowerCase()} found.</p>`; return; }
+    let html = `<h3 style="margin:12px 0 8px">${esc(title)} (${data.length})</h3>`;
+    html += '<div class="table-wrap"><table><tr><th>PV Name</th><th>Status</th><th>Last Event</th></tr>';
+    for (const item of data) {
+      html += `<tr><td>${esc(item.pvName)}</td><td>${statusBadge(item.status)}</td><td>${item.lastEvent || '-'}</td></tr>`;
+    }
+    html += '</table></div>';
+    el.innerHTML = html;
+  } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
+}
+
+// Cluster
+async function loadClusterInfo() {
+  const el = document.getElementById('cluster-results');
+  el.innerHTML = '<p class="loading">Loading cluster info...</p>';
+  try {
+    const r = await api('getAppliancesInCluster');
+    const data = await r.json();
+    if (!data.length) { el.innerHTML = '<p>Not running in cluster mode.</p>'; return; }
+    let html = '<h3 style="margin:12px 0 8px">Appliances in Cluster (' + data.length + ')</h3>';
+    html += '<div class="table-wrap"><table><tr><th>Identity</th><th>Mgmt URL</th><th>Retrieval URL</th><th>Engine URL</th><th>ETL URL</th></tr>';
+    for (const a of data) {
+      html += `<tr><td>${esc(a.identity)}</td><td>${esc(a.mgmtURL)}</td><td>${esc(a.retrievalURL)}</td><td>${esc(a.engineURL || '-')}</td><td>${esc(a.etlURL || '-')}</td></tr>`;
+    }
+    html += '</table></div>';
+    el.innerHTML = html;
+  } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// Init
+loadStats();
+loadAllPVs();
+</script>
+</body>
+</html>
