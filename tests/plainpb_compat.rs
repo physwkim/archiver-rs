@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use archiver_core::storage::plainpb::codec;
 use archiver_core::storage::plainpb::PlainPbStoragePlugin;
 use archiver_core::storage::partition::PartitionGranularity;
-use archiver_core::storage::traits::{EventStream, StoragePlugin};
+use archiver_core::storage::traits::StoragePlugin;
 use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
 
 use chrono::{TimeZone, Utc};

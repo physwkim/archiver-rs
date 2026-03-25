@@ -229,33 +229,25 @@ async fn archive_pv(
     let is_proxied = headers.get("X-Archiver-Proxied").is_some();
     let mut results = Vec::with_capacity(pvs.len());
 
-    // In cluster mode, group by peer.
+    // In cluster mode, check for duplicates before archiving locally.
     if !is_proxied {
         if let Some(ref cluster) = state.cluster {
-            let mut remote_batches: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            let mut local_pvs = Vec::new();
             for pv in &pvs {
-                // Check if already archived somewhere in cluster.
-                if let Some(resolved) = cluster.resolve_peer(pv).await {
+                if cluster.resolve_peer(pv).await.is_some() {
                     results.push(BulkResult {
                         pv_name: pv.clone(),
                         status: "Already archived on peer".to_string(),
                     });
-                    continue;
+                } else {
+                    let status = match state.channel_mgr.archive_pv(pv, &SampleMode::Monitor).await {
+                        Ok(()) => "Archive request submitted".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    results.push(BulkResult {
+                        pv_name: pv.clone(),
+                        status,
+                    });
                 }
-                local_pvs.push(pv.clone());
-            }
-
-            for pv in &local_pvs {
-                let status = match state.channel_mgr.archive_pv(pv, &SampleMode::Monitor).await {
-                    Ok(()) => "Archive request submitted".to_string(),
-                    Err(e) => e.to_string(),
-                };
-                results.push(BulkResult {
-                    pv_name: pv.clone(),
-                    status,
-                });
             }
             return axum::Json(results).into_response();
         }
@@ -289,7 +281,12 @@ async fn archive_single_pv(
             if let Some(ref cluster) = state.cluster {
                 if target != cluster.identity().name {
                     if let Some(peer) = cluster.find_peer_by_name(target) {
-                        let body = serde_json::json!({ "pv": pv });
+                        let mut body = serde_json::json!({ "pv": pv });
+                        // Preserve sampling config when forwarding.
+                        if let SampleMode::Scan { period_secs } = sample_mode {
+                            body["sampling_method"] = serde_json::json!("scan");
+                            body["sampling_period"] = serde_json::json!(period_secs);
+                        }
                         let bytes = axum::body::Bytes::from(body.to_string());
                         return match cluster.proxy_mgmt_post(&peer.mgmt_url, "archivePV", bytes).await {
                             Ok(resp) => resp,

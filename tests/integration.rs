@@ -1,14 +1,13 @@
 //! End-to-end integration tests.
 
-use std::sync::Arc;
 use std::time::SystemTime;
 
 use archiver_bluesky::documents::BlueskyDocument;
 use archiver_bluesky::pv_mapper::PvMapper;
 use archiver_core::storage::plainpb::PlainPbStoragePlugin;
 use archiver_core::storage::partition::PartitionGranularity;
-use archiver_core::storage::traits::{EventStream, StoragePlugin};
-use archiver_core::types::{ArchDbType, ArchiverValue};
+use archiver_core::storage::traits::StoragePlugin;
+use archiver_core::types::ArchiverValue;
 
 use chrono::{TimeZone, Utc};
 

@@ -569,7 +569,7 @@ mod tests {
         let result = json_value_to_archiver(&val);
         // serde_json::Number from integer literal: is_i64() = true
         assert!(result.is_some());
-        let (dbr, av) = result.unwrap();
+        let (_dbr, av) = result.unwrap();
         // JSON numbers from integer literals are treated as integers.
         assert!(matches!(av, ArchiverValue::ScalarInt(42) | ArchiverValue::ScalarDouble(_)));
     }
