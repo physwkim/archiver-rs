@@ -33,6 +33,8 @@ pub struct ClusterClient {
     peers: Vec<PeerConfig>,
     pv_cache: DashMap<String, CachedPeer>,
     cache_ttl: Duration,
+    /// Shared cluster API key for inter-peer authentication.
+    api_key: Option<String>,
 }
 
 impl ClusterClient {
@@ -47,11 +49,21 @@ impl ClusterClient {
             peers: config.peers.clone(),
             pv_cache: DashMap::new(),
             cache_ttl: Duration::from_secs(config.cache_ttl_secs),
+            api_key: config.api_key.clone(),
         }
     }
 
     pub fn identity(&self) -> &ApplianceIdentity {
         &self.identity
+    }
+
+    /// Apply cluster API key to an outgoing request if configured.
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(ref key) = self.api_key {
+            builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
+        } else {
+            builder
+        }
     }
 
     pub fn peers(&self) -> &[PeerConfig] {
@@ -137,12 +149,11 @@ impl ClusterClient {
             format!("{peer_retrieval_url}/{path}?{query_string}")
         };
 
-        let resp = self
+        let req = self
             .http_client
             .get(&url)
-            .header("X-Archiver-Proxied", "true")
-            .send()
-            .await?;
+            .header("X-Archiver-Proxied", "true");
+        let resp = self.apply_auth(req).send().await?;
 
         let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY);
@@ -178,12 +189,11 @@ impl ClusterClient {
             format!("{peer_mgmt_url}/{endpoint}?{query_string}")
         };
 
-        let resp = self
+        let req = self
             .http_client
             .get(&url)
-            .header("X-Archiver-Proxied", "true")
-            .send()
-            .await?;
+            .header("X-Archiver-Proxied", "true");
+        let resp = self.apply_auth(req).send().await?;
 
         let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY);
@@ -212,14 +222,13 @@ impl ClusterClient {
     ) -> anyhow::Result<Response> {
         let url = format!("{peer_mgmt_url}/{endpoint}");
 
-        let resp = self
+        let req = self
             .http_client
             .post(&url)
             .header("X-Archiver-Proxied", "true")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .await?;
+            .body(body);
+        let resp = self.apply_auth(req).send().await?;
 
         let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY);
@@ -483,6 +492,7 @@ mod tests {
                 mgmt_url: "http://app1:17665/mgmt/bpl".to_string(),
                 retrieval_url: "http://app1:17665/retrieval".to_string(),
             }],
+            api_key: None,
         }
     }
 

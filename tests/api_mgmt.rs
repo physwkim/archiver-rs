@@ -37,6 +37,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         api_keys: None,
         metrics_handle: None,
         rate_limiter: None,
+        trust_proxy_headers: false,
     };
     (build_router(state, &SecurityConfig::default()), dir)
 }
@@ -77,6 +78,7 @@ async fn build_test_app_with_pvs() -> (axum::Router, Arc<PvRegistry>, tempfile::
         api_keys: None,
         metrics_handle: None,
         rate_limiter: None,
+        trust_proxy_headers: false,
     };
     (build_router(state, &SecurityConfig::default()), registry, dir)
 }
@@ -475,6 +477,7 @@ async fn test_export_import_preserves_status() {
         api_keys: None,
         metrics_handle: None,
         rate_limiter: None,
+        trust_proxy_headers: false,
     };
     let app2 = build_router(state2, &SecurityConfig::default());
 
@@ -544,6 +547,7 @@ async fn build_test_app_with_auth() -> (axum::Router, tempfile::TempDir) {
         api_keys: Some(vec!["test-secret-key".to_string()]),
         metrics_handle: None,
         rate_limiter: None,
+        trust_proxy_headers: false,
     };
     (build_router(state, &SecurityConfig::default()), dir)
 }
@@ -641,4 +645,127 @@ async fn test_metadata_partial_update() {
     let r = reg.get_pv("TEST:Partial").unwrap().unwrap();
     assert_eq!(r.prec.as_deref(), Some("2"));
     assert_eq!(r.egu.as_deref(), Some("mm"));
+}
+
+// --- Rate limiting tests ---
+
+#[tokio::test]
+async fn test_rate_limiter_blocks_excess_requests() {
+    use archiver_api::security::RateLimiter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(PlainPbStoragePlugin::new(
+        "sts",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    ));
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
+        .await
+        .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
+    let repo = Arc::new(RegistryRepository::new(registry));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
+
+    // Very restrictive: 1 rps, burst of 2.
+    let limiter = Arc::new(RateLimiter::new(1, 2));
+
+    let state = AppState {
+        storage,
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
+        cluster: None,
+        api_keys: None,
+        metrics_handle: None,
+        rate_limiter: Some(limiter),
+        trust_proxy_headers: true,
+    };
+    let app = build_router(state, &SecurityConfig::default());
+
+    // The rate limiter reads X-Forwarded-For (trust_proxy_headers=true); simulate requests.
+    let mut ok_count = 0;
+    let mut throttled_count = 0;
+
+    for _ in 0..5 {
+        let req = Request::builder()
+            .uri("/health")
+            .header("x-forwarded-for", "10.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            throttled_count += 1;
+        } else {
+            ok_count += 1;
+        }
+    }
+
+    // With burst=2, at most 2 requests should succeed.
+    assert!(ok_count <= 2, "Expected at most 2 OK responses, got {ok_count}");
+    assert!(throttled_count >= 3, "Expected at least 3 throttled responses, got {throttled_count}");
+}
+
+#[tokio::test]
+async fn test_rate_limiter_isolates_by_ip() {
+    use archiver_api::security::RateLimiter;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(PlainPbStoragePlugin::new(
+        "sts",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    ));
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
+        .await
+        .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
+    let repo = Arc::new(RegistryRepository::new(registry));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
+
+    // 1 rps, burst 1 — very tight.
+    let limiter = Arc::new(RateLimiter::new(1, 1));
+
+    let state = AppState {
+        storage,
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
+        cluster: None,
+        api_keys: None,
+        metrics_handle: None,
+        rate_limiter: Some(limiter),
+        trust_proxy_headers: true,
+    };
+    let app = build_router(state, &SecurityConfig::default());
+
+    // First request from IP A — should succeed.
+    let req_a = Request::builder()
+        .uri("/health")
+        .header("x-forwarded-for", "10.0.0.1")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req_a).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Second request from IP A — should be throttled.
+    let req_a2 = Request::builder()
+        .uri("/health")
+        .header("x-forwarded-for", "10.0.0.1")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req_a2).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // First request from IP B — should succeed (different bucket).
+    let req_b = Request::builder()
+        .uri("/health")
+        .header("x-forwarded-for", "10.0.0.2")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req_b).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

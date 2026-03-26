@@ -197,6 +197,20 @@ async fn main() -> anyhow::Result<()> {
     // Build REST API.
     let repo = Arc::new(RegistryRepository::new(registry.clone()));
     let archiver_impl = Arc::new(ChannelArchiverControl::new(channel_mgr.clone()));
+    // Merge the cluster internal API key into the effective API key list so that
+    // proxied requests from peers authenticate via the shared cluster secret.
+    let effective_api_keys = {
+        let mut keys = config.api_keys.clone().unwrap_or_default();
+        if let Some(ref cc) = config.cluster {
+            if let Some(ref cluster_key) = cc.api_key {
+                if !keys.contains(cluster_key) {
+                    keys.push(cluster_key.clone());
+                }
+            }
+        }
+        if keys.is_empty() { None } else { Some(keys) }
+    };
+
     let app_state = AppState {
         storage: storage.clone(),
         pv_query: repo.clone(),
@@ -204,9 +218,10 @@ async fn main() -> anyhow::Result<()> {
         archiver_query: archiver_impl.clone(),
         archiver_cmd: archiver_impl,
         cluster,
-        api_keys: config.api_keys.clone(),
+        api_keys: effective_api_keys,
         metrics_handle,
         rate_limiter,
+        trust_proxy_headers: config.security.trust_proxy_headers,
     };
     let app = archiver_api::build_router(app_state, &config.security);
 
@@ -236,13 +251,17 @@ async fn main() -> anyhow::Result<()> {
         info!(addr, "REST API listening (TLS)");
         axum_server::bind_rustls(addr.parse()?, rustls_config)
             .handle(handle)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         info!(addr, "REST API listening");
 
-        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
             tokio::signal::ctrl_c().await.ok();
             info!("Shutdown signal received");
             let _ = shutdown_tx.send(true);

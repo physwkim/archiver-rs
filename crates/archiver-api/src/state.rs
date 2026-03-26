@@ -25,6 +25,7 @@ pub struct AppState {
     pub api_keys: Option<Vec<String>>,
     pub metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     pub rate_limiter: Option<Arc<RateLimiter>>,
+    pub trust_proxy_headers: bool,
 }
 
 /// Middleware that records HTTP request metrics.

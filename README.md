@@ -174,10 +174,11 @@ See [Cluster Mode](#cluster-mode) below.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `cors_origins` | string[] | `[]` (permissive) | Allowed CORS origins. Empty = allow all. |
-| `rate_limit_rps` | u32 | `0` (disabled) | Per-IP requests per second limit |
-| `rate_limit_burst` | u32 | `50` | Burst capacity for rate limiter |
+| `cors_origins` | string[] | `[]` (strict same-origin) | Allowed CORS origins. Empty = same-origin only. |
+| `rate_limit_rps` | u32 | `100` | Per-IP requests per second limit (0 = disabled) |
+| `rate_limit_burst` | u32 | `200` | Burst capacity for rate limiter |
 | `max_body_size` | usize | `10485760` (10 MB) | Maximum request body size in bytes |
+| `trust_proxy_headers` | bool | `false` | Trust `X-Forwarded-For` for client IP (enable behind reverse proxy) |
 
 ### `[tls]`
 
@@ -193,7 +194,7 @@ The archiver includes built-in security features that the Java Archiver Applianc
 - **TLS** — native HTTPS support via rustls (no need for a reverse proxy just for TLS)
 - **API key authentication** — write endpoints (archive, pause, resume, delete) require an `X-API-Key` header when `api_keys` is configured; read endpoints remain open
 - **Timing-safe key comparison** — API keys are compared using constant-time equality to prevent timing attacks
-- **CORS restriction** — configurable allowed origins (default: permissive for development; restrict in production)
+- **CORS restriction** — configurable allowed origins (default: same-origin only; add origins for cross-origin access)
 - **Rate limiting** — per-IP token bucket rate limiter to mitigate abuse
 - **Security headers** — `X-Content-Type-Options`, `X-Frame-Options`, `Content-Security-Policy`, `Referrer-Policy` added to all responses
 - **Request body size limits** — prevents oversized payloads from consuming memory
@@ -406,6 +407,7 @@ retrieval_url = "http://app2-host:17665/retrieval"
 | `identity.etl_url` | string | *required* | This appliance's ETL URL |
 | `cache_ttl_secs` | u64 | `300` | PV routing cache TTL in seconds |
 | `peer_timeout_secs` | u64 | `30` | HTTP timeout for peer requests |
+| `api_key` | string | *none* | Shared secret for inter-peer auth (required when `api_keys` is set) |
 | `peers[].name` | string | *required* | Peer appliance name |
 | `peers[].mgmt_url` | string | *required* | Peer management URL |
 | `peers[].retrieval_url` | string | *required* | Peer retrieval URL |
@@ -588,6 +590,7 @@ cors_origins = ["https://controls.example.com"]
 rate_limit_rps = 100
 rate_limit_burst = 200
 max_body_size = 10485760
+trust_proxy_headers = false  # set true if behind a trusted reverse proxy
 
 # Optional: Multi-appliance cluster
 [cluster.identity]
@@ -600,6 +603,7 @@ etl_url = "http://archiver0:17665"
 [cluster]
 cache_ttl_secs = 300
 peer_timeout_secs = 30
+api_key = "change-me-shared-cluster-secret"  # required when api_keys is set
 
 [[cluster.peers]]
 name = "appliance1"

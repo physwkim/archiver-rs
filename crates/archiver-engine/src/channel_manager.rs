@@ -92,12 +92,16 @@ impl ChannelManager {
         let count = active_pvs.len() as u64;
         info!(count, "Restoring PVs from registry");
 
+        let mut restored = 0u64;
         for record in active_pvs {
             if let Err(e) = self.start_archiving_internal(&record).await {
                 warn!(pv = record.pv_name, "Failed to restore PV: {e}");
                 self.registry.set_status(&record.pv_name, PvStatus::Error)?;
+            } else {
+                restored += 1;
             }
         }
+        metrics::gauge!("archiver_pvs_active").set(restored as f64);
 
         Ok(count)
     }
@@ -194,6 +198,7 @@ impl ChannelManager {
     pub fn pause_pv(&self, pv_name: &str) -> anyhow::Result<()> {
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
             handle.cancel_token.cancel();
+            metrics::gauge!("archiver_pvs_active").decrement(1.0);
         }
         self.registry.set_status(pv_name, PvStatus::Paused)?;
         info!(pv = pv_name, "Paused archiving");
@@ -222,6 +227,7 @@ impl ChannelManager {
         // Start the task first; only mark Active if it succeeds.
         self.start_archiving_internal(&record).await?;
         self.registry.set_status(pv_name, PvStatus::Active)?;
+        metrics::gauge!("archiver_pvs_active").increment(1.0);
         info!(pv = pv_name, "Resumed archiving");
         Ok(())
     }
@@ -231,9 +237,9 @@ impl ChannelManager {
     pub fn stop_pv(&self, pv_name: &str) -> anyhow::Result<()> {
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
             handle.cancel_token.cancel();
+            metrics::gauge!("archiver_pvs_active").decrement(1.0);
         }
         self.registry.set_status(pv_name, PvStatus::Inactive)?;
-        metrics::gauge!("archiver_pvs_active").decrement(1.0);
         info!(pv = pv_name, "Stopped archiving (inactive)");
         Ok(())
     }
@@ -242,9 +248,9 @@ impl ChannelManager {
     pub fn destroy_pv(&self, pv_name: &str) -> anyhow::Result<()> {
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
             handle.cancel_token.cancel();
+            metrics::gauge!("archiver_pvs_active").decrement(1.0);
         }
         self.registry.remove_pv(pv_name)?;
-        metrics::gauge!("archiver_pvs_active").decrement(1.0);
         info!(pv = pv_name, "Destroyed archiving channel");
         Ok(())
     }

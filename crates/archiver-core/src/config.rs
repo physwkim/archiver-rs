@@ -95,6 +95,11 @@ pub struct SecurityConfig {
     /// Maximum request body size in bytes (default 10MB).
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
+    /// Trust X-Forwarded-For header for client IP detection (e.g., behind a reverse proxy).
+    /// When false (default), only the direct connection IP is used for rate limiting.
+    /// Enable only when the server is behind a trusted reverse proxy.
+    #[serde(default)]
+    pub trust_proxy_headers: bool,
 }
 
 impl Default for SecurityConfig {
@@ -104,6 +109,7 @@ impl Default for SecurityConfig {
             rate_limit_rps: default_rate_limit_rps(),
             rate_limit_burst: default_rate_limit_burst(),
             max_body_size: default_max_body_size(),
+            trust_proxy_headers: false,
         }
     }
 }
@@ -155,6 +161,11 @@ pub struct ClusterConfig {
     pub peer_timeout_secs: u64,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    /// Shared secret for inter-peer authentication. When API keys are enabled,
+    /// all peers in the cluster must share the same `api_key` so that proxied
+    /// management requests authenticate successfully on the receiving peer.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 fn default_cache_ttl() -> u64 {

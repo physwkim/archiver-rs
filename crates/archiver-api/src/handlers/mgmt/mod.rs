@@ -120,7 +120,7 @@ async fn forward_pv_batch_to_peer(
     endpoint: &str,
     pv_names: &[String],
 ) -> Vec<BulkResult> {
-    let body = pv_names.join("\n");
+    let body = serde_json::to_string(pv_names).unwrap_or_default();
     match cluster
         .proxy_mgmt_post(mgmt_url, endpoint, body.into())
         .await

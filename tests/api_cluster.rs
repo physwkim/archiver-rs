@@ -35,6 +35,7 @@ async fn start_mock_peer(
         api_keys: None,
         metrics_handle: None,
         rate_limiter: None,
+        trust_proxy_headers: false,
     };
     let app = build_router(state, &SecurityConfig::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -71,6 +72,7 @@ async fn build_cluster_test_app(
             mgmt_url: format!("{peer_url}/mgmt/bpl"),
             retrieval_url: format!("{peer_url}/retrieval"),
         }],
+        api_key: None,
     };
 
     let repo = Arc::new(RegistryRepository::new(local_registry));
@@ -85,6 +87,7 @@ async fn build_cluster_test_app(
         api_keys: None,
         metrics_handle: None,
         rate_limiter: None,
+        trust_proxy_headers: false,
     };
     build_router(state, &SecurityConfig::default())
 }
@@ -503,4 +506,201 @@ async fn test_archive_pv_rejects_duplicate() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let text = body_to_string(resp.into_body()).await;
     assert!(text.contains("already archived"));
+}
+
+// --- Cluster + Auth tests ---
+
+/// Shared cluster internal key used by both local and peer in auth tests.
+const CLUSTER_INTERNAL_KEY: &str = "shared-cluster-secret";
+
+/// Build a cluster test app with API key authentication + cluster internal key.
+async fn build_cluster_test_app_with_auth(
+    local_registry: Arc<PvRegistry>,
+    local_storage: Arc<PlainPbStoragePlugin>,
+    peer_url: &str,
+) -> axum::Router {
+    let (channel_mgr, _rx) = ChannelManager::new(local_storage.clone(), local_registry.clone(), None)
+        .await
+        .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
+
+    let cluster_config = ClusterConfig {
+        identity: ApplianceIdentity {
+            name: "local".to_string(),
+            mgmt_url: "http://localhost:0/mgmt/bpl".to_string(),
+            retrieval_url: "http://localhost:0/retrieval".to_string(),
+            engine_url: "http://localhost:0".to_string(),
+            etl_url: "http://localhost:0".to_string(),
+        },
+        cache_ttl_secs: 1,
+        peer_timeout_secs: 5,
+        peers: vec![PeerConfig {
+            name: "peer0".to_string(),
+            mgmt_url: format!("{peer_url}/mgmt/bpl"),
+            retrieval_url: format!("{peer_url}/retrieval"),
+        }],
+        api_key: Some(CLUSTER_INTERNAL_KEY.to_string()),
+    };
+
+    let repo = Arc::new(RegistryRepository::new(local_registry));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
+    // Effective api_keys = user key + cluster internal key (mirrors main.rs logic).
+    let state = AppState {
+        storage: local_storage,
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
+        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
+        api_keys: Some(vec!["test-cluster-key".to_string(), CLUSTER_INTERNAL_KEY.to_string()]),
+        metrics_handle: None,
+        rate_limiter: None,
+        trust_proxy_headers: false,
+    };
+    build_router(state, &SecurityConfig::default())
+}
+
+/// Start a mock peer with API key auth enabled (accepts the shared cluster internal key).
+async fn start_mock_peer_with_auth(
+    registry: Arc<PvRegistry>,
+    storage: Arc<PlainPbStoragePlugin>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
+        .await
+        .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
+    let repo = Arc::new(RegistryRepository::new(registry));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
+    // Peer accepts its own key + the shared cluster key.
+    let state = AppState {
+        storage,
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
+        cluster: None,
+        api_keys: Some(vec!["peer-secret-key".to_string(), CLUSTER_INTERNAL_KEY.to_string()]),
+        metrics_handle: None,
+        rate_limiter: None,
+        trust_proxy_headers: false,
+    };
+    let app = build_router(state, &SecurityConfig::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), handle)
+}
+
+#[tokio::test]
+async fn test_cluster_proxy_authenticates_with_internal_key() {
+    // Peer has auth enabled — proxied requests authenticate via the shared cluster api_key.
+    let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
+    peer_reg
+        .register_pv("AUTH:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let (peer_url, _handle) = start_mock_peer_with_auth(peer_reg.clone(), peer_storage).await;
+
+    let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
+    let app = build_cluster_test_app_with_auth(local_reg, local_storage, &peer_url).await;
+
+    // Pause a PV on the peer — caller authenticates with user key, proxy uses cluster key.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/mgmt/bpl/pauseArchivingPV?pv=AUTH:PV")
+                .header("authorization", "Bearer test-cluster-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify PV was actually paused on the peer.
+    let record = peer_reg.get_pv("AUTH:PV").unwrap().unwrap();
+    assert_eq!(record.status, archiver_core::registry::PvStatus::Paused);
+}
+
+#[tokio::test]
+async fn test_x_archiver_proxied_header_does_not_bypass_auth() {
+    // External clients must NOT be able to bypass auth by adding X-Archiver-Proxied.
+    let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
+    let (peer_url, _handle) = start_mock_peer(peer_reg, peer_storage).await;
+
+    let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
+    let app = build_cluster_test_app_with_auth(local_reg, local_storage, &peer_url).await;
+
+    // Send request with X-Archiver-Proxied but NO valid API key — should be rejected.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/mgmt/bpl/pauseArchivingPV?pv=FAKE:PV")
+                .header("X-Archiver-Proxied", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_cluster_auth_rejects_unauthenticated_caller() {
+    // Even with cluster mode, the *caller* must authenticate.
+    let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
+    peer_reg
+        .register_pv("AUTH:PV2", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let (peer_url, _handle) = start_mock_peer(peer_reg, peer_storage).await;
+
+    let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
+    let app = build_cluster_test_app_with_auth(local_reg, local_storage, &peer_url).await;
+
+    // Pause without API key — should be rejected.
+    let resp = app
+        .oneshot(get_request("/mgmt/bpl/pauseArchivingPV?pv=AUTH:PV2"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_bulk_pause_cluster_with_auth() {
+    // Bulk pause with auth: should correctly forward to auth-enabled peer.
+    let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
+    peer_reg
+        .register_pv("REMOTE:BulkAuth", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let (peer_url, _handle) = start_mock_peer_with_auth(peer_reg.clone(), peer_storage).await;
+
+    let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
+    local_reg
+        .register_pv("LOCAL:BulkAuth", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let app = build_cluster_test_app_with_auth(local_reg.clone(), local_storage, &peer_url).await;
+
+    let body = r#"["LOCAL:BulkAuth", "REMOTE:BulkAuth"]"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/pauseArchivingPV")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test-cluster-key")
+        .body(Body::from(body))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_to_json(resp.into_body()).await;
+    let arr = json.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+
+    // Verify local PV was paused.
+    let local_pv = local_reg.get_pv("LOCAL:BulkAuth").unwrap().unwrap();
+    assert_eq!(local_pv.status, archiver_core::registry::PvStatus::Paused);
+
+    // Verify remote PV was paused on the peer.
+    let remote_pv = peer_reg.get_pv("REMOTE:BulkAuth").unwrap().unwrap();
+    assert_eq!(remote_pv.status, archiver_core::registry::PvStatus::Paused);
 }

@@ -84,11 +84,25 @@ pub(crate) async fn rate_limit(
     next: Next,
 ) -> Response {
     if let Some(ref limiter) = state.rate_limiter {
-        // Extract client IP from ConnectInfo or X-Forwarded-For.
-        let ip = request
+        // Extract client IP from ConnectInfo (direct connection address).
+        let connect_ip = request
             .extensions()
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map(|ci| ci.0.ip());
+
+        // Only trust X-Forwarded-For when explicitly configured (server behind a trusted proxy).
+        let ip = if state.trust_proxy_headers {
+            request
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+                .or(connect_ip)
+        } else {
+            connect_ip
+        };
+
         if let Some(ip) = ip {
             if !limiter.check(ip) {
                 return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
