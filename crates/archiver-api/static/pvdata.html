@@ -37,6 +37,9 @@
   .auto-refresh { display: flex; align-items: center; gap: 6px; font-size: 13px; }
   .auto-refresh select { padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
   #chart-container { min-height: 400px; position: relative; }
+  .chart-toolbar { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
+  .chart-toolbar .spacer { flex: 1; }
+  .chart-toolbar .hint { font-size: 11px; color: #999; }
   .msg { padding: 12px; border-radius: 4px; margin-top: 12px; font-size: 14px; }
   .msg-err { background: #ffebee; color: #c62828; }
   .msg-info { background: #e3f2fd; color: #1565c0; }
@@ -94,6 +97,22 @@
 
   <!-- Chart -->
   <div class="card">
+    <div class="chart-toolbar" id="chart-toolbar" style="display:none">
+      <button class="btn-outline btn-sm" onclick="resetZoom()">Reset Zoom</button>
+      <button class="btn-outline btn-sm" onclick="exportPNG()">PNG</button>
+      <button class="btn-outline btn-sm" onclick="exportCSV()">CSV</button>
+      <span style="margin-left:8px;font-size:12px;color:#666">Points:</span>
+      <select id="point-style" class="btn-sm" style="border:1px solid #ccc;border-radius:4px;font-size:12px;padding:3px 6px" onchange="applyPointStyle()">
+        <option value="none">None</option>
+        <option value="circle" selected>Circle</option>
+        <option value="square">Square</option>
+        <option value="diamond">Diamond</option>
+        <option value="triangle">Triangle</option>
+        <option value="cross">Cross</option>
+      </select>
+      <span class="spacer"></span>
+      <span class="hint">Drag: zoom | Shift+Drag: pan | Scroll: zoom | Double-click: reset</span>
+    </div>
     <div id="chart-container"></div>
     <div class="status-bar" id="status-bar"></div>
   </div>
@@ -116,6 +135,10 @@ let customFrom = null;
 let customTo = null;
 let uplot = null;
 let refreshTimer = null;
+let curXRange = null;       // current [min, max] in seconds — drives the x scale
+let originalXRange = null;  // for reset zoom
+let lastChartData = null;   // for export
+let lastPlottable = null;   // for CSV export
 
 // ── URL state ──
 
@@ -296,9 +319,21 @@ async function plotData() {
     // Merge timestamps and build uPlot data
     const { timestamps, series } = mergeTimeSeries(plottable);
 
+    // Pad boundaries so x-axis covers full requested range
+    const xMin = new Date(from).getTime() / 1000;
+    const xMax = new Date(to).getTime() / 1000;
+    if (!timestamps.length || timestamps[0] > xMin) {
+      timestamps.unshift(xMin);
+      series.forEach(s => s.unshift(null));
+    }
+    if (timestamps[timestamps.length - 1] < xMax) {
+      timestamps.push(xMax);
+      series.forEach(s => s.push(null));
+    }
+
     // Build uPlot options
+    const pointsCfg = getPointsConfig();
     const seriesOpts = [{ label: 'Time' }];
-    const legendParts = [];
     for (let i = 0; i < plottable.length; i++) {
       const pv = plottable[i].pv;
       const meta = plottable[i].result.meta || {};
@@ -309,14 +344,20 @@ async function plotData() {
         stroke: COLORS[pvList.indexOf(pv) % COLORS.length],
         width: 2,
         spanGaps: false,
+        points: pointsCfg,
       });
     }
 
     const chartData = [timestamps, ...series];
+    lastChartData = chartData;
+    lastPlottable = plottable;
 
     container.innerHTML = '';
     const width = container.clientWidth;
     const height = Math.max(400, Math.min(600, window.innerHeight - 350));
+
+    curXRange = [xMin, xMax];
+    originalXRange = [xMin, xMax];
 
     const opts = {
       width,
@@ -326,16 +367,21 @@ async function plotData() {
         { stroke: '#666', grid: { stroke: '#eee' } },
         { stroke: '#666', grid: { stroke: '#eee' } },
       ],
-      cursor: { sync: { key: 'sync' } },
+      cursor: {
+        drag: { x: false, y: false },
+      },
       scales: {
         x: {
           time: true,
-          range: [new Date(from).getTime() / 1000, new Date(to).getTime() / 1000],
+          auto: false,
+          range: () => curXRange,
         },
       },
     };
 
     uplot = new uPlot(opts, chartData, container);
+    document.getElementById('chart-toolbar').style.display = 'flex';
+    setupChartInteractions(height);
 
     // Resize handler
     const ro = new ResizeObserver(() => {
@@ -387,7 +433,223 @@ function clearChart() {
   const container = document.getElementById('chart-container');
   container.innerHTML = '';
   document.getElementById('status-bar').textContent = '';
+  document.getElementById('chart-toolbar').style.display = 'none';
   if (uplot) { uplot.destroy(); uplot = null; }
+  lastChartData = null;
+  lastPlottable = null;
+  originalXRange = null;
+}
+
+// ── Point shapes ──
+
+function drawShape(ctx, cx, cy, r, shape) {
+  switch (shape) {
+    case 'square':
+      ctx.rect(cx - r, cy - r, r * 2, r * 2);
+      break;
+    case 'diamond':
+      ctx.moveTo(cx, cy - r);
+      ctx.lineTo(cx + r, cy);
+      ctx.lineTo(cx, cy + r);
+      ctx.lineTo(cx - r, cy);
+      ctx.closePath();
+      break;
+    case 'triangle':
+      ctx.moveTo(cx, cy - r);
+      ctx.lineTo(cx + r, cy + r * 0.8);
+      ctx.lineTo(cx - r, cy + r * 0.8);
+      ctx.closePath();
+      break;
+    case 'cross': {
+      const t = r * 0.35;
+      ctx.moveTo(cx - t, cy - r);
+      ctx.lineTo(cx + t, cy - r);
+      ctx.lineTo(cx + t, cy - t);
+      ctx.lineTo(cx + r, cy - t);
+      ctx.lineTo(cx + r, cy + t);
+      ctx.lineTo(cx + t, cy + t);
+      ctx.lineTo(cx + t, cy + r);
+      ctx.lineTo(cx - t, cy + r);
+      ctx.lineTo(cx - t, cy + t);
+      ctx.lineTo(cx - r, cy + t);
+      ctx.lineTo(cx - r, cy - t);
+      ctx.lineTo(cx - t, cy - t);
+      ctx.closePath();
+      break;
+    }
+    default: // circle
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      break;
+  }
+}
+
+function makePointsPaths(shape) {
+  return (u, sidx, i0, i1) => {
+    const s = u.series[sidx];
+    const xdata = u.data[0];
+    const ydata = u.data[sidx];
+    const r = (s.points.size || 6) / 2 * devicePixelRatio;
+    const p = new Path2D();
+    for (let i = i0; i <= i1; i++) {
+      const v = ydata[i];
+      if (v == null) continue;
+      const cx = Math.round(u.valToPos(xdata[i], 'x', true));
+      const cy = Math.round(u.valToPos(v, u.series[sidx].scale || 'y', true));
+      p.moveTo(cx + r, cy);
+      drawShape(p, cx, cy, r, shape);
+    }
+    return { stroke: p, fill: p };
+  };
+}
+
+function getPointsConfig() {
+  const shape = document.getElementById('point-style').value;
+  if (shape === 'none') return { show: false };
+  const cfg = { show: true, size: 5, fill: 'white', width: 2 };
+  if (shape !== 'circle') cfg.paths = makePointsPaths(shape);
+  return cfg;
+}
+
+function applyPointStyle() {
+  if (!uplot) return;
+  const cfg = getPointsConfig();
+  for (let i = 1; i < uplot.series.length; i++) {
+    uplot.series[i].points = cfg;
+  }
+  uplot.redraw();
+}
+
+// ── Chart interactions: zoom, pan, reset ──
+
+function setXRange(min, max) {
+  curXRange = [min, max];
+  uplot.redraw();
+}
+
+function setupChartInteractions(chartHeight) {
+  const over = uplot.over;
+
+  // ── Drag-to-zoom (box select) ──
+  let dragStart = null;
+  const selectBox = document.createElement('div');
+  selectBox.style.cssText = 'position:absolute;top:0;height:100%;background:rgba(26,35,126,0.1);border:1px solid rgba(26,35,126,0.3);pointer-events:none;display:none;z-index:10;';
+  over.appendChild(selectBox);
+
+  over.addEventListener('mousedown', e => {
+    if (e.shiftKey || e.button !== 0) return;
+    dragStart = { x: e.clientX, left: e.offsetX };
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!dragStart) return;
+    const dx = e.clientX - dragStart.x;
+    if (Math.abs(dx) < 3) { selectBox.style.display = 'none'; return; }
+    selectBox.style.display = 'block';
+    const left = dx > 0 ? dragStart.left : dragStart.left + dx;
+    selectBox.style.left = Math.max(0, left) + 'px';
+    selectBox.style.width = Math.min(Math.abs(dx), over.clientWidth - Math.max(0, left)) + 'px';
+  });
+
+  document.addEventListener('mouseup', e => {
+    if (!dragStart) return;
+    const dx = e.clientX - dragStart.x;
+    selectBox.style.display = 'none';
+    if (Math.abs(dx) > 5) {
+      const rect = over.getBoundingClientRect();
+      const x1 = Math.max(0, Math.min(dragStart.x, e.clientX) - rect.left);
+      const x2 = Math.min(rect.width, Math.max(dragStart.x, e.clientX) - rect.left);
+      const newMin = uplot.posToVal(x1, 'x');
+      const newMax = uplot.posToVal(x2, 'x');
+      setXRange(newMin, newMax);
+    }
+    dragStart = null;
+  });
+
+  // ── Wheel zoom ──
+  over.addEventListener('wheel', e => {
+    e.preventDefault();
+    const rect = over.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const xVal = uplot.posToVal(cx, 'x');
+    const [min, max] = curXRange;
+    const range = max - min;
+    const factor = e.deltaY > 0 ? 1.25 : 0.8;
+    const newRange = range * factor;
+    const ratio = (xVal - min) / range;
+    setXRange(xVal - newRange * ratio, xVal + newRange * (1 - ratio));
+  }, { passive: false });
+
+  // ── Shift+Drag pan ──
+  let panStart = null;
+  over.addEventListener('mousedown', e => {
+    if (!e.shiftKey || e.button !== 0) return;
+    e.preventDefault();
+    over.style.cursor = 'grabbing';
+    panStart = { x: e.clientX, range: [...curXRange] };
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!panStart) return;
+    const dx = e.clientX - panStart.x;
+    const pxWidth = uplot.over.clientWidth;
+    const valRange = panStart.range[1] - panStart.range[0];
+    const shift = -(dx / pxWidth) * valRange;
+    setXRange(panStart.range[0] + shift, panStart.range[1] + shift);
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (panStart) { over.style.cursor = ''; panStart = null; }
+  });
+
+  // ── Double-click reset ──
+  over.addEventListener('dblclick', () => resetZoom());
+}
+
+function resetZoom() {
+  if (uplot && originalXRange) {
+    setXRange(originalXRange[0], originalXRange[1]);
+  }
+}
+
+// ── Export PNG ──
+
+function exportPNG() {
+  if (!uplot) return;
+  const src = uplot.ctx.canvas;
+  const tmp = document.createElement('canvas');
+  tmp.width = src.width;
+  tmp.height = src.height;
+  const ctx = tmp.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, tmp.width, tmp.height);
+  ctx.drawImage(src, 0, 0);
+  const a = document.createElement('a');
+  a.download = (pvList[0] || 'chart') + '.png';
+  a.href = tmp.toDataURL('image/png');
+  a.click();
+}
+
+// ── Export CSV ──
+
+function exportCSV() {
+  if (!lastChartData || !lastPlottable) return;
+  const ts = lastChartData[0];
+  const headers = ['timestamp', ...lastPlottable.map(p => p.pv)];
+  const lines = [headers.join(',')];
+  for (let i = 0; i < ts.length; i++) {
+    const row = [toLocalISO(new Date(ts[i] * 1000))];
+    for (let s = 1; s < lastChartData.length; s++) {
+      const v = lastChartData[s][i];
+      row.push(v != null ? v : '');
+    }
+    lines.push(row.join(','));
+  }
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.download = (pvList[0] || 'data') + '.csv';
+  a.href = URL.createObjectURL(blob);
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 // ── Auto-refresh ──
