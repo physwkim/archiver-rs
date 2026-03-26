@@ -9,7 +9,7 @@ A high-performance EPICS Channel Access archiver written in Rust, compatible wit
 - **Monitor and Scan sampling modes** — subscribe to value changes or poll at fixed intervals
 - **Post-processing** — `mean`, `min`, `max`, `std`, `firstSample` decimation on retrieval
 - **Multi-appliance cluster mode** — transparent PV routing and proxy across peers
-- **Bluesky integration** — archive scan metadata from Kafka as EPICS-style PVs
+
 - **Management UI** — web console for PV management, search, bulk operations, and reports
 - **Java-compatible REST API** — drop-in replacement for archiver viewer tools
 - **Built-in security** — optional TLS, API key authentication, CORS restriction, rate limiting, security headers, request body size limits, and internal error hiding — features the Java archiver relies on reverse proxies or network segmentation for
@@ -17,9 +17,9 @@ A high-performance EPICS Channel Access archiver written in Rust, compatible wit
 ## Prerequisites
 
 - **Rust** 1.75+ (2021 edition)
-- **CMake** — required to build the `rdkafka` Kafka client
+
 - **EPICS base** — `EPICS_CA_ADDR_LIST` must be set for Channel Access connectivity
-- **Kafka** (optional) — only needed if Bluesky integration is enabled
+
 
 ## Building
 
@@ -137,7 +137,7 @@ Navigate to `http://localhost:17665/mgmt/ui/` in your browser.
 | `listen_port` | u16 | `17665` | HTTP port (matches Java archiver default) |
 | `storage` | object | *required* | 3-tier storage config |
 | `engine` | object | defaults | EPICS engine settings |
-| `bluesky` | object | *disabled* | Kafka Bluesky integration |
+
 | `cluster` | object | *disabled* | Multi-appliance cluster mode |
 | `security` | object | defaults | Security settings (CORS, rate limiting, body limits) |
 | `tls` | object | *disabled* | TLS certificate configuration |
@@ -165,15 +165,6 @@ Recommended setup:
 |-------|------|---------|-------------|
 | `write_period_secs` | u64 | `10` | How often buffered samples flush to disk |
 | `policy_file` | path | *none* | Path to PV policy TOML file |
-
-### `[bluesky]`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `bootstrap_servers` | string | Kafka broker list (e.g., `"localhost:9092"`) |
-| `topic` | string | Kafka topic (e.g., `"bluesky.documents"`) |
-| `group_id` | string | Consumer group ID |
-| `beamline` | string | Beamline name, used in PV naming (`EXP:{beamline}:...`) |
 
 ### `[cluster]`
 
@@ -483,27 +474,6 @@ curl "http://app0-host:17665/mgmt/bpl/getPVStatus?pv=SIM:Cosine&cluster=true"
 
 The management UI includes a **Cluster** tab and **"Include cluster"** checkboxes on the PV List and Search tabs.
 
-## Bluesky Kafka Integration
-
-The archiver can consume [Bluesky](https://blueskyproject.io/) scan documents from Kafka and archive them as EPICS-style PVs.
-
-```toml
-[bluesky]
-bootstrap_servers = "kafka-broker:9092"
-topic = "bluesky.documents"
-group_id = "archiver-bluesky"
-beamline = "BL1"
-```
-
-Bluesky documents are mapped to PVs with the naming convention `EXP:{beamline}:{category}:{detail}`:
-
-| Document | PVs Created |
-|----------|-------------|
-| RunStart | `EXP:BL1:run:active`, `EXP:BL1:run:uid`, `EXP:BL1:run:plan_name`, `EXP:BL1:run:scan_id` |
-| Descriptor | `EXP:BL1:scan:num_points`, `EXP:BL1:det:{name}:*`, `EXP:BL1:motor:{name}:*` |
-| Event | `EXP:BL1:det:{name}:value`, `EXP:BL1:motor:{name}:value` |
-| RunStop | `EXP:BL1:run:active` set to 0 |
-
 ## REST API Reference
 
 ### Data Retrieval
@@ -618,13 +588,6 @@ cors_origins = ["https://controls.example.com"]
 rate_limit_rps = 100
 rate_limit_burst = 200
 max_body_size = 10485760
-
-# Optional: Bluesky Kafka integration
-[bluesky]
-bootstrap_servers = "kafka:9092"
-topic = "bluesky.documents"
-group_id = "archiver"
-beamline = "BL1"
 
 # Optional: Multi-appliance cluster
 [cluster.identity]

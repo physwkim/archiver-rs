@@ -14,8 +14,7 @@ pub struct ArchiverConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub engine: EngineConfig,
-    #[serde(default)]
-    pub bluesky: Option<BlueskyConfig>,
+
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
     /// Optional API keys for management endpoint authentication.
@@ -79,15 +78,6 @@ pub struct EngineConfig {
 
 fn default_write_period() -> u64 {
     10
-}
-
-/// Bluesky Kafka integration configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlueskyConfig {
-    pub bootstrap_servers: String,
-    pub topic: String,
-    pub group_id: String,
-    pub beamline: String,
 }
 
 /// Security configuration.

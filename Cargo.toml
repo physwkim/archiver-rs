@@ -3,7 +3,7 @@ members = [
     "crates/archiver-proto",
     "crates/archiver-core",
     "crates/archiver-engine",
-    "crates/archiver-bluesky",
+
     "crates/archiver-api",
 ]
 resolver = "2"
@@ -35,8 +35,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
-# Kafka
-rdkafka = { version = "0.37", features = ["cmake-build"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -87,7 +85,7 @@ tower = { version = "0.5", features = ["util"] }
 archiver-proto = { path = "crates/archiver-proto" }
 archiver-core = { path = "crates/archiver-core" }
 archiver-engine = { path = "crates/archiver-engine" }
-archiver-bluesky = { path = "crates/archiver-bluesky" }
+
 archiver-api = { path = "crates/archiver-api" }
 
 [package]
@@ -98,7 +96,7 @@ edition.workspace = true
 [dependencies]
 archiver-core = { workspace = true }
 archiver-engine = { workspace = true }
-archiver-bluesky = { workspace = true }
+
 archiver-api = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

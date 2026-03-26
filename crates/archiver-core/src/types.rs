@@ -170,7 +170,7 @@ impl ArchiverSample {
         ts.into()
     }
 
-    /// Create a sample from a UNIX epoch timestamp (seconds as f64, as Bluesky uses).
+    /// Create a sample from a UNIX epoch timestamp (seconds as f64).
     pub fn from_unix_timestamp(epoch_secs: f64, value: ArchiverValue) -> Self {
         let secs = epoch_secs as u64;
         let nanos = ((epoch_secs - secs as f64) * 1e9) as u32;

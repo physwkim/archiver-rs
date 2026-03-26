@@ -12,7 +12,7 @@ use archiver_api::security::RateLimiter;
 use archiver_api::services::impls::{ChannelArchiverControl, ClusterClientRouter, RegistryRepository};
 use archiver_api::services::traits::ClusterRouter;
 use archiver_api::AppState;
-use archiver_bluesky::consumer::BlueskyConsumer;
+
 use archiver_core::config::ArchiverConfig;
 use archiver_core::etl::executor::EtlExecutor;
 use archiver_core::registry::PvRegistry;
@@ -137,19 +137,6 @@ async fn main() -> anyhow::Result<()> {
     supervisor.spawn("etl_sts_mts", async move { etl_sts_mts.run(etl1_shutdown).await });
     let etl2_shutdown = supervisor.shutdown_rx();
     supervisor.spawn("etl_mts_lts", async move { etl_mts_lts.run(etl2_shutdown).await });
-
-    // Start Bluesky Kafka consumer if configured.
-    if let Some(ref bluesky_config) = config.bluesky {
-        let consumer =
-            BlueskyConsumer::new(bluesky_config.clone(), storage.clone(), registry.clone());
-        let bs_shutdown = supervisor.shutdown_rx();
-        supervisor.spawn("bluesky_consumer", async move {
-            if let Err(e) = consumer.run(bs_shutdown).await {
-                error!("Bluesky consumer error: {e}");
-            }
-        });
-        info!("Bluesky Kafka consumer enabled");
-    }
 
     // Initialize cluster client if configured.
     let cluster: Option<Arc<dyn ClusterRouter>> = config.cluster.as_ref().map(|cc| {

@@ -21,10 +21,3 @@ gather = 5
 
 [engine]
 write_period_secs = 10
-
-# Uncomment to enable Bluesky Kafka integration
-# [bluesky]
-# bootstrap_servers = "localhost:9092"
-# topic = "bluesky.documents"
-# group_id = "archiver-bluesky"
-# beamline = "BL1"
