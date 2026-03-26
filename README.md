@@ -16,7 +16,7 @@ A high-performance EPICS Channel Access archiver written in Rust, compatible wit
 
 ## Prerequisites
 
-- **Rust** 1.75+ (2021 edition)
+- **Rust** 1.85+ (2024 edition)
 
 - **EPICS base** — `EPICS_CA_ADDR_LIST` must be set for Channel Access connectivity
 
@@ -407,10 +407,11 @@ retrieval_url = "http://app2-host:17665/retrieval"
 | `identity.etl_url` | string | *required* | This appliance's ETL URL |
 | `cache_ttl_secs` | u64 | `300` | PV routing cache TTL in seconds |
 | `peer_timeout_secs` | u64 | `30` | HTTP timeout for peer requests |
-| `api_key` | string | *none* | Shared secret for inter-peer auth (required when `api_keys` is set) |
+| `api_key` | string | *none* | Fallback outbound credential for peers without their own key; also the inbound key this appliance accepts |
 | `peers[].name` | string | *required* | Peer appliance name |
 | `peers[].mgmt_url` | string | *required* | Peer management URL |
 | `peers[].retrieval_url` | string | *required* | Peer retrieval URL |
+| `peers[].api_key` | string | *none* | Per-peer outbound credential (overrides `cluster.api_key` for this peer) |
 
 ### Deploying a Cluster
 
@@ -466,6 +467,42 @@ curl "http://app0-host:17665/mgmt/bpl/getMatchingPVs?pv=SIM:*&cluster=true"
 # Check PV status across the cluster
 curl "http://app0-host:17665/mgmt/bpl/getPVStatus?pv=SIM:Cosine&cluster=true"
 ```
+
+### Per-Peer Credentials
+
+By default all peers share a single `cluster.api_key`. For finer-grained control, each peer can have its own outbound credential:
+
+```toml
+api_keys = ["external-mgmt-key"]
+
+[cluster]
+api_key = "shared-fallback"   # used for peers without their own key
+
+[cluster.identity]
+name = "appliance0"
+mgmt_url = "http://app0-host:17665/mgmt/bpl"
+retrieval_url = "http://app0-host:17665/retrieval"
+engine_url = "http://app0-host:17665"
+etl_url = "http://app0-host:17665"
+
+[[cluster.peers]]
+name = "appliance1"
+mgmt_url = "http://app1-host:17665/mgmt/bpl"
+retrieval_url = "http://app1-host:17665/retrieval"
+api_key = "peer1-specific-secret"   # this appliance uses this key when proxying to appliance1
+
+[[cluster.peers]]
+name = "appliance2"
+mgmt_url = "http://app2-host:17665/mgmt/bpl"
+retrieval_url = "http://app2-host:17665/retrieval"
+# no api_key → falls back to cluster.api_key ("shared-fallback")
+```
+
+**How it works:**
+
+- **Outbound (sending):** When this appliance proxies a request to a peer, it looks up the peer's `api_key` first. If not set, it falls back to `cluster.api_key`.
+- **Inbound (receiving):** Each appliance accepts its own `cluster.api_key` as the inbound credential — this is unchanged.
+- **Validation:** When `api_keys` is set, every peer must have either its own `api_key` or a `cluster.api_key` fallback. The archiver refuses to start otherwise.
 
 ### Cluster BPL Endpoints
 
@@ -542,6 +579,16 @@ Writes ──> [STS] ──ETL──> [MTS] ──ETL──> [LTS]
 - STS to MTS runs every `sts.hold * sts.partition_granularity` (e.g., 5 hours with `hold=5, granularity="hour"`)
 - MTS to LTS runs every `mts.hold * mts.partition_granularity` (e.g., 150 days with `hold=5, granularity="month"`)
 
+## Memory Management
+
+Unlike the Java archiver, which relies on JVM garbage collection and can exhibit unbounded heap growth, the Rust archiver uses bounded data structures with explicit resource management:
+
+- **Bounded sample channel** — EPICS monitor/scan producers write into a fixed-capacity channel (500K entries, ~100 MB max). When the channel is full, producers backpressure naturally instead of accumulating unbounded queues. This prevents memory exhaustion if the storage writer is temporarily slow.
+- **PV routing cache cleanup** — the cluster PV routing cache (`DashMap`) runs a background cleanup task every 5 minutes, removing expired entries that are no longer being queried.
+- **Rate limiter cleanup** — per-IP token buckets are pruned every 60 seconds, removing entries inactive for more than 5 minutes.
+- **Scoped file handles** — storage read/write operations open files within function scope and release them on completion.
+- **Streaming proxies** — cluster proxy responses are streamed, not buffered in memory.
+
 ## Running Tests
 
 ```bash
@@ -603,12 +650,13 @@ etl_url = "http://archiver0:17665"
 [cluster]
 cache_ttl_secs = 300
 peer_timeout_secs = 30
-api_key = "change-me-shared-cluster-secret"  # required when api_keys is set
+api_key = "change-me-shared-cluster-secret"  # fallback for peers without their own key
 
 [[cluster.peers]]
 name = "appliance1"
 mgmt_url = "http://archiver1:17665/mgmt/bpl"
 retrieval_url = "http://archiver1:17665/retrieval"
+api_key = "optional-per-peer-secret"  # overrides cluster.api_key for this peer
 ```
 
 ## Compatibility
