@@ -33,6 +33,7 @@ async fn start_mock_peer(
         archiver_cmd: archiver,
         cluster: None,
         api_keys: None,
+        cluster_api_key: None,
         metrics_handle: None,
         rate_limiter: None,
         trust_proxy_headers: false,
@@ -71,6 +72,7 @@ async fn build_cluster_test_app(
             name: "peer0".to_string(),
             mgmt_url: format!("{peer_url}/mgmt/bpl"),
             retrieval_url: format!("{peer_url}/retrieval"),
+            api_key: None,
         }],
         api_key: None,
     };
@@ -85,6 +87,7 @@ async fn build_cluster_test_app(
         archiver_cmd: archiver,
         cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
         api_keys: None,
+        cluster_api_key: None,
         metrics_handle: None,
         rate_limiter: None,
         trust_proxy_headers: false,
@@ -538,13 +541,14 @@ async fn build_cluster_test_app_with_auth(
             name: "peer0".to_string(),
             mgmt_url: format!("{peer_url}/mgmt/bpl"),
             retrieval_url: format!("{peer_url}/retrieval"),
+            api_key: None,
         }],
         api_key: Some(CLUSTER_INTERNAL_KEY.to_string()),
     };
 
     let repo = Arc::new(RegistryRepository::new(local_registry));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
-    // Effective api_keys = user key + cluster internal key (mirrors main.rs logic).
+    // External api_keys and cluster_api_key are separate privilege domains.
     let state = AppState {
         storage: local_storage,
         pv_query: repo.clone(),
@@ -552,7 +556,8 @@ async fn build_cluster_test_app_with_auth(
         archiver_query: archiver.clone(),
         archiver_cmd: archiver,
         cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
-        api_keys: Some(vec!["test-cluster-key".to_string(), CLUSTER_INTERNAL_KEY.to_string()]),
+        api_keys: Some(vec!["test-cluster-key".to_string()]),
+        cluster_api_key: Some(CLUSTER_INTERNAL_KEY.to_string()),
         metrics_handle: None,
         rate_limiter: None,
         trust_proxy_headers: false,
@@ -571,7 +576,7 @@ async fn start_mock_peer_with_auth(
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
-    // Peer accepts its own key + the shared cluster key.
+    // Peer has its own external key + the shared cluster key (separate fields).
     let state = AppState {
         storage,
         pv_query: repo.clone(),
@@ -579,7 +584,8 @@ async fn start_mock_peer_with_auth(
         archiver_query: archiver.clone(),
         archiver_cmd: archiver,
         cluster: None,
-        api_keys: Some(vec!["peer-secret-key".to_string(), CLUSTER_INTERNAL_KEY.to_string()]),
+        api_keys: Some(vec!["peer-secret-key".to_string()]),
+        cluster_api_key: Some(CLUSTER_INTERNAL_KEY.to_string()),
         metrics_handle: None,
         rate_limiter: None,
         trust_proxy_headers: false,
@@ -703,4 +709,213 @@ async fn test_bulk_pause_cluster_with_auth() {
     // Verify remote PV was paused on the peer.
     let remote_pv = peer_reg.get_pv("REMOTE:BulkAuth").unwrap().unwrap();
     assert_eq!(remote_pv.status, archiver_core::registry::PvStatus::Paused);
+}
+
+// --- Per-peer credential tests ---
+
+/// Per-peer key used by the test peer's inbound auth.
+const PEER_SPECIFIC_KEY: &str = "peer0-specific-secret";
+
+/// Start a mock peer that accepts a specific per-peer key (not the shared cluster key).
+async fn start_mock_peer_with_own_key(
+    registry: Arc<PvRegistry>,
+    storage: Arc<PlainPbStoragePlugin>,
+    inbound_key: &str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
+        .await
+        .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
+    let repo = Arc::new(RegistryRepository::new(registry));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
+    let state = AppState {
+        storage,
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
+        cluster: None,
+        api_keys: Some(vec!["unused-external".to_string()]),
+        cluster_api_key: Some(inbound_key.to_string()),
+        metrics_handle: None,
+        rate_limiter: None,
+        trust_proxy_headers: false,
+    };
+    let app = build_router(state, &SecurityConfig::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), handle)
+}
+
+#[tokio::test]
+async fn test_cluster_proxy_authenticates_with_per_peer_key() {
+    // Peer accepts only PEER_SPECIFIC_KEY as its inbound key.
+    // Local appliance has no cluster.api_key fallback — only the per-peer key.
+    let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
+    peer_reg
+        .register_pv("PPEER:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let (peer_url, _handle) = start_mock_peer_with_own_key(peer_reg.clone(), peer_storage, PEER_SPECIFIC_KEY).await;
+
+    let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
+    let (channel_mgr, _rx) = ChannelManager::new(local_storage.clone(), local_reg.clone(), None)
+        .await
+        .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
+
+    let cluster_config = ClusterConfig {
+        identity: ApplianceIdentity {
+            name: "local".to_string(),
+            mgmt_url: "http://localhost:0/mgmt/bpl".to_string(),
+            retrieval_url: "http://localhost:0/retrieval".to_string(),
+            engine_url: "http://localhost:0".to_string(),
+            etl_url: "http://localhost:0".to_string(),
+        },
+        cache_ttl_secs: 1,
+        peer_timeout_secs: 5,
+        peers: vec![PeerConfig {
+            name: "peer0".to_string(),
+            mgmt_url: format!("{peer_url}/mgmt/bpl"),
+            retrieval_url: format!("{peer_url}/retrieval"),
+            api_key: Some(PEER_SPECIFIC_KEY.to_string()),
+        }],
+        api_key: None, // no fallback
+    };
+
+    let repo = Arc::new(RegistryRepository::new(local_reg));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
+    let state = AppState {
+        storage: local_storage,
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
+        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
+        api_keys: Some(vec!["caller-key".to_string()]),
+        cluster_api_key: None,
+        metrics_handle: None,
+        rate_limiter: None,
+        trust_proxy_headers: false,
+    };
+    let app = build_router(state, &SecurityConfig::default());
+
+    // Pause a PV that only exists on the peer — proxy must use per-peer key.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/mgmt/bpl/pauseArchivingPV?pv=PPEER:PV")
+                .header("authorization", "Bearer caller-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify PV was actually paused on the peer.
+    let record = peer_reg.get_pv("PPEER:PV").unwrap().unwrap();
+    assert_eq!(record.status, archiver_core::registry::PvStatus::Paused);
+}
+
+#[tokio::test]
+async fn test_different_peers_get_different_keys() {
+    const PEER0_KEY: &str = "peer0-key";
+    const PEER1_KEY: &str = "peer1-key";
+
+    // Two peers, each with their own inbound key.
+    let (peer0_reg, peer0_storage, _peer0_dir) = new_registry_and_storage();
+    peer0_reg
+        .register_pv("P0:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let (peer0_url, _h0) = start_mock_peer_with_own_key(peer0_reg.clone(), peer0_storage, PEER0_KEY).await;
+
+    let (peer1_reg, peer1_storage, _peer1_dir) = new_registry_and_storage();
+    peer1_reg
+        .register_pv("P1:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let (peer1_url, _h1) = start_mock_peer_with_own_key(peer1_reg.clone(), peer1_storage, PEER1_KEY).await;
+
+    let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
+    let (channel_mgr, _rx) = ChannelManager::new(local_storage.clone(), local_reg.clone(), None)
+        .await
+        .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
+
+    let cluster_config = ClusterConfig {
+        identity: ApplianceIdentity {
+            name: "local".to_string(),
+            mgmt_url: "http://localhost:0/mgmt/bpl".to_string(),
+            retrieval_url: "http://localhost:0/retrieval".to_string(),
+            engine_url: "http://localhost:0".to_string(),
+            etl_url: "http://localhost:0".to_string(),
+        },
+        cache_ttl_secs: 1,
+        peer_timeout_secs: 5,
+        peers: vec![
+            PeerConfig {
+                name: "peer0".to_string(),
+                mgmt_url: format!("{peer0_url}/mgmt/bpl"),
+                retrieval_url: format!("{peer0_url}/retrieval"),
+                api_key: Some(PEER0_KEY.to_string()),
+            },
+            PeerConfig {
+                name: "peer1".to_string(),
+                mgmt_url: format!("{peer1_url}/mgmt/bpl"),
+                retrieval_url: format!("{peer1_url}/retrieval"),
+                api_key: Some(PEER1_KEY.to_string()),
+            },
+        ],
+        api_key: None,
+    };
+
+    let repo = Arc::new(RegistryRepository::new(local_reg));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
+    let state = AppState {
+        storage: local_storage,
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
+        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
+        api_keys: Some(vec!["caller-key".to_string()]),
+        cluster_api_key: None,
+        metrics_handle: None,
+        rate_limiter: None,
+        trust_proxy_headers: false,
+    };
+    let app = build_router(state, &SecurityConfig::default());
+
+    // Pause PV on peer0 — must use PEER0_KEY.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/mgmt/bpl/pauseArchivingPV?pv=P0:PV")
+                .header("authorization", "Bearer caller-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let record = peer0_reg.get_pv("P0:PV").unwrap().unwrap();
+    assert_eq!(record.status, archiver_core::registry::PvStatus::Paused);
+
+    // Pause PV on peer1 — must use PEER1_KEY.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/mgmt/bpl/pauseArchivingPV?pv=P1:PV")
+                .header("authorization", "Bearer caller-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let record = peer1_reg.get_pv("P1:PV").unwrap().unwrap();
+    assert_eq!(record.status, archiver_core::registry::PvStatus::Paused);
 }

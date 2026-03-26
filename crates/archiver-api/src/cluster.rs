@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
@@ -33,8 +34,10 @@ pub struct ClusterClient {
     peers: Vec<PeerConfig>,
     pv_cache: DashMap<String, CachedPeer>,
     cache_ttl: Duration,
-    /// Shared cluster API key for inter-peer authentication.
+    /// Fallback cluster API key for inter-peer authentication.
     api_key: Option<String>,
+    /// Per-peer outbound credentials: URL → key.
+    peer_keys: HashMap<String, String>,
 }
 
 impl ClusterClient {
@@ -43,6 +46,13 @@ impl ClusterClient {
             .timeout(Duration::from_secs(config.peer_timeout_secs))
             .build()
             .expect("reqwest Client::builder with timeout should never fail");
+        let mut peer_keys = HashMap::new();
+        for p in &config.peers {
+            if let Some(ref key) = p.api_key {
+                peer_keys.insert(p.mgmt_url.clone(), key.clone());
+                peer_keys.insert(p.retrieval_url.clone(), key.clone());
+            }
+        }
         Self {
             http_client,
             identity: config.identity.clone(),
@@ -50,6 +60,7 @@ impl ClusterClient {
             pv_cache: DashMap::new(),
             cache_ttl: Duration::from_secs(config.cache_ttl_secs),
             api_key: config.api_key.clone(),
+            peer_keys,
         }
     }
 
@@ -57,9 +68,11 @@ impl ClusterClient {
         &self.identity
     }
 
-    /// Apply cluster API key to an outgoing request if configured.
-    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if let Some(ref key) = self.api_key {
+    /// Apply the appropriate outbound credential. Uses the per-peer key if one
+    /// is configured for `peer_url`, otherwise falls back to the cluster-level key.
+    fn apply_auth(&self, builder: reqwest::RequestBuilder, peer_url: &str) -> reqwest::RequestBuilder {
+        let key = self.peer_keys.get(peer_url).or(self.api_key.as_ref());
+        if let Some(key) = key {
             builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
         } else {
             builder
@@ -153,7 +166,7 @@ impl ClusterClient {
             .http_client
             .get(&url)
             .header("X-Archiver-Proxied", "true");
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_auth(req, peer_retrieval_url).send().await?;
 
         let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY);
@@ -161,11 +174,10 @@ impl ClusterClient {
         let mut builder = axum::http::Response::builder().status(status);
 
         // Forward content-type header.
-        if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
-            if let Ok(ct_str) = ct.to_str() {
+        if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE)
+            && let Ok(ct_str) = ct.to_str() {
                 builder = builder.header(axum::http::header::CONTENT_TYPE, ct_str);
             }
-        }
 
         // Stream the body.
         let stream = resp.bytes_stream();
@@ -193,17 +205,16 @@ impl ClusterClient {
             .http_client
             .get(&url)
             .header("X-Archiver-Proxied", "true");
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_auth(req, peer_mgmt_url).send().await?;
 
         let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY);
 
         let mut builder = axum::http::Response::builder().status(status);
-        if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
-            if let Ok(ct_str) = ct.to_str() {
+        if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE)
+            && let Ok(ct_str) = ct.to_str() {
                 builder = builder.header(axum::http::header::CONTENT_TYPE, ct_str);
             }
-        }
 
         let stream = resp.bytes_stream();
         let body = axum::body::Body::from_stream(stream);
@@ -228,17 +239,16 @@ impl ClusterClient {
             .header("X-Archiver-Proxied", "true")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_auth(req, peer_mgmt_url).send().await?;
 
         let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY);
 
         let mut builder = axum::http::Response::builder().status(status);
-        if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
-            if let Ok(ct_str) = ct.to_str() {
+        if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE)
+            && let Ok(ct_str) = ct.to_str() {
                 builder = builder.header(axum::http::header::CONTENT_TYPE, ct_str);
             }
-        }
 
         let stream = resp.bytes_stream();
         let body = axum::body::Body::from_stream(stream);
@@ -491,6 +501,7 @@ mod tests {
                 name: "app1".to_string(),
                 mgmt_url: "http://app1:17665/mgmt/bpl".to_string(),
                 retrieval_url: "http://app1:17665/retrieval".to_string(),
+                api_key: None,
             }],
             api_key: None,
         }

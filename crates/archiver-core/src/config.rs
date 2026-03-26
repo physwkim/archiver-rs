@@ -149,6 +149,10 @@ pub struct PeerConfig {
     pub name: String,
     pub mgmt_url: String,
     pub retrieval_url: String,
+    /// Per-peer outbound credential. When this appliance sends proxied requests
+    /// to this peer, it uses this key instead of the cluster-level `api_key`.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 /// Cluster configuration for multi-appliance mode.
@@ -161,9 +165,9 @@ pub struct ClusterConfig {
     pub peer_timeout_secs: u64,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
-    /// Shared secret for inter-peer authentication. When API keys are enabled,
-    /// all peers in the cluster must share the same `api_key` so that proxied
-    /// management requests authenticate successfully on the receiving peer.
+    /// Shared secret for inter-peer authentication. Used as the outbound credential
+    /// for any peer that does not have its own `api_key` in `[[cluster.peers]]`.
+    /// Also serves as the inbound key this appliance accepts from peers.
     #[serde(default)]
     pub api_key: Option<String>,
 }
@@ -193,6 +197,20 @@ impl ArchiverConfig {
             }
         }
         if let Some(ref cluster) = self.cluster {
+            // When external API keys are enabled, each peer must have an outbound
+            // credential — either its own `api_key` or the cluster-level fallback.
+            if self.api_keys.is_some() && !cluster.peers.is_empty() {
+                let has_fallback = cluster.api_key.is_some();
+                for (i, peer) in cluster.peers.iter().enumerate() {
+                    if peer.api_key.is_none() && !has_fallback {
+                        anyhow::bail!(
+                            "cluster.peers[{i}] ({}) has no api_key and no cluster.api_key fallback; \
+                             proxied write requests to this peer will be rejected",
+                            peer.name
+                        );
+                    }
+                }
+            }
             for (i, peer) in cluster.peers.iter().enumerate() {
                 if !peer.mgmt_url.starts_with("http://") && !peer.mgmt_url.starts_with("https://") {
                     anyhow::bail!("cluster.peers[{i}].mgmt_url must start with http:// or https://");
@@ -263,5 +281,187 @@ retrieval_url = "http://host1:17665/retrieval"
         assert_eq!(cluster.peers[0].name, "appliance1");
         assert_eq!(cluster.cache_ttl_secs, 300);
         assert_eq!(cluster.peer_timeout_secs, 30);
+    }
+
+    #[test]
+    fn validate_cluster_api_key_required_with_api_keys() {
+        let toml = r#"
+api_keys = ["secret"]
+
+[storage.sts]
+root_folder = "/tmp/sts"
+partition_granularity = "hour"
+
+[storage.mts]
+root_folder = "/tmp/mts"
+partition_granularity = "day"
+
+[storage.lts]
+root_folder = "/tmp/lts"
+partition_granularity = "year"
+
+[cluster.identity]
+name = "appliance0"
+mgmt_url = "http://host0:17665/mgmt/bpl"
+retrieval_url = "http://host0:17665/retrieval"
+engine_url = "http://host0:17665"
+etl_url = "http://host0:17665"
+
+[[cluster.peers]]
+name = "appliance1"
+mgmt_url = "http://host1:17665/mgmt/bpl"
+retrieval_url = "http://host1:17665/retrieval"
+"#;
+        let config = ArchiverConfig::from_toml(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("has no api_key and no cluster.api_key fallback"));
+    }
+
+    #[test]
+    fn validate_cluster_api_key_not_required_without_api_keys() {
+        let toml = r#"
+[storage.sts]
+root_folder = "/tmp/sts"
+partition_granularity = "hour"
+
+[storage.mts]
+root_folder = "/tmp/mts"
+partition_granularity = "day"
+
+[storage.lts]
+root_folder = "/tmp/lts"
+partition_granularity = "year"
+
+[cluster.identity]
+name = "appliance0"
+mgmt_url = "http://host0:17665/mgmt/bpl"
+retrieval_url = "http://host0:17665/retrieval"
+engine_url = "http://host0:17665"
+etl_url = "http://host0:17665"
+
+[[cluster.peers]]
+name = "appliance1"
+mgmt_url = "http://host1:17665/mgmt/bpl"
+retrieval_url = "http://host1:17665/retrieval"
+"#;
+        let config = ArchiverConfig::from_toml(toml).unwrap();
+        config.validate().unwrap(); // No api_keys → no requirement for cluster.api_key
+    }
+
+    #[test]
+    fn validate_per_peer_keys_without_fallback() {
+        // Each peer has its own api_key → passes even without cluster.api_key.
+        let toml = r#"
+api_keys = ["secret"]
+
+[storage.sts]
+root_folder = "/tmp/sts"
+partition_granularity = "hour"
+
+[storage.mts]
+root_folder = "/tmp/mts"
+partition_granularity = "day"
+
+[storage.lts]
+root_folder = "/tmp/lts"
+partition_granularity = "year"
+
+[cluster.identity]
+name = "appliance0"
+mgmt_url = "http://host0:17665/mgmt/bpl"
+retrieval_url = "http://host0:17665/retrieval"
+engine_url = "http://host0:17665"
+etl_url = "http://host0:17665"
+
+[[cluster.peers]]
+name = "appliance1"
+mgmt_url = "http://host1:17665/mgmt/bpl"
+retrieval_url = "http://host1:17665/retrieval"
+api_key = "peer1-key"
+"#;
+        let config = ArchiverConfig::from_toml(toml).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_mixed_per_peer_and_fallback() {
+        // One peer has its own key, another relies on the fallback → passes.
+        let toml = r#"
+api_keys = ["secret"]
+
+[storage.sts]
+root_folder = "/tmp/sts"
+partition_granularity = "hour"
+
+[storage.mts]
+root_folder = "/tmp/mts"
+partition_granularity = "day"
+
+[storage.lts]
+root_folder = "/tmp/lts"
+partition_granularity = "year"
+
+[cluster]
+api_key = "shared-fallback"
+
+[cluster.identity]
+name = "appliance0"
+mgmt_url = "http://host0:17665/mgmt/bpl"
+retrieval_url = "http://host0:17665/retrieval"
+engine_url = "http://host0:17665"
+etl_url = "http://host0:17665"
+
+[[cluster.peers]]
+name = "appliance1"
+mgmt_url = "http://host1:17665/mgmt/bpl"
+retrieval_url = "http://host1:17665/retrieval"
+api_key = "peer1-specific"
+
+[[cluster.peers]]
+name = "appliance2"
+mgmt_url = "http://host2:17665/mgmt/bpl"
+retrieval_url = "http://host2:17665/retrieval"
+"#;
+        let config = ArchiverConfig::from_toml(toml).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn parse_peer_api_key_from_toml() {
+        let toml = r#"
+[storage.sts]
+root_folder = "/tmp/sts"
+partition_granularity = "hour"
+
+[storage.mts]
+root_folder = "/tmp/mts"
+partition_granularity = "day"
+
+[storage.lts]
+root_folder = "/tmp/lts"
+partition_granularity = "year"
+
+[cluster.identity]
+name = "appliance0"
+mgmt_url = "http://host0:17665/mgmt/bpl"
+retrieval_url = "http://host0:17665/retrieval"
+engine_url = "http://host0:17665"
+etl_url = "http://host0:17665"
+
+[[cluster.peers]]
+name = "appliance1"
+mgmt_url = "http://host1:17665/mgmt/bpl"
+retrieval_url = "http://host1:17665/retrieval"
+api_key = "peer1-secret"
+
+[[cluster.peers]]
+name = "appliance2"
+mgmt_url = "http://host2:17665/mgmt/bpl"
+retrieval_url = "http://host2:17665/retrieval"
+"#;
+        let config = ArchiverConfig::from_toml(toml).unwrap();
+        let cluster = config.cluster.unwrap();
+        assert_eq!(cluster.peers[0].api_key.as_deref(), Some("peer1-secret"));
+        assert_eq!(cluster.peers[1].api_key, None);
     }
 }
