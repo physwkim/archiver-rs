@@ -171,7 +171,7 @@ impl EventStream for StatStream {
                     if !self.buffer.is_empty() {
                         let result_val = self.compute();
                         let result = ArchiverSample::new(
-                            self.window_start.unwrap(),
+                            self.window_start.expect("non-empty buffer implies window_start set"),
                             ArchiverValue::ScalarDouble(result_val),
                         );
                         self.buffer.clear();

@@ -91,6 +91,12 @@ pub struct PvRegistry {
 }
 
 impl PvRegistry {
+    fn lock_conn(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Connection>> {
+        self.conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("PV registry lock poisoned: {e}"))
+    }
+
     /// Open (or create) the registry database at the given path.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
@@ -112,7 +118,7 @@ impl PvRegistry {
     }
 
     fn init_schema(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS pv_info (
@@ -150,7 +156,7 @@ impl PvRegistry {
         sample_mode: &SampleMode,
         element_count: i32,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let (mode_str, period) = sample_mode.to_db();
 
@@ -165,7 +171,7 @@ impl PvRegistry {
 
     /// Update PV status (active, paused, error).
     pub fn set_status(&self, pv_name: &str, status: PvStatus) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let rows = conn.execute(
             "UPDATE pv_info SET status = ?1, updated_at = ?2 WHERE pv_name = ?3",
@@ -180,7 +186,7 @@ impl PvRegistry {
         pv_name: &str,
         timestamp: SystemTime,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let dt = DateTime::<Utc>::from(timestamp).to_rfc3339();
         let now = Utc::now().to_rfc3339();
         conn.execute(
@@ -192,20 +198,20 @@ impl PvRegistry {
 
     /// Remove a PV from the registry entirely.
     pub fn remove_pv(&self, pv_name: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let rows = conn.execute("DELETE FROM pv_info WHERE pv_name = ?1", params![pv_name])?;
         Ok(rows > 0)
     }
 
     /// Get a single PV record.
     pub fn get_pv(&self, pv_name: &str) -> anyhow::Result<Option<PvRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.query_row(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
                     last_timestamp, created_at, updated_at, prec, egu
              FROM pv_info WHERE pv_name = ?1",
             params![pv_name],
-            |row| Ok(row_to_record(row)),
+            row_to_record,
         )
         .optional()
         .map_err(Into::into)
@@ -213,7 +219,7 @@ impl PvRegistry {
 
     /// List all PV names.
     pub fn all_pv_names(&self) -> anyhow::Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare("SELECT pv_name FROM pv_info ORDER BY pv_name")?;
         let names = stmt
             .query_map([], |row| row.get(0))?
@@ -223,14 +229,14 @@ impl PvRegistry {
 
     /// List all PVs with a given status.
     pub fn pvs_by_status(&self, status: PvStatus) -> anyhow::Result<Vec<PvRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
                     last_timestamp, created_at, updated_at, prec, egu
              FROM pv_info WHERE status = ?1 ORDER BY pv_name",
         )?;
         let records = stmt
-            .query_map(params![status.as_str()], |row| Ok(row_to_record(row)))?
+            .query_map(params![status.as_str()], row_to_record)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
     }
@@ -238,7 +244,7 @@ impl PvRegistry {
     /// Match PV names by glob pattern (SQL GLOB).
     /// Supports `*` and `?` wildcards.
     pub fn matching_pvs(&self, pattern: &str) -> anyhow::Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt =
             conn.prepare("SELECT pv_name FROM pv_info WHERE pv_name GLOB ?1 ORDER BY pv_name")?;
         let names = stmt
@@ -249,7 +255,7 @@ impl PvRegistry {
 
     /// Count total PVs, optionally filtered by status.
     pub fn count(&self, status: Option<PvStatus>) -> anyhow::Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let count: u64 = match status {
             Some(s) => conn.query_row(
                 "SELECT COUNT(*) FROM pv_info WHERE status = ?1",
@@ -266,7 +272,7 @@ impl PvRegistry {
         &self,
         updates: &[(&str, SystemTime)],
     ) -> anyhow::Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         let now = Utc::now().to_rfc3339();
         {
@@ -284,7 +290,7 @@ impl PvRegistry {
 
     /// Get PVs added since a given time.
     pub fn recently_added_pvs(&self, since: SystemTime) -> anyhow::Result<Vec<PvRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let since_str = DateTime::<Utc>::from(since).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
@@ -292,14 +298,14 @@ impl PvRegistry {
              FROM pv_info WHERE created_at >= ?1 ORDER BY created_at DESC",
         )?;
         let records = stmt
-            .query_map(params![since_str], |row| Ok(row_to_record(row)))?
+            .query_map(params![since_str], row_to_record)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
     }
 
     /// Get PVs modified since a given time.
     pub fn recently_modified_pvs(&self, since: SystemTime) -> anyhow::Result<Vec<PvRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let since_str = DateTime::<Utc>::from(since).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
@@ -307,14 +313,14 @@ impl PvRegistry {
              FROM pv_info WHERE updated_at >= ?1 ORDER BY updated_at DESC",
         )?;
         let records = stmt
-            .query_map(params![since_str], |row| Ok(row_to_record(row)))?
+            .query_map(params![since_str], row_to_record)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
     }
 
     /// Update the sample mode and period for a PV.
     pub fn update_sample_mode(&self, pv_name: &str, mode: &SampleMode) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let (mode_str, period) = mode.to_db();
         let rows = conn.execute(
@@ -331,7 +337,7 @@ impl PvRegistry {
         prec: Option<&str>,
         egu: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let rows = conn.execute(
             "UPDATE pv_info SET prec = COALESCE(?1, prec), egu = COALESCE(?2, egu), updated_at = ?3 WHERE pv_name = ?4",
@@ -354,7 +360,7 @@ impl PvRegistry {
         prec: Option<&str>,
         egu: Option<&str>,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let (mode_str, period) = sample_mode.to_db();
         let created = created_at.unwrap_or(&now);
@@ -382,14 +388,14 @@ impl PvRegistry {
 
     /// Get all PV records (for export).
     pub fn all_records(&self) -> anyhow::Result<Vec<PvRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
                     last_timestamp, created_at, updated_at, prec, egu
              FROM pv_info ORDER BY pv_name",
         )?;
         let records = stmt
-            .query_map([], |row| Ok(row_to_record(row)))?
+            .query_map([], row_to_record)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
     }
@@ -397,7 +403,7 @@ impl PvRegistry {
     /// Get PVs that have not received events for longer than the threshold duration.
     /// Only returns PVs that have a last_timestamp (have received at least one event).
     pub fn silent_pvs(&self, threshold: Duration) -> anyhow::Result<Vec<PvRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let cutoff = SystemTime::now()
             .checked_sub(threshold)
             .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -409,22 +415,22 @@ impl PvRegistry {
              ORDER BY last_timestamp ASC",
         )?;
         let records = stmt
-            .query_map(params![cutoff_str], |row| Ok(row_to_record(row)))?
+            .query_map(params![cutoff_str], row_to_record)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
     }
 }
 
-fn row_to_record(row: &rusqlite::Row) -> PvRecord {
-    let pv_name: String = row.get(0).unwrap();
-    let dbr_type_i: i32 = row.get(1).unwrap();
-    let sample_mode_str: String = row.get(2).unwrap();
-    let sample_period: f64 = row.get(3).unwrap();
-    let status_str: String = row.get(4).unwrap();
-    let element_count: i32 = row.get(5).unwrap();
-    let last_ts_str: Option<String> = row.get(6).unwrap();
-    let created_str: String = row.get(7).unwrap();
-    let updated_str: String = row.get(8).unwrap();
+fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<PvRecord> {
+    let pv_name: String = row.get(0)?;
+    let dbr_type_i: i32 = row.get(1)?;
+    let sample_mode_str: String = row.get(2)?;
+    let sample_period: f64 = row.get(3)?;
+    let status_str: String = row.get(4)?;
+    let element_count: i32 = row.get(5)?;
+    let last_ts_str: Option<String> = row.get(6)?;
+    let created_str: String = row.get(7)?;
+    let updated_str: String = row.get(8)?;
     let prec: Option<String> = row.get(9).unwrap_or(None);
     let egu: Option<String> = row.get(10).unwrap_or(None);
 
@@ -434,7 +440,7 @@ fn row_to_record(row: &rusqlite::Row) -> PvRecord {
             .map(|dt| dt.with_timezone(&Utc).into())
     });
 
-    PvRecord {
+    Ok(PvRecord {
         pv_name,
         dbr_type: ArchDbType::from_i32(dbr_type_i).unwrap_or(ArchDbType::ScalarDouble),
         sample_mode: SampleMode::from_db(&sample_mode_str, sample_period),
@@ -449,7 +455,7 @@ fn row_to_record(row: &rusqlite::Row) -> PvRecord {
             .unwrap_or_else(|_| Utc::now()),
         prec,
         egu,
-    }
+    })
 }
 
 #[cfg(test)]

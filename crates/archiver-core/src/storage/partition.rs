@@ -124,9 +124,9 @@ pub fn next_partition_start(ts: SystemTime, granularity: PartitionGranularity) -
     let next = match granularity {
         PartitionGranularity::Year => {
             NaiveDate::from_ymd_opt(dt.year() + 1, 1, 1)
-                .unwrap()
+                .expect("Jan 1 is always valid")
                 .and_hms_opt(0, 0, 0)
-                .unwrap()
+                .expect("midnight is always valid")
                 .and_utc()
         }
         PartitionGranularity::Month => {
@@ -136,22 +136,22 @@ pub fn next_partition_start(ts: SystemTime, granularity: PartitionGranularity) -
                 (dt.year(), dt.month() + 1)
             };
             NaiveDate::from_ymd_opt(y, m, 1)
-                .unwrap()
+                .expect("1st of month is always valid")
                 .and_hms_opt(0, 0, 0)
-                .unwrap()
+                .expect("midnight is always valid")
                 .and_utc()
         }
         PartitionGranularity::Day => {
             (dt.date_naive() + Duration::days(1))
                 .and_hms_opt(0, 0, 0)
-                .unwrap()
+                .expect("midnight is always valid")
                 .and_utc()
         }
         PartitionGranularity::Hour => {
             let current_hour = dt
                 .date_naive()
                 .and_hms_opt(dt.hour(), 0, 0)
-                .unwrap()
+                .expect("hour from valid DateTime")
                 .and_utc();
             current_hour + Duration::hours(1)
         }
@@ -163,7 +163,7 @@ pub fn next_partition_start(ts: SystemTime, granularity: PartitionGranularity) -
             let current_start = dt
                 .date_naive()
                 .and_hms_opt(dt.hour(), start_min, 0)
-                .unwrap()
+                .expect("aligned minute from valid DateTime")
                 .and_utc();
             current_start + Duration::minutes(approx_min as i64)
         }
@@ -179,24 +179,29 @@ fn prev_partition_end(ts: SystemTime, granularity: PartitionGranularity) -> Syst
     let prev_end = match granularity {
         PartitionGranularity::Year => {
             NaiveDate::from_ymd_opt(dt.year() - 1, 12, 31)
-                .unwrap()
+                .expect("Dec 31 is always valid")
                 .and_hms_opt(23, 59, 59)
-                .unwrap()
+                .expect("23:59:59 is always valid")
                 .and_utc()
         }
         PartitionGranularity::Month => {
-            let first_of_month = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1).unwrap();
+            let first_of_month = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
+                .expect("1st of month is always valid");
             let prev = first_of_month - Duration::days(1);
-            prev.and_hms_opt(23, 59, 59).unwrap().and_utc()
+            prev.and_hms_opt(23, 59, 59)
+                .expect("23:59:59 is always valid")
+                .and_utc()
         }
         PartitionGranularity::Day => {
             let prev = dt.date_naive() - Duration::days(1);
-            prev.and_hms_opt(23, 59, 59).unwrap().and_utc()
+            prev.and_hms_opt(23, 59, 59)
+                .expect("23:59:59 is always valid")
+                .and_utc()
         }
         PartitionGranularity::Hour => {
             dt.date_naive()
                 .and_hms_opt(dt.hour(), 0, 0)
-                .unwrap()
+                .expect("hour from valid DateTime")
                 .and_utc()
                 - Duration::seconds(1)
         }
@@ -207,7 +212,7 @@ fn prev_partition_end(ts: SystemTime, granularity: PartitionGranularity) -> Syst
             let start_min = (dt.minute() / approx_min) * approx_min;
             dt.date_naive()
                 .and_hms_opt(dt.hour(), start_min, 0)
-                .unwrap()
+                .expect("aligned minute from valid DateTime")
                 .and_utc()
                 - Duration::seconds(1)
         }

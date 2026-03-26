@@ -50,7 +50,7 @@ impl EventStream for MergedEventStream {
         for (i, head) in self.heads.iter().enumerate() {
             if let Some((_, ref sample)) = head {
                 let ts = sample.timestamp;
-                if earliest_ts.is_none() || ts < earliest_ts.unwrap() {
+                if earliest_ts.is_none_or(|e| ts < e) {
                     earliest_ts = Some(ts);
                     earliest_idx = Some(i);
                 }
@@ -63,7 +63,9 @@ impl EventStream for MergedEventStream {
         };
 
         // Take the sample and advance that stream.
-        let (stream_idx, sample) = self.heads[idx].take().unwrap();
+        let (stream_idx, sample) = self.heads[idx]
+            .take()
+            .expect("earliest_idx points to a Some entry");
         if let Some(next_sample) = self.streams[stream_idx].next_event()? {
             self.heads[idx] = Some((stream_idx, next_sample));
         }

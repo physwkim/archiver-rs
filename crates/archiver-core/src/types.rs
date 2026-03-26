@@ -47,8 +47,8 @@ impl ArchDbType {
         }
     }
 
-    pub fn to_payload_type(self) -> PayloadType {
-        PayloadType::try_from(self as i32).unwrap()
+    pub fn to_payload_type(self) -> Option<PayloadType> {
+        PayloadType::try_from(self as i32).ok()
     }
 
     pub fn is_waveform(self) -> bool {
@@ -148,10 +148,11 @@ impl ArchiverSample {
     pub fn decompose_timestamp(&self) -> (i32, u32, u32) {
         let datetime = chrono::DateTime::<Utc>::from(self.timestamp);
         let year = datetime.year();
-        let year_start =
-            NaiveDateTime::parse_from_str(&format!("{year}-01-01 00:00:00"), "%Y-%m-%d %H:%M:%S")
-                .unwrap()
-                .and_utc();
+        let year_start = NaiveDateTime::new(
+            chrono::NaiveDate::from_ymd_opt(year, 1, 1).expect("year from valid SystemTime"),
+            chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight"),
+        )
+        .and_utc();
         let duration = datetime.signed_duration_since(year_start);
         let seconds_into_year = duration.num_seconds() as u32;
         let nanos = datetime.timestamp_subsec_nanos();
@@ -159,15 +160,14 @@ impl ArchiverSample {
     }
 
     /// Reconstruct a SystemTime from year + seconds_into_year + nanos.
-    pub fn timestamp_from_epoch_parts(year: i32, seconds_into_year: u32, nanos: u32) -> SystemTime {
-        let year_start =
-            NaiveDateTime::parse_from_str(&format!("{year}-01-01 00:00:00"), "%Y-%m-%d %H:%M:%S")
-                .unwrap()
-                .and_utc();
+    pub fn timestamp_from_epoch_parts(year: i32, seconds_into_year: u32, nanos: u32) -> Option<SystemTime> {
+        let year_start = chrono::NaiveDate::from_ymd_opt(year, 1, 1)?
+            .and_hms_opt(0, 0, 0)?
+            .and_utc();
         let ts = year_start
             + chrono::Duration::seconds(seconds_into_year as i64)
             + chrono::Duration::nanoseconds(nanos as i64);
-        ts.into()
+        Some(ts.into())
     }
 
     /// Create a sample from a UNIX epoch timestamp (seconds as f64).

@@ -9,7 +9,7 @@ use crate::errors::ApiError;
 use crate::pv_input::{parse_pv_list, PvListInput};
 use crate::AppState;
 
-use super::{forward_pv_batch_to_peer, try_mgmt_dispatch};
+use super::{forward_all_peer_batches, route_pvs, try_mgmt_dispatch};
 
 /// POST /mgmt/bpl/archivePV
 ///
@@ -73,7 +73,9 @@ async fn bulk_archive_requests(
         std::collections::HashMap::new();
 
     for req in reqs {
-        let pv = req.pv.as_deref().unwrap();
+        let Some(pv) = req.pv.as_deref() else {
+            continue;
+        };
 
         let target = if is_proxied {
             None
@@ -113,7 +115,9 @@ async fn bulk_archive_requests(
 
     // Archive local PVs.
     for req in &local_reqs {
-        let pv = req.pv.as_deref().unwrap();
+        let Some(pv) = req.pv.as_deref() else {
+            continue;
+        };
         let sample_mode = parse_sample_mode(req.sampling_method.as_deref(), req.sampling_period);
         let status = match state.archiver_cmd.archive_pv(pv, &sample_mode).await {
             Ok(()) => "Archive request submitted".to_string(),
@@ -157,7 +161,20 @@ async fn bulk_archive_requests(
                 })
                 .collect();
 
-            let bytes = axum::body::Bytes::from(serde_json::to_string(&peer_body).unwrap());
+            let json = match serde_json::to_string(&peer_body) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to serialize peer batch: {e}");
+                    for req in batch {
+                        results.push(BulkResult {
+                            pv_name: req.pv.clone().unwrap_or_default(),
+                            status: "Failed to serialize request".to_string(),
+                        });
+                    }
+                    continue;
+                }
+            };
+            let bytes = axum::body::Bytes::from(json);
             match cluster.proxy_mgmt_post(&peer.mgmt_url, "archivePV", bytes).await {
                 Ok(resp) => {
                     let status_code = resp.status();
@@ -280,68 +297,30 @@ pub async fn bulk_pause_archiving_pv(
     PvListInput(pvs): PvListInput,
 ) -> Response {
     let is_proxied = headers.get("X-Archiver-Proxied").is_some();
+    let (local_pvs, remote_batches) = route_pvs(&state, &pvs, is_proxied).await;
+
     let mut results = Vec::with_capacity(pvs.len());
 
-    if !is_proxied {
-        if let Some(ref cluster) = state.cluster {
-            let mut remote_batches: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            let mut local_pvs = Vec::new();
-            for pv in &pvs {
-                if state.pv_query.get_pv(pv).ok().flatten().is_some() {
-                    local_pvs.push(pv.clone());
-                } else if let Some(resolved) = cluster.resolve_peer(pv).await {
-                    remote_batches
-                        .entry(resolved.mgmt_url)
-                        .or_default()
-                        .push(pv.clone());
-                } else {
-                    local_pvs.push(pv.clone());
-                }
-            }
-
-            let futs: Vec<_> = remote_batches
-                .into_iter()
-                .map(|(mgmt_url, batch)| {
-                    let cluster = cluster.clone();
-                    async move {
-                        forward_pv_batch_to_peer(cluster.as_ref(), &mgmt_url, "pauseArchivingPV", &batch)
-                            .await
-                    }
-                })
-                .collect();
-            let remote_results = futures::future::join_all(futs).await;
-            for batch_results in remote_results {
-                results.extend(batch_results);
-            }
-
-            for pv in &local_pvs {
-                let status = match state.archiver_cmd.pause_pv(pv) {
-                    Ok(()) => "Successfully paused".to_string(),
-                    Err(e) => {
-                        tracing::warn!(pv, "Failed to pause: {e}");
-                        "Failed to pause".to_string()
-                    }
-                };
-                results.push(BulkResult {
-                    pv_name: pv.clone(),
-                    status,
-                });
-            }
-            return axum::Json(results).into_response();
-        }
+    if let Some(ref cluster) = state.cluster {
+        results.extend(
+            forward_all_peer_batches(cluster.as_ref(), remote_batches, "pauseArchivingPV").await,
+        );
     }
 
-    for pv in &pvs {
+    for pv in &local_pvs {
         let status = match state.archiver_cmd.pause_pv(pv) {
             Ok(()) => "Successfully paused".to_string(),
-            Err(e) => e.to_string(),
+            Err(e) => {
+                tracing::warn!(pv, "Failed to pause: {e}");
+                "Failed to pause".to_string()
+            }
         };
         results.push(BulkResult {
             pv_name: pv.clone(),
             status,
         });
     }
+
     axum::Json(results).into_response()
 }
 
@@ -351,68 +330,30 @@ pub async fn bulk_resume_archiving_pv(
     PvListInput(pvs): PvListInput,
 ) -> Response {
     let is_proxied = headers.get("X-Archiver-Proxied").is_some();
+    let (local_pvs, remote_batches) = route_pvs(&state, &pvs, is_proxied).await;
+
     let mut results = Vec::with_capacity(pvs.len());
 
-    if !is_proxied {
-        if let Some(ref cluster) = state.cluster {
-            let mut remote_batches: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            let mut local_pvs = Vec::new();
-            for pv in &pvs {
-                if state.pv_query.get_pv(pv).ok().flatten().is_some() {
-                    local_pvs.push(pv.clone());
-                } else if let Some(resolved) = cluster.resolve_peer(pv).await {
-                    remote_batches
-                        .entry(resolved.mgmt_url)
-                        .or_default()
-                        .push(pv.clone());
-                } else {
-                    local_pvs.push(pv.clone());
-                }
-            }
-
-            let futs: Vec<_> = remote_batches
-                .into_iter()
-                .map(|(mgmt_url, batch)| {
-                    let cluster = cluster.clone();
-                    async move {
-                        forward_pv_batch_to_peer(cluster.as_ref(), &mgmt_url, "resumeArchivingPV", &batch)
-                            .await
-                    }
-                })
-                .collect();
-            let remote_results = futures::future::join_all(futs).await;
-            for batch_results in remote_results {
-                results.extend(batch_results);
-            }
-
-            for pv in &local_pvs {
-                let status = match state.archiver_cmd.resume_pv(pv).await {
-                    Ok(()) => "Successfully resumed".to_string(),
-                    Err(e) => {
-                        tracing::warn!(pv, "Failed to resume: {e}");
-                        "Failed to resume".to_string()
-                    }
-                };
-                results.push(BulkResult {
-                    pv_name: pv.clone(),
-                    status,
-                });
-            }
-            return axum::Json(results).into_response();
-        }
+    if let Some(ref cluster) = state.cluster {
+        results.extend(
+            forward_all_peer_batches(cluster.as_ref(), remote_batches, "resumeArchivingPV").await,
+        );
     }
 
-    for pv in &pvs {
+    for pv in &local_pvs {
         let status = match state.archiver_cmd.resume_pv(pv).await {
             Ok(()) => "Successfully resumed".to_string(),
-            Err(e) => e.to_string(),
+            Err(e) => {
+                tracing::warn!(pv, "Failed to resume: {e}");
+                "Failed to resume".to_string()
+            }
         };
         results.push(BulkResult {
             pv_name: pv.clone(),
             status,
         });
     }
+
     axum::Json(results).into_response()
 }
 

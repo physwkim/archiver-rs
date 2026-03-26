@@ -40,7 +40,7 @@ impl ClusterClient {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.peer_timeout_secs))
             .build()
-            .expect("Failed to build HTTP client");
+            .expect("reqwest Client::builder with timeout should never fail");
         Self {
             http_client,
             identity: config.identity.clone(),
@@ -159,7 +159,10 @@ impl ClusterClient {
         // Stream the body.
         let stream = resp.bytes_stream();
         let body = axum::body::Body::from_stream(stream);
-        Ok(builder.body(body).unwrap().into_response())
+        Ok(builder
+            .body(body)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            .into_response())
     }
 
     /// Proxy a management GET request to a remote peer.
@@ -194,7 +197,10 @@ impl ClusterClient {
 
         let stream = resp.bytes_stream();
         let body = axum::body::Body::from_stream(stream);
-        Ok(builder.body(body).unwrap().into_response())
+        Ok(builder
+            .body(body)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            .into_response())
     }
 
     /// Proxy a management POST request to a remote peer.
@@ -227,7 +233,10 @@ impl ClusterClient {
 
         let stream = resp.bytes_stream();
         let body = axum::body::Body::from_stream(stream);
-        Ok(builder.body(body).unwrap().into_response())
+        Ok(builder
+            .body(body)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            .into_response())
     }
 
     /// Aggregate PV count from all peers.

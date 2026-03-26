@@ -14,6 +14,13 @@ use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
 
 use crate::policy::PolicyConfig;
 
+/// Timeout for initial CA channel connection.
+const CA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Timeout for CA reconnection attempts in the monitor loop.
+const CA_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Delay before retrying a failed CA subscription.
+const CA_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// Connection state tracked per PV.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionInfo {
@@ -119,7 +126,7 @@ impl ChannelManager {
         // Connect to discover the native type.
         let channel = self.ca_client.create_channel(pv_name);
         channel
-            .wait_connected(Duration::from_secs(10))
+            .wait_connected(CA_CONNECT_TIMEOUT)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to {pv_name}: {e}"))?;
 
@@ -133,7 +140,8 @@ impl ChannelManager {
         self.registry
             .register_pv(pv_name, dbr_type, &effective_mode, element_count)?;
 
-        let record = self.registry.get_pv(pv_name)?.unwrap();
+        let record = self.registry.get_pv(pv_name)?
+            .ok_or_else(|| anyhow::anyhow!("PV {pv_name} not found in registry"))?;
         self.start_archiving_internal(&record).await?;
 
         metrics::gauge!("archiver_pvs_active").increment(1.0);
@@ -243,12 +251,18 @@ impl ChannelManager {
 
     /// List all currently archived PV names (from registry).
     pub fn list_pvs(&self) -> Vec<String> {
-        self.registry.all_pv_names().unwrap_or_default()
+        self.registry.all_pv_names().unwrap_or_else(|e| {
+            warn!("Failed to list PVs: {e}");
+            Vec::new()
+        })
     }
 
     /// Match PVs by glob pattern (from registry).
     pub fn matching_pvs(&self, pattern: &str) -> Vec<String> {
-        self.registry.matching_pvs(pattern).unwrap_or_default()
+        self.registry.matching_pvs(pattern).unwrap_or_else(|e| {
+            warn!("Failed to match PVs: {e}");
+            Vec::new()
+        })
     }
 
     /// Get the registry reference.
@@ -260,7 +274,7 @@ impl ChannelManager {
     pub fn get_connection_info(&self, pv: &str) -> Option<ConnectionInfo> {
         self.channels
             .get(pv)
-            .map(|h| h.conn_info.lock().unwrap().clone())
+            .map(|h| h.conn_info.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
     /// Get PV names that have never received any event (connected_since == None).
@@ -268,7 +282,7 @@ impl ChannelManager {
         self.channels
             .iter()
             .filter(|entry| {
-                let ci = entry.value().conn_info.lock().unwrap();
+                let ci = entry.value().conn_info.lock().unwrap_or_else(|e| e.into_inner());
                 ci.connected_since.is_none()
             })
             .map(|entry| entry.key().clone())
@@ -280,7 +294,7 @@ impl ChannelManager {
         self.channels
             .iter()
             .filter(|entry| {
-                let ci = entry.value().conn_info.lock().unwrap();
+                let ci = entry.value().conn_info.lock().unwrap_or_else(|e| e.into_inner());
                 !ci.is_connected
             })
             .map(|entry| entry.key().clone())
@@ -302,10 +316,10 @@ async fn monitor_loop(
         // Wait for connection, respecting cancellation.
         tokio::select! {
             _ = cancel_token.cancelled() => return,
-            result = channel.wait_connected(Duration::from_secs(30)) => {
+            result = channel.wait_connected(CA_RECONNECT_TIMEOUT) => {
                 if result.is_err() {
                     {
-                        let mut ci = conn_info.lock().unwrap();
+                        let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
                         ci.is_connected = false;
                     }
                     // Wait for reconnection via connection events.
@@ -333,7 +347,7 @@ async fn monitor_loop(
                 warn!(pv = pv_name, "Subscribe failed: {e}, retrying...");
                 tokio::select! {
                     _ = cancel_token.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                    _ = tokio::time::sleep(CA_RETRY_DELAY) => continue,
                 }
             }
         };
@@ -349,14 +363,14 @@ async fn monitor_loop(
                         Some(Ok(epics_val)) => {
                             let now = SystemTime::now();
                             {
-                                let mut ci = conn_info.lock().unwrap();
+                                let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
                                 if ci.connected_since.is_none() {
                                     ci.connected_since = Some(now);
                                 }
                                 ci.is_connected = true;
                                 ci.last_event_time = Some(now);
                             }
-                            let archiver_val = epics_value_to_archiver(&epics_val, dbr_type);
+                            let archiver_val = epics_value_to_archiver(&epics_val);
                             let sample = ArchiverSample::new(now, archiver_val);
                             let pv_sample = PvSample {
                                 pv_name: pv_name.clone(),
@@ -379,7 +393,7 @@ async fn monitor_loop(
 
         // Monitor ended (disconnect) — loop back to reconnect.
         {
-            let mut ci = conn_info.lock().unwrap();
+            let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
             ci.is_connected = false;
         }
         debug!(pv = pv_name, "Monitor ended, waiting for reconnection");
@@ -407,8 +421,8 @@ async fn scan_loop(
             _ = interval.tick() => {}
         }
 
-        if channel.wait_connected(Duration::from_secs(5)).await.is_err() {
-            let mut ci = conn_info.lock().unwrap();
+        if channel.wait_connected(CA_RETRY_DELAY).await.is_err() {
+            let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
             ci.is_connected = false;
             continue;
         }
@@ -417,14 +431,14 @@ async fn scan_loop(
             Ok((_dbr_type, epics_val)) => {
                 let now = SystemTime::now();
                 {
-                    let mut ci = conn_info.lock().unwrap();
+                    let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
                     if ci.connected_since.is_none() {
                         ci.connected_since = Some(now);
                     }
                     ci.is_connected = true;
                     ci.last_event_time = Some(now);
                 }
-                let archiver_val = epics_value_to_archiver(&epics_val, dbr_type);
+                let archiver_val = epics_value_to_archiver(&epics_val);
                 let sample = ArchiverSample::new(now, archiver_val);
                 let pv_sample = PvSample {
                     pv_name: pv_name.clone(),
@@ -457,7 +471,7 @@ fn dbr_field_to_arch_type(field_type: DbFieldType) -> ArchDbType {
 }
 
 /// Convert epics-base-rs EpicsValue to archiver ArchiverValue.
-fn epics_value_to_archiver(val: &EpicsValue, _expected_type: ArchDbType) -> ArchiverValue {
+fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
     match val {
         EpicsValue::String(s) => ArchiverValue::ScalarString(s.clone()),
         EpicsValue::Short(v) => ArchiverValue::ScalarShort(*v as i32),
@@ -534,14 +548,17 @@ pub async fn write_loop(
                         element_count: pv_sample.element_count,
                         ..Default::default()
                     };
-                    let _ = storage
+                    if let Err(e) = storage
                         .append_event_with_meta(
                             &pv_sample.pv_name,
                             pv_sample.dbr_type,
                             &pv_sample.sample,
                             &meta,
                         )
-                        .await;
+                        .await
+                    {
+                        warn!(pv = pv_sample.pv_name, "Shutdown drain write error: {e}");
+                    }
                 }
                 // Final timestamp flush.
                 if !ts_updates.is_empty() {
@@ -549,7 +566,9 @@ pub async fn write_loop(
                         .iter()
                         .map(|(name, ts)| (name.as_str(), *ts))
                         .collect();
-                    let _ = registry.batch_update_timestamps(&refs);
+                    if let Err(e) = registry.batch_update_timestamps(&refs) {
+                        warn!("Shutdown timestamp flush failed: {e}");
+                    }
                 }
                 info!("Write loop shutting down");
                 break;

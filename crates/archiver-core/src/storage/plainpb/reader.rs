@@ -106,7 +106,7 @@ pub fn decode_sample(
     match dbr_type {
         ArchDbType::ScalarString => {
             let msg = epics_event::ScalarString::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -116,11 +116,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::ScalarByte => {
             let msg = epics_event::ScalarByte::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -130,11 +130,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::ScalarShort => {
             let msg = epics_event::ScalarShort::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -144,11 +144,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::ScalarInt => {
             let msg = epics_event::ScalarInt::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -158,11 +158,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::ScalarEnum => {
             let msg = epics_event::ScalarEnum::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -172,11 +172,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::ScalarFloat => {
             let msg = epics_event::ScalarFloat::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -186,11 +186,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::ScalarDouble => {
             let msg = epics_event::ScalarDouble::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -200,11 +200,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::WaveformString => {
             let msg = epics_event::VectorString::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -214,11 +214,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::WaveformByte => {
             let msg = epics_event::VectorChar::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -228,11 +228,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::WaveformShort => {
             let msg = epics_event::VectorShort::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -242,11 +242,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::WaveformInt => {
             let msg = epics_event::VectorInt::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -256,11 +256,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::WaveformEnum => {
             let msg = epics_event::VectorEnum::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -270,11 +270,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::WaveformFloat => {
             let msg = epics_event::VectorFloat::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -284,11 +284,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::WaveformDouble => {
             let msg = epics_event::VectorDouble::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -298,11 +298,11 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
         ArchDbType::V4GenericBytes => {
             let msg = epics_event::V4GenericBytes::decode(data)?;
-            Ok(sample_from_parts(
+            sample_from_parts(
                 year,
                 msg.secondsintoyear,
                 msg.nano,
@@ -312,7 +312,7 @@ pub fn decode_sample(
                 msg.repeatcount,
                 &msg.fieldvalues,
                 msg.fieldactualchange,
-            ))
+            )
         }
     }
 }
@@ -328,9 +328,10 @@ fn sample_from_parts(
     repeat_count: Option<u32>,
     field_values: &[epics_event::FieldValue],
     field_actual_change: Option<bool>,
-) -> ArchiverSample {
-    let timestamp = ArchiverSample::timestamp_from_epoch_parts(year, seconds_into_year, nanos);
-    ArchiverSample {
+) -> anyhow::Result<ArchiverSample> {
+    let timestamp = ArchiverSample::timestamp_from_epoch_parts(year, seconds_into_year, nanos)
+        .ok_or_else(|| anyhow::anyhow!("invalid timestamp: year={year} secs={seconds_into_year} nanos={nanos}"))?;
+    Ok(ArchiverSample {
         timestamp,
         value,
         severity: severity.unwrap_or(0),
@@ -341,5 +342,5 @@ fn sample_from_parts(
             .map(|fv| (fv.name.clone(), fv.val.clone()))
             .collect(),
         field_actual_change: field_actual_change.unwrap_or(false),
-    }
+    })
 }

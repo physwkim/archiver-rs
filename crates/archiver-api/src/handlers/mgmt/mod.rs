@@ -61,6 +61,58 @@ async fn try_mgmt_dispatch(
         .ok()
 }
 
+/// Route PVs to local vs remote batches based on cluster ownership.
+/// Returns (local_pvs, remote_batches_by_mgmt_url).
+async fn route_pvs(
+    state: &AppState,
+    pvs: &[String],
+    is_proxied: bool,
+) -> (Vec<String>, std::collections::HashMap<String, Vec<String>>) {
+    let mut local = Vec::new();
+    let mut remote: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    if is_proxied {
+        return (pvs.to_vec(), remote);
+    }
+
+    let cluster = match state.cluster.as_ref() {
+        Some(c) => c,
+        None => return (pvs.to_vec(), remote),
+    };
+
+    for pv in pvs {
+        if state.pv_query.get_pv(pv).ok().flatten().is_some() {
+            local.push(pv.clone());
+        } else if let Some(resolved) = cluster.resolve_peer(pv).await {
+            remote
+                .entry(resolved.mgmt_url)
+                .or_default()
+                .push(pv.clone());
+        } else {
+            local.push(pv.clone());
+        }
+    }
+
+    (local, remote)
+}
+
+/// Forward all remote PV batches to their respective peers and collect results.
+async fn forward_all_peer_batches(
+    cluster: &dyn ClusterRouter,
+    batches: std::collections::HashMap<String, Vec<String>>,
+    endpoint: &str,
+) -> Vec<BulkResult> {
+    let futs: Vec<_> = batches
+        .into_iter()
+        .map(|(mgmt_url, batch)| async move {
+            forward_pv_batch_to_peer(cluster, &mgmt_url, endpoint, &batch).await
+        })
+        .collect();
+    let results = futures::future::join_all(futs).await;
+    results.into_iter().flatten().collect()
+}
+
 /// Forward a batch of PV names to a peer and parse the response as Vec<BulkResult>.
 async fn forward_pv_batch_to_peer(
     cluster: &dyn ClusterRouter,

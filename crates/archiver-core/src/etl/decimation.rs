@@ -87,7 +87,7 @@ impl EventStream for MeanDecimationStream {
                         let mean =
                             self.buffer.iter().sum::<f64>() / self.buffer.len() as f64;
                         let result = ArchiverSample::new(
-                            self.window_start.unwrap(),
+                            self.window_start.expect("non-empty buffer implies window_start set"),
                             ArchiverValue::ScalarDouble(mean),
                         );
                         self.buffer.clear();

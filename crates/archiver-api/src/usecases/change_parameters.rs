@@ -26,7 +26,9 @@ pub async fn change_parameters(
     };
 
     if record.status == PvStatus::Active {
-        let _ = archiver_cmd.pause_pv(pv);
+        if let Err(e) = archiver_cmd.pause_pv(pv) {
+            tracing::warn!(pv, "Failed to pause before parameter change: {e}");
+        }
         archiver_cmd.resume_pv(pv).await.map_err(|e| {
             ApiError::Internal(format!("Updated parameters but failed to restart {pv}: {e}"))
         })?;

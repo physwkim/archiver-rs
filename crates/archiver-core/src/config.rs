@@ -169,6 +169,30 @@ impl ArchiverConfig {
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)
     }
+
+    /// Validate configuration values that TOML deserialization alone cannot check.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, tier) in [("sts", &self.storage.sts), ("mts", &self.storage.mts), ("lts", &self.storage.lts)] {
+            if tier.gather >= tier.hold {
+                anyhow::bail!(
+                    "{name}: gather ({}) must be less than hold ({})",
+                    tier.gather,
+                    tier.hold,
+                );
+            }
+        }
+        if let Some(ref cluster) = self.cluster {
+            for (i, peer) in cluster.peers.iter().enumerate() {
+                if !peer.mgmt_url.starts_with("http://") && !peer.mgmt_url.starts_with("https://") {
+                    anyhow::bail!("cluster.peers[{i}].mgmt_url must start with http:// or https://");
+                }
+                if !peer.retrieval_url.starts_with("http://") && !peer.retrieval_url.starts_with("https://") {
+                    anyhow::bail!("cluster.peers[{i}].retrieval_url must start with http:// or https://");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

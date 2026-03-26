@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context(format!("Failed to read config file: {config_path}"))?;
     let config = ArchiverConfig::from_toml(&config_str)?;
+    config.validate()?;
 
     info!(
         listen = format!("{}:{}", config.listen_addr, config.listen_port),
@@ -152,7 +153,13 @@ async fn main() -> anyhow::Result<()> {
     // Install Prometheus metrics recorder.
     let metrics_handle = {
         let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-        builder.install_recorder().ok()
+        match builder.install_recorder() {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::warn!("Prometheus recorder failed: {e}");
+                None
+            }
+        }
     };
 
     // Build rate limiter if configured.
@@ -210,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
         // Install ring crypto provider for rustls.
         rustls::crypto::ring::default_provider()
             .install_default()
-            .expect("Failed to install rustls crypto provider");
+            .expect("rustls crypto provider already installed or ring unavailable");
 
         let rustls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)

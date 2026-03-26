@@ -55,7 +55,11 @@ pub fn build_router(state: AppState, security: &SecurityConfig) -> Router {
         let origins: Vec<HeaderValue> = security
             .cors_origins
             .iter()
-            .filter_map(|s| s.parse().ok())
+            .filter_map(|s| {
+                s.parse().map_err(|e| {
+                    tracing::warn!(origin = s, "Invalid CORS origin, skipping: {e}");
+                }).ok()
+            })
             .collect();
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(origins))

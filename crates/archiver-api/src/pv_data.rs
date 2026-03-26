@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use axum::extract::{OriginalUri, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -15,6 +15,9 @@ use archiver_core::types::{ArchiverSample, ArchiverValue};
 
 use crate::errors::ApiError;
 use crate::AppState;
+
+/// Default time range when no `from` parameter is specified (1 hour).
+const DEFAULT_TIME_RANGE_SECS: u64 = 3600;
 
 /// Try to proxy a data request to the correct cluster peer.
 /// Returns Some(Response) if proxied, None if should handle locally.
@@ -114,6 +117,38 @@ fn parse_pv_spec(spec: &str) -> (String, Option<String>) {
     (spec.to_string(), None)
 }
 
+/// Parsed retrieval parameters shared across all getData endpoints.
+struct RetrievalParams {
+    pv_name: String,
+    pp_spec: Option<String>,
+    start: SystemTime,
+    end: SystemTime,
+    limit: Option<usize>,
+}
+
+/// Parse and validate common retrieval parameters.
+fn parse_retrieval_params(params: &GetDataParams) -> RetrievalParams {
+    let (pv_name, pp_spec) = parse_pv_spec(&params.pv);
+    let now = SystemTime::now();
+    let start = params
+        .from
+        .as_deref()
+        .and_then(parse_iso8601)
+        .unwrap_or(now - std::time::Duration::from_secs(DEFAULT_TIME_RANGE_SECS));
+    let end = params
+        .to
+        .as_deref()
+        .and_then(parse_iso8601)
+        .unwrap_or(now);
+    RetrievalParams {
+        pv_name,
+        pp_spec,
+        start,
+        end,
+        limit: params.limit,
+    }
+}
+
 fn sample_to_json_value(value: &ArchiverValue) -> serde_json::Value {
     match value {
         ArchiverValue::ScalarString(v) => serde_json::Value::String(v.clone()),
@@ -200,29 +235,15 @@ async fn get_data_json(
     headers: HeaderMap,
     Query(params): Query<GetDataParams>,
 ) -> Response {
-    let (pv_name, _) = parse_pv_spec(&params.pv);
+    let rp = parse_retrieval_params(&params);
 
-    // Try cluster proxy first.
-    if let Some(resp) = try_cluster_proxy(&state, &pv_name, "data/getData.json", &headers, &uri).await {
+    if let Some(resp) = try_cluster_proxy(&state, &rp.pv_name, "data/getData.json", &headers, &uri).await {
         return resp;
     }
 
-    let now = SystemTime::now();
-    let start = params
-        .from
-        .as_deref()
-        .and_then(parse_iso8601)
-        .unwrap_or(now - std::time::Duration::from_secs(3600));
-    let end = params
-        .to
-        .as_deref()
-        .and_then(parse_iso8601)
-        .unwrap_or(now);
+    let post_processor = rp.pp_spec.and_then(|s| parse_post_processor(&s));
 
-    let (pv_name, pp_spec) = parse_pv_spec(&params.pv);
-    let post_processor = pp_spec.and_then(|s| parse_post_processor(&s));
-
-    let stream = match query_data(state.storage.as_ref(), &pv_name, start, end, post_processor)
+    let stream = match query_data(state.storage.as_ref(), &rp.pv_name, rp.start, rp.end, post_processor)
         .await
     {
         Ok(s) => s,
@@ -231,8 +252,9 @@ async fn get_data_json(
         }
     };
 
-    let limit = params.limit;
-    let pv_name_clone = pv_name.clone();
+    let start = rp.start;
+    let end = rp.end;
+    let limit = rp.limit;
 
     // Stream JSON: [{"meta":...,"data":[sample,sample,...]}]
     let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(64);
@@ -240,19 +262,27 @@ async fn get_data_json(
     // Look up metadata from registry.
     let (prec, egu) = state
         .pv_query
-        .get_pv(&pv_name)
+        .get_pv(&rp.pv_name)
         .ok()
         .flatten()
         .map(|r| (r.prec, r.egu))
         .unwrap_or((None, None));
 
+    let pv_name = rp.pv_name;
+
     tokio::spawn(async move {
         let meta = JsonMeta {
-            name: pv_name_clone,
+            name: pv_name,
             prec,
             egu,
         };
-        let meta_json = serde_json::to_string(&meta).unwrap_or_default();
+        let meta_json = match serde_json::to_string(&meta) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to serialize PV metadata: {e}");
+                "{}".to_string()
+            }
+        };
         let header = format!("[{{\"meta\":{meta_json},\"data\":[");
         if chunk_tx.send(Ok(header)).await.is_err() {
             return;
@@ -267,7 +297,13 @@ async fn get_data_json(
         let mut first = true;
         while let Ok(sample) = sample_rx.recv() {
             let js = sample_to_json(&sample);
-            let json_str = serde_json::to_string(&js).unwrap_or_default();
+            let json_str = match serde_json::to_string(&js) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Failed to serialize sample: {e}");
+                    continue;
+                }
+            };
             let chunk = if first {
                 first = false;
                 json_str
@@ -287,7 +323,7 @@ async fn get_data_json(
     Response::builder()
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .body(body)
-        .unwrap()
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         .into_response()
 }
 
@@ -297,27 +333,15 @@ async fn get_data_csv(
     headers: HeaderMap,
     Query(params): Query<GetDataParams>,
 ) -> Response {
-    let (pv_name_check, _) = parse_pv_spec(&params.pv);
-    if let Some(resp) = try_cluster_proxy(&state, &pv_name_check, "data/getData.csv", &headers, &uri).await {
+    let rp = parse_retrieval_params(&params);
+
+    if let Some(resp) = try_cluster_proxy(&state, &rp.pv_name, "data/getData.csv", &headers, &uri).await {
         return resp;
     }
 
-    let now = SystemTime::now();
-    let start = params
-        .from
-        .as_deref()
-        .and_then(parse_iso8601)
-        .unwrap_or(now - std::time::Duration::from_secs(3600));
-    let end = params
-        .to
-        .as_deref()
-        .and_then(parse_iso8601)
-        .unwrap_or(now);
+    let post_processor = rp.pp_spec.and_then(|s| parse_post_processor(&s));
 
-    let (pv_name, pp_spec) = parse_pv_spec(&params.pv);
-    let post_processor = pp_spec.and_then(|s| parse_post_processor(&s));
-
-    let stream = match query_data(state.storage.as_ref(), &pv_name, start, end, post_processor)
+    let stream = match query_data(state.storage.as_ref(), &rp.pv_name, rp.start, rp.end, post_processor)
         .await
     {
         Ok(s) => s,
@@ -326,7 +350,9 @@ async fn get_data_csv(
         }
     };
 
-    let limit = params.limit;
+    let start = rp.start;
+    let end = rp.end;
+    let limit = rp.limit;
 
     let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(64);
 
@@ -357,7 +383,7 @@ async fn get_data_csv(
     Response::builder()
         .header(axum::http::header::CONTENT_TYPE, "text/csv")
         .body(body)
-        .unwrap()
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         .into_response()
 }
 
@@ -367,26 +393,16 @@ async fn get_data_raw(
     headers: HeaderMap,
     Query(params): Query<GetDataParams>,
 ) -> Response {
-    let (pv_name_check, _) = parse_pv_spec(&params.pv);
-    if let Some(resp) = try_cluster_proxy(&state, &pv_name_check, "data/getData.raw", &headers, &uri).await {
+    let rp = parse_retrieval_params(&params);
+
+    if let Some(resp) = try_cluster_proxy(&state, &rp.pv_name, "data/getData.raw", &headers, &uri).await {
         return resp;
     }
 
-    let now = SystemTime::now();
-    let start = params
-        .from
-        .as_deref()
-        .and_then(parse_iso8601)
-        .unwrap_or(now - std::time::Duration::from_secs(3600));
-    let end = params
-        .to
-        .as_deref()
-        .and_then(parse_iso8601)
-        .unwrap_or(now);
+    let start = rp.start;
+    let end = rp.end;
 
-    let (pv_name, _) = parse_pv_spec(&params.pv);
-
-    let streams = match state.storage.get_data(&pv_name, start, end).await {
+    let streams = match state.storage.get_data(&rp.pv_name, start, end).await {
         Ok(s) => s,
         Err(e) => {
             return ApiError::internal(e).into_response();
@@ -456,6 +472,6 @@ async fn get_data_raw(
     Response::builder()
         .header(axum::http::header::CONTENT_TYPE, "application/x-protobuf")
         .body(body)
-        .unwrap()
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         .into_response()
 }
