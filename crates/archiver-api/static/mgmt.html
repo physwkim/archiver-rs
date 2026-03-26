@@ -235,6 +235,7 @@ async function loadAllPVs() {
     for (const pv of pvs) {
       html += `<tr id="pvrow-${css(pv)}"><td>${esc(pv)}</td><td class="pv-status" data-pv="${esc(pv)}"><span class="loading">...</span></td><td>
         <button class="btn-primary btn-sm" onclick="showPvDetail('${esc(pv)}')">Details</button>
+        <button class="btn-primary btn-sm" onclick="viewData('${esc(pv)}')" title="View Data">&#x1F4C8;</button>
         <button class="btn-secondary btn-sm" onclick="pausePV('${esc(pv)}')">Pause</button>
         <button class="btn-secondary btn-sm" onclick="resumePV('${esc(pv)}')">Resume</button>
         <button class="btn-danger btn-sm" onclick="deletePV('${esc(pv)}')">Delete</button>
@@ -297,6 +298,7 @@ async function showPvDetail(pv) {
 
     // Action buttons
     html += '<div style="margin-top:16px;display:flex;gap:8px">';
+    html += `<button class="btn-primary btn-sm" onclick="viewData('${esc(pv)}')">View Data</button>`;
     html += `<button class="btn-secondary btn-sm" onclick="pausePV('${esc(pv)}');closePvDetail()">Pause</button>`;
     html += `<button class="btn-secondary btn-sm" onclick="resumePV('${esc(pv)}');closePvDetail()">Resume</button>`;
     html += `<button class="btn-secondary btn-sm" onclick="abortPV('${esc(pv)}');closePvDetail()">Abort</button>`;
@@ -363,7 +365,7 @@ async function searchPVs() {
     if (!pvs.length) { el.innerHTML = '<p>No matches.</p>'; return; }
     let html = '<div class="table-wrap"><table><tr><th>PV Name</th><th>Actions</th></tr>';
     for (const pv of pvs) {
-      html += `<tr><td>${esc(pv)}</td><td><button class="btn-primary btn-sm" onclick="showPvDetail('${esc(pv)}')">Details</button></td></tr>`;
+      html += `<tr><td>${esc(pv)}</td><td><button class="btn-primary btn-sm" onclick="showPvDetail('${esc(pv)}')">Details</button> <button class="btn-primary btn-sm" onclick="viewData('${esc(pv)}')" title="View Data">&#x1F4C8;</button></td></tr>`;
     }
     html += '</table></div>';
     el.innerHTML = html;
@@ -511,6 +513,8 @@ async function loadClusterInfo() {
     el.innerHTML = html;
   } catch(e) { el.innerHTML = `<div class="msg msg-err">${e}</div>`; }
 }
+
+function viewData(pv) { window.open('/mgmt/ui/pvdata.html?pv=' + encodeURIComponent(pv), '_blank'); }
 
 function esc(s) { if (s == null) return ''; const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }
 function css(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }

@@ -83,6 +83,19 @@ export EPICS_CA_AUTO_ADDR_LIST=YES
 ./target/release/archiver /etc/archiver/myconfig.toml
 ```
 
+The default log level is `info`. Use the `RUST_LOG` environment variable for more detail:
+
+```bash
+# Enable debug logging for all archiver crates
+RUST_LOG=debug ./target/release/archiver
+
+# Debug only for the engine, info for everything else
+RUST_LOG=info,archiver_engine=debug ./target/release/archiver
+
+# Suppress noisy storage writes, keep engine debug
+RUST_LOG=info,archiver_engine=debug,archiver_core::storage=warn ./target/release/archiver
+```
+
 ### 4. Archive a PV
 
 ```bash

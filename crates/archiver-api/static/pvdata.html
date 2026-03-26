@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EPICS Archiver - Data Viewer</title>
+<link rel="stylesheet" href="/mgmt/ui/vendor/uplot.min.css">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #333; }
+  .header { background: #1a237e; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+  .header h1 { font-size: 20px; font-weight: 500; }
+  .header a { color: rgba(255,255,255,0.8); text-decoration: none; font-size: 14px; }
+  .header a:hover { color: white; }
+  .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+  .card { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+  .card h3 { font-size: 15px; font-weight: 600; margin-bottom: 12px; color: #555; }
+  .form-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  input[type="text"], input[type="datetime-local"] { padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+  input[type="text"] { width: 320px; }
+  button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
+  .btn-primary { background: #1a237e; color: white; }
+  .btn-primary:hover { background: #283593; }
+  .btn-secondary { background: #757575; color: white; }
+  .btn-secondary:hover { background: #616161; }
+  .btn-sm { padding: 4px 10px; font-size: 12px; }
+  .btn-outline { background: white; color: #1a237e; border: 1px solid #1a237e; }
+  .btn-outline:hover { background: #e8eaf6; }
+  .btn-outline.active { background: #1a237e; color: white; }
+  .pv-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .pv-tag { display: inline-flex; align-items: center; gap: 4px; background: #e8eaf6; color: #1a237e; padding: 4px 10px; border-radius: 16px; font-size: 13px; font-family: monospace; }
+  .pv-tag .remove { cursor: pointer; font-size: 16px; line-height: 1; opacity: 0.6; }
+  .pv-tag .remove:hover { opacity: 1; }
+  .time-presets { display: flex; gap: 4px; }
+  .custom-range { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  .custom-range label { font-size: 13px; color: #666; }
+  .auto-refresh { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .auto-refresh select { padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+  #chart-container { min-height: 400px; position: relative; }
+  .msg { padding: 12px; border-radius: 4px; margin-top: 12px; font-size: 14px; }
+  .msg-err { background: #ffebee; color: #c62828; }
+  .msg-info { background: #e3f2fd; color: #1565c0; }
+  .loading { color: #666; font-style: italic; }
+  .status-bar { font-size: 12px; color: #999; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>EPICS Archiver - Data Viewer</h1>
+  <a href="/mgmt/ui/">Management Console</a>
+</div>
+
+<div class="container">
+  <!-- PV Input -->
+  <div class="card">
+    <h3>Process Variables</h3>
+    <div class="form-row">
+      <input type="text" id="pv-input" placeholder="PV name or mean_600(PV:NAME)" />
+      <button class="btn-primary" onclick="addPV()">Add</button>
+    </div>
+    <div class="pv-tags" id="pv-tags"></div>
+  </div>
+
+  <!-- Time Range -->
+  <div class="card">
+    <h3>Time Range</h3>
+    <div class="form-row">
+      <div class="time-presets">
+        <button class="btn-outline btn-sm" data-range="5m">5m</button>
+        <button class="btn-outline btn-sm" data-range="1h">1h</button>
+        <button class="btn-outline btn-sm" data-range="12h">12h</button>
+        <button class="btn-outline btn-sm active" data-range="1d">1d</button>
+        <button class="btn-outline btn-sm" data-range="1w">1w</button>
+      </div>
+      <button class="btn-primary" onclick="plotData()">Plot</button>
+      <div class="auto-refresh">
+        <label><input type="checkbox" id="auto-refresh"> Auto-refresh</label>
+        <select id="refresh-interval">
+          <option value="10">10s</option>
+          <option value="30" selected>30s</option>
+          <option value="60">60s</option>
+        </select>
+      </div>
+    </div>
+    <div class="custom-range">
+      <label>From:</label>
+      <input type="datetime-local" id="time-from" step="1" />
+      <label>To:</label>
+      <input type="datetime-local" id="time-to" step="1" />
+      <button class="btn-outline btn-sm" onclick="plotCustomRange()">Apply</button>
+    </div>
+  </div>
+
+  <!-- Chart -->
+  <div class="card">
+    <div id="chart-container"></div>
+    <div class="status-bar" id="status-bar"></div>
+  </div>
+</div>
+
+<script src="/mgmt/ui/vendor/uplot.min.js"></script>
+<script>
+'use strict';
+
+const COLORS = ['#1a237e','#c62828','#2e7d32','#e65100','#6a1b9a','#00838f','#4e342e','#37474f'];
+const RANGE_MS = { '5m': 5*60e3, '1h': 3600e3, '12h': 12*3600e3, '1d': 86400e3, '1w': 7*86400e3 };
+const DOWNSAMPLE_THRESHOLDS = [
+  { ms: 7*86400e3, operator: 'mean_600' },
+  { ms: 86400e3,   operator: 'mean_60' },
+];
+
+let pvList = [];
+let activeRange = '1d';
+let customFrom = null;
+let customTo = null;
+let uplot = null;
+let refreshTimer = null;
+
+// ── URL state ──
+
+function readURL() {
+  const params = new URLSearchParams(location.search);
+  const pvs = params.getAll('pv');
+  pvs.forEach(pv => { if (pv && !pvList.includes(pv)) pvList.push(pv); });
+  if (params.get('range') && RANGE_MS[params.get('range')]) {
+    activeRange = params.get('range');
+  }
+  if (params.get('from')) {
+    customFrom = params.get('from');
+    customTo = params.get('to') || null;
+    activeRange = null;
+  }
+}
+
+function syncURL() {
+  const params = new URLSearchParams();
+  pvList.forEach(pv => params.append('pv', pv));
+  if (activeRange) {
+    params.set('range', activeRange);
+  } else {
+    if (customFrom) params.set('from', customFrom);
+    if (customTo) params.set('to', customTo);
+  }
+  const qs = params.toString();
+  history.replaceState(null, '', qs ? '?' + qs : location.pathname);
+}
+
+// ── PV management ──
+
+function addPV(name) {
+  const input = document.getElementById('pv-input');
+  const pv = (name || input.value).trim();
+  if (!pv || pvList.includes(pv)) return;
+  pvList.push(pv);
+  if (!name) input.value = '';
+  renderTags();
+  syncURL();
+}
+
+function removePV(pv) {
+  pvList = pvList.filter(p => p !== pv);
+  renderTags();
+  syncURL();
+  if (pvList.length === 0) clearChart();
+}
+
+function renderTags() {
+  const el = document.getElementById('pv-tags');
+  el.innerHTML = pvList.map((pv, i) =>
+    `<span class="pv-tag" style="border-left: 3px solid ${COLORS[i % COLORS.length]}">` +
+    `${esc(pv)} <span class="remove" onclick="removePV('${escAttr(pv)}')">&times;</span></span>`
+  ).join('');
+}
+
+// ── Time range ──
+
+document.querySelectorAll('[data-range]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    activeRange = btn.dataset.range;
+    customFrom = null;
+    customTo = null;
+    document.querySelectorAll('[data-range]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    syncURL();
+    syncDateInputs();
+    plotData();
+  });
+});
+
+function plotCustomRange() {
+  const from = document.getElementById('time-from').value;
+  const to = document.getElementById('time-to').value;
+  if (!from) return;
+  customFrom = new Date(from).toISOString();
+  customTo = to ? new Date(to).toISOString() : new Date().toISOString();
+  activeRange = null;
+  document.querySelectorAll('[data-range]').forEach(b => b.classList.remove('active'));
+  syncURL();
+  plotData();
+}
+
+function getTimeRange() {
+  if (activeRange) {
+    const to = new Date();
+    const from = new Date(to.getTime() - RANGE_MS[activeRange]);
+    return { from: from.toISOString(), to: to.toISOString() };
+  }
+  return { from: customFrom, to: customTo || new Date().toISOString() };
+}
+
+// Keep From/To inputs in sync with current range
+function toLocalISO(d) {
+  const off = d.getTimezoneOffset();
+  const local = new Date(d.getTime() - off * 60000);
+  return local.toISOString().slice(0, 19);
+}
+
+function syncDateInputs() {
+  const { from, to } = getTimeRange();
+  document.getElementById('time-from').value = toLocalISO(new Date(from));
+  document.getElementById('time-to').value = toLocalISO(new Date(to));
+}
+
+// ── Auto-downsampling ──
+
+function applyDownsampling(pvName, rangeMs) {
+  // If user already specified a post-processor, don't touch it
+  if (/^\w+\(/.test(pvName)) return pvName;
+  for (const { ms, operator } of DOWNSAMPLE_THRESHOLDS) {
+    if (rangeMs >= ms) return `${operator}(${pvName})`;
+  }
+  return pvName;
+}
+
+// ── Data fetch ──
+
+async function fetchPV(pvName, from, to) {
+  const url = `/retrieval/data/getData.json?pv=${encodeURIComponent(pvName)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+  const data = await resp.json();
+  if (!data.length || !data[0].data) return null;
+  return data[0];
+}
+
+async function plotData() {
+  if (!pvList.length) return;
+
+  const container = document.getElementById('chart-container');
+  const statusBar = document.getElementById('status-bar');
+  container.innerHTML = '<p class="loading">Loading data...</p>';
+  statusBar.textContent = '';
+
+  const { from, to } = getTimeRange();
+  const rangeMs = new Date(to).getTime() - new Date(from).getTime();
+
+  try {
+    const fetches = pvList.map(pv => {
+      const qpv = applyDownsampling(pv, rangeMs);
+      return fetchPV(qpv, from, to).then(result => ({ pv, result })).catch(err => ({ pv, error: err }));
+    });
+    const results = await Promise.all(fetches);
+
+    // Check for errors
+    const errors = results.filter(r => r.error);
+    const successes = results.filter(r => r.result);
+
+    if (!successes.length) {
+      container.innerHTML = errors.length
+        ? `<div class="msg msg-err">Failed to fetch data: ${esc(errors[0].error.message)}</div>`
+        : '<div class="msg msg-info">No data returned for the selected PVs and time range.</div>';
+      return;
+    }
+
+    // Check plottability — only numeric scalars
+    const plottable = [];
+    for (const s of successes) {
+      const sample = s.result.data[0];
+      if (sample && (typeof sample.val === 'number' || typeof sample.val === 'string' && !isNaN(Number(sample.val)))) {
+        plottable.push(s);
+      } else if (sample && Array.isArray(sample.val)) {
+        container.innerHTML = `<div class="msg msg-info">PV "${esc(s.pv)}" returns array data — not plottable as a simple chart.</div>`;
+      } else if (sample && typeof sample.val === 'string') {
+        container.innerHTML = `<div class="msg msg-info">PV "${esc(s.pv)}" returns string data — not plottable.</div>`;
+      }
+    }
+
+    if (!plottable.length) {
+      if (!container.querySelector('.msg')) {
+        container.innerHTML = '<div class="msg msg-info">No plottable numeric data found.</div>';
+      }
+      return;
+    }
+
+    // Merge timestamps and build uPlot data
+    const { timestamps, series } = mergeTimeSeries(plottable);
+
+    // Build uPlot options
+    const seriesOpts = [{ label: 'Time' }];
+    const legendParts = [];
+    for (let i = 0; i < plottable.length; i++) {
+      const pv = plottable[i].pv;
+      const meta = plottable[i].result.meta || {};
+      const egu = meta.EGU || '';
+      const label = egu ? `${pv} (${egu})` : pv;
+      seriesOpts.push({
+        label,
+        stroke: COLORS[pvList.indexOf(pv) % COLORS.length],
+        width: 2,
+        spanGaps: false,
+      });
+    }
+
+    const chartData = [timestamps, ...series];
+
+    container.innerHTML = '';
+    const width = container.clientWidth;
+    const height = Math.max(400, Math.min(600, window.innerHeight - 350));
+
+    const opts = {
+      width,
+      height,
+      series: seriesOpts,
+      axes: [
+        { stroke: '#666', grid: { stroke: '#eee' } },
+        { stroke: '#666', grid: { stroke: '#eee' } },
+      ],
+      cursor: { sync: { key: 'sync' } },
+      scales: {
+        x: {
+          time: true,
+          range: [new Date(from).getTime() / 1000, new Date(to).getTime() / 1000],
+        },
+      },
+    };
+
+    uplot = new uPlot(opts, chartData, container);
+
+    // Resize handler
+    const ro = new ResizeObserver(() => {
+      if (uplot) uplot.setSize({ width: container.clientWidth, height });
+    });
+    ro.observe(container);
+
+    // Status
+    let totalPoints = 0;
+    plottable.forEach(s => { totalPoints += s.result.data.length; });
+    statusBar.textContent = `${plottable.length} series, ${totalPoints.toLocaleString()} points total`;
+    if (errors.length) {
+      statusBar.textContent += ` | ${errors.length} PV(s) failed`;
+    }
+
+  } catch (e) {
+    container.innerHTML = `<div class="msg msg-err">${esc(e.message)}</div>`;
+  }
+}
+
+function mergeTimeSeries(plottable) {
+  // Collect all unique timestamps
+  const tsSet = new Set();
+  const pvData = plottable.map(s => {
+    const map = new Map();
+    for (const sample of s.result.data) {
+      const t = sample.secs;
+      tsSet.add(t);
+      const val = typeof sample.val === 'number' ? sample.val : Number(sample.val);
+      map.set(t, isNaN(val) ? null : val);
+    }
+    return map;
+  });
+
+  const timestamps = Float64Array.from(tsSet).sort();
+  const series = pvData.map(map => {
+    const arr = new Array(timestamps.length);
+    for (let i = 0; i < timestamps.length; i++) {
+      const v = map.get(timestamps[i]);
+      arr[i] = v !== undefined ? v : null;
+    }
+    return arr;
+  });
+
+  return { timestamps: Array.from(timestamps), series };
+}
+
+function clearChart() {
+  const container = document.getElementById('chart-container');
+  container.innerHTML = '';
+  document.getElementById('status-bar').textContent = '';
+  if (uplot) { uplot.destroy(); uplot = null; }
+}
+
+// ── Auto-refresh ──
+
+document.getElementById('auto-refresh').addEventListener('change', function() {
+  if (this.checked) {
+    startAutoRefresh();
+  } else {
+    stopAutoRefresh();
+  }
+});
+
+document.getElementById('refresh-interval').addEventListener('change', function() {
+  if (document.getElementById('auto-refresh').checked) {
+    stopAutoRefresh();
+    startAutoRefresh();
+  }
+});
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+  const seconds = parseInt(document.getElementById('refresh-interval').value) || 30;
+  refreshTimer = setInterval(() => {
+    if (!document.hidden && pvList.length > 0) {
+      plotData();
+    }
+  }, seconds * 1000);
+}
+
+function stopAutoRefresh() {
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+}
+
+// ── Input handlers ──
+
+document.getElementById('pv-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') addPV();
+});
+
+
+// ── Utility ──
+
+function esc(s) {
+  if (s == null) return '';
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+
+function escAttr(s) {
+  return String(s).replace(/'/g, "\\'").replace(/\\/g, '\\\\');
+}
+
+// ── Init ──
+
+readURL();
+renderTags();
+
+// Highlight active range button
+document.querySelectorAll('[data-range]').forEach(b => {
+  b.classList.toggle('active', b.dataset.range === activeRange);
+});
+
+// Always populate From/To inputs with current range
+syncDateInputs();
+
+// Auto-plot if PVs in URL
+if (pvList.length) plotData();
+</script>
+</body>
+</html>
