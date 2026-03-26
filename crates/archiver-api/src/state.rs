@@ -9,14 +9,18 @@ use subtle::ConstantTimeEq;
 use archiver_core::storage::traits::StoragePlugin;
 
 use crate::security::RateLimiter;
-use crate::services::traits::{ArchiverControl, ClusterRouter, PvRepository};
+use crate::services::traits::{
+    ArchiverCommand, ArchiverQuery, ClusterRouter, PvCommandRepository, PvQueryRepository,
+};
 
 /// Shared application state for API handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<dyn StoragePlugin>,
-    pub pv_repo: Arc<dyn PvRepository>,
-    pub archiver: Arc<dyn ArchiverControl>,
+    pub pv_query: Arc<dyn PvQueryRepository>,
+    pub pv_cmd: Arc<dyn PvCommandRepository>,
+    pub archiver_query: Arc<dyn ArchiverQuery>,
+    pub archiver_cmd: Arc<dyn ArchiverCommand>,
     pub cluster: Option<Arc<dyn ClusterRouter>>,
     pub api_keys: Option<Vec<String>>,
     pub metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,

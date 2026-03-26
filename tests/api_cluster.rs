@@ -23,10 +23,14 @@ async fn start_mock_peer(
         .await
         .unwrap();
     let channel_mgr = Arc::new(channel_mgr);
+    let repo = Arc::new(RegistryRepository::new(registry));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
     let state = AppState {
         storage,
-        pv_repo: Arc::new(RegistryRepository::new(registry)),
-        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr)),
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
         cluster: None,
         api_keys: None,
         metrics_handle: None,
@@ -69,10 +73,14 @@ async fn build_cluster_test_app(
         }],
     };
 
+    let repo = Arc::new(RegistryRepository::new(local_registry));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
     let state = AppState {
         storage: local_storage,
-        pv_repo: Arc::new(RegistryRepository::new(local_registry)),
-        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr)),
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
         cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
         api_keys: None,
         metrics_handle: None,

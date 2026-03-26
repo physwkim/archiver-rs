@@ -7,8 +7,9 @@ use std::collections::HashSet;
 
 use axum::body::Bytes;
 use axum::extract::FromRequest;
-use axum::http::{header, Request, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::{header, Request};
+
+use crate::errors::ApiError;
 
 /// Parse a PV list from a string body.
 ///
@@ -46,7 +47,7 @@ impl<S> FromRequest<S> for PvListInput
 where
     S: Send + Sync,
 {
-    type Rejection = Response;
+    type Rejection = ApiError;
 
     async fn from_request(req: Request<axum::body::Body>, state: &S) -> Result<Self, Self::Rejection> {
         let content_type = req
@@ -58,16 +59,14 @@ where
 
         let bytes = Bytes::from_request(req, state)
             .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
         let body = String::from_utf8(bytes.to_vec())
-            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid UTF-8 body").into_response())?;
+            .map_err(|_| ApiError::BadRequest("Invalid UTF-8 body".to_string()))?;
 
         let pvs = if content_type.contains("application/json") {
-            // Strict JSON parsing for JSON content type.
-            serde_json::from_str::<Vec<String>>(&body).map_err(|e| {
-                (StatusCode::BAD_REQUEST, format!("Invalid JSON array: {e}")).into_response()
-            })?
+            serde_json::from_str::<Vec<String>>(&body)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid JSON array: {e}")))?
         } else {
             parse_pv_list(&body)
         };

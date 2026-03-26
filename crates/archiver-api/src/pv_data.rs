@@ -13,7 +13,7 @@ use archiver_core::retrieval::query::{parse_post_processor, query_data};
 use archiver_core::storage::traits::EventStream;
 use archiver_core::types::{ArchiverSample, ArchiverValue};
 
-use crate::errors::internal_error;
+use crate::errors::ApiError;
 use crate::AppState;
 
 /// Try to proxy a data request to the correct cluster peer.
@@ -34,7 +34,7 @@ async fn try_cluster_proxy(
     let cluster = state.cluster.as_ref()?;
 
     // Don't proxy if PV is local.
-    if state.pv_repo.get_pv(pv_name).ok().flatten().is_some() {
+    if state.pv_query.get_pv(pv_name).ok().flatten().is_some() {
         return None;
     }
 
@@ -227,7 +227,7 @@ async fn get_data_json(
     {
         Ok(s) => s,
         Err(e) => {
-            return internal_error(e);
+            return ApiError::internal(e).into_response();
         }
     };
 
@@ -239,7 +239,7 @@ async fn get_data_json(
 
     // Look up metadata from registry.
     let (prec, egu) = state
-        .pv_repo
+        .pv_query
         .get_pv(&pv_name)
         .ok()
         .flatten()
@@ -322,7 +322,7 @@ async fn get_data_csv(
     {
         Ok(s) => s,
         Err(e) => {
-            return internal_error(e);
+            return ApiError::internal(e).into_response();
         }
     };
 
@@ -389,7 +389,7 @@ async fn get_data_raw(
     let streams = match state.storage.get_data(&pv_name, start, end).await {
         Ok(s) => s,
         Err(e) => {
-            return internal_error(e);
+            return ApiError::internal(e).into_response();
         }
     };
 

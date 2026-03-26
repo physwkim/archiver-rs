@@ -1,18 +1,16 @@
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 
-use archiver_core::registry::{PvStatus, SampleMode};
+use archiver_core::registry::SampleMode;
 
 use crate::dto::mgmt::*;
-use crate::errors::internal_error;
+use crate::errors::ApiError;
 use crate::AppState;
 
-pub async fn export_config(State(state): State<AppState>) -> Response {
-    let records = match state.pv_repo.all_records() {
-        Ok(r) => r,
-        Err(e) => return internal_error(e),
-    };
+pub async fn export_config(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let records = state.pv_query.all_records().map_err(ApiError::internal)?;
 
     let exports: Vec<ExportRecord> = records
         .into_iter()
@@ -36,54 +34,22 @@ pub async fn export_config(State(state): State<AppState>) -> Response {
         })
         .collect();
 
-    axum::Json(exports).into_response()
+    Ok(axum::Json(exports))
 }
 
 pub async fn import_config(
     State(state): State<AppState>,
     body: axum::body::Bytes,
-) -> Response {
-    let records: Vec<ExportRecord> = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")).into_response(),
-    };
+) -> Result<impl IntoResponse, ApiError> {
+    let records: Vec<ExportRecord> = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid JSON: {e}")))?;
 
-    let mut imported = 0u64;
-    let mut errors = Vec::new();
-
-    for r in &records {
-        let dbr_type = archiver_core::types::ArchDbType::from_i32(r.dbr_type)
-            .unwrap_or(archiver_core::types::ArchDbType::ScalarDouble);
-        let sample_mode = parse_sample_mode(
-            Some(r.sampling_method.as_str()),
-            if r.sampling_period > 0.0 { Some(r.sampling_period) } else { None },
-        );
-        let status = r.status.as_deref()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(PvStatus::Active);
-
-        match state.pv_repo.import_pv(
-            &r.pv_name,
-            dbr_type,
-            &sample_mode,
-            r.element_count,
-            status,
-            r.created_at.as_deref(),
-            r.prec.as_deref(),
-            r.egu.as_deref(),
-        ) {
-            Ok(()) => imported += 1,
-            Err(e) => {
-                tracing::warn!(pv = r.pv_name, "Import failed: {e}");
-                errors.push(format!("Failed to import {}", r.pv_name));
-            }
-        }
-    }
+    let result = crate::usecases::import_config::import_config(state.pv_cmd.as_ref(), &records)?;
 
     let resp = serde_json::json!({
-        "imported": imported,
-        "total": records.len(),
-        "errors": errors,
+        "imported": result.imported,
+        "total": result.total,
+        "errors": result.errors,
     });
-    axum::Json(resp).into_response()
+    Ok(axum::Json(resp))
 }

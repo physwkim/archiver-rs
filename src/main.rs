@@ -1,3 +1,5 @@
+mod supervisor;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +20,8 @@ use archiver_core::storage::tiered::TieredStorage;
 use archiver_core::storage::traits::StoragePlugin;
 use archiver_engine::channel_manager::{self, ChannelManager};
 use archiver_engine::policy::PolicyConfig;
+
+use supervisor::RuntimeSupervisor;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -65,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Shutdown signal.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut supervisor = RuntimeSupervisor::new(shutdown_rx);
 
     // Load policy config if specified.
     let policy = config
@@ -95,8 +100,8 @@ async fn main() -> anyhow::Result<()> {
     let flush_period = Duration::from_secs(config.engine.write_period_secs);
     let write_storage = storage.clone();
     let write_registry = registry.clone();
-    let write_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move {
+    let write_shutdown = supervisor.shutdown_rx();
+    supervisor.spawn("write_loop", async move {
         channel_manager::write_loop(
             write_storage,
             write_registry,
@@ -108,7 +113,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Compute ETL periods from tier config.
-    // STS→MTS: run at interval = hold * partition_granularity_seconds
     let sts_period_secs = config.storage.sts.hold as u64
         * config.storage.sts.partition_granularity.approx_seconds();
     let mts_period_secs = config.storage.mts.hold as u64
@@ -129,17 +133,17 @@ async fn main() -> anyhow::Result<()> {
         config.storage.mts.gather,
     );
 
-    let etl1_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move { etl_sts_mts.run(etl1_shutdown).await });
-    let etl2_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move { etl_mts_lts.run(etl2_shutdown).await });
+    let etl1_shutdown = supervisor.shutdown_rx();
+    supervisor.spawn("etl_sts_mts", async move { etl_sts_mts.run(etl1_shutdown).await });
+    let etl2_shutdown = supervisor.shutdown_rx();
+    supervisor.spawn("etl_mts_lts", async move { etl_mts_lts.run(etl2_shutdown).await });
 
     // Start Bluesky Kafka consumer if configured.
     if let Some(ref bluesky_config) = config.bluesky {
         let consumer =
             BlueskyConsumer::new(bluesky_config.clone(), storage.clone(), registry.clone());
-        let bs_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        let bs_shutdown = supervisor.shutdown_rx();
+        supervisor.spawn("bluesky_consumer", async move {
             if let Err(e) = consumer.run(bs_shutdown).await {
                 error!("Bluesky consumer error: {e}");
             }
@@ -170,13 +174,20 @@ async fn main() -> anyhow::Result<()> {
             config.security.rate_limit_rps,
             config.security.rate_limit_burst,
         ));
-        // Periodic cleanup of stale entries.
+        // Periodic cleanup of stale entries with shutdown support.
         let cleanup_limiter = limiter.clone();
-        tokio::spawn(async move {
+        let mut cleanup_shutdown = supervisor.shutdown_rx();
+        supervisor.spawn("rate_limiter_cleanup", async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
-                interval.tick().await;
-                cleanup_limiter.cleanup();
+                tokio::select! {
+                    _ = interval.tick() => {
+                        cleanup_limiter.cleanup();
+                    }
+                    _ = cleanup_shutdown.changed() => {
+                        break;
+                    }
+                }
             }
         });
         info!(
@@ -190,10 +201,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Build REST API.
+    let repo = Arc::new(RegistryRepository::new(registry.clone()));
+    let archiver_impl = Arc::new(ChannelArchiverControl::new(channel_mgr.clone()));
     let app_state = AppState {
         storage: storage.clone(),
-        pv_repo: Arc::new(RegistryRepository::new(registry.clone())),
-        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr.clone())),
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver_impl.clone(),
+        archiver_cmd: archiver_impl,
         cluster,
         api_keys: config.api_keys.clone(),
         metrics_handle,
@@ -241,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
         server.await?;
     }
 
+    supervisor.shutdown(Duration::from_secs(30)).await;
     info!("Archiver stopped");
     Ok(())
 }

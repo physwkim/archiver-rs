@@ -25,10 +25,14 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         .await
         .unwrap();
     let channel_mgr = Arc::new(channel_mgr);
+    let repo = Arc::new(RegistryRepository::new(registry));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
     let state = AppState {
         storage,
-        pv_repo: Arc::new(RegistryRepository::new(registry)),
-        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr)),
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
         cluster: None,
         api_keys: None,
         metrics_handle: None,
@@ -61,10 +65,14 @@ async fn build_test_app_with_pvs() -> (axum::Router, Arc<PvRegistry>, tempfile::
         .await
         .unwrap();
     let channel_mgr = Arc::new(channel_mgr);
+    let repo = Arc::new(RegistryRepository::new(registry.clone()));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
     let state = AppState {
         storage,
-        pv_repo: Arc::new(RegistryRepository::new(registry.clone())),
-        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr)),
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
         cluster: None,
         api_keys: None,
         metrics_handle: None,
@@ -455,10 +463,14 @@ async fn test_export_import_preserves_status() {
         .await
         .unwrap();
     let channel_mgr2 = Arc::new(channel_mgr2);
+    let repo2 = Arc::new(RegistryRepository::new(registry2.clone()));
+    let archiver2 = Arc::new(ChannelArchiverControl::new(channel_mgr2));
     let state2 = AppState {
         storage: storage2,
-        pv_repo: Arc::new(RegistryRepository::new(registry2.clone())),
-        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr2)),
+        pv_query: repo2.clone(),
+        pv_cmd: repo2,
+        archiver_query: archiver2.clone(),
+        archiver_cmd: archiver2,
         cluster: None,
         api_keys: None,
         metrics_handle: None,
@@ -520,10 +532,14 @@ async fn build_test_app_with_auth() -> (axum::Router, tempfile::TempDir) {
         .await
         .unwrap();
     let channel_mgr = Arc::new(channel_mgr);
+    let repo = Arc::new(RegistryRepository::new(registry));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
     let state = AppState {
         storage,
-        pv_repo: Arc::new(RegistryRepository::new(registry)),
-        archiver: Arc::new(ChannelArchiverControl::new(channel_mgr)),
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
         cluster: None,
         api_keys: Some(vec!["test-secret-key".to_string()]),
         metrics_handle: None,

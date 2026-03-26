@@ -1,11 +1,11 @@
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 
-use archiver_core::registry::{PvStatus, SampleMode};
+use archiver_core::registry::SampleMode;
 
 use crate::dto::mgmt::*;
-use crate::errors::{bad_gateway, internal_error};
+use crate::errors::ApiError;
 use crate::pv_input::{parse_pv_list, PvListInput};
 use crate::AppState;
 
@@ -22,7 +22,7 @@ pub async fn archive_pv(
 ) -> Response {
     let body_str = match String::from_utf8(body.to_vec()) {
         Ok(s) => s,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid UTF-8 body").into_response(),
+        Err(_) => return ApiError::BadRequest("Invalid UTF-8 body".to_string()).into_response(),
     };
 
     // Try parsing as single PV request first.
@@ -44,7 +44,7 @@ pub async fn archive_pv(
     // Fallback: plain PV list (string array or newline-delimited).
     let pvs = parse_pv_list(&body_str);
     if pvs.is_empty() {
-        return (StatusCode::BAD_REQUEST, "No PVs specified").into_response();
+        return ApiError::BadRequest("No PVs specified".to_string()).into_response();
     }
     let reqs: Vec<_> = pvs
         .into_iter()
@@ -115,7 +115,7 @@ async fn bulk_archive_requests(
     for req in &local_reqs {
         let pv = req.pv.as_deref().unwrap();
         let sample_mode = parse_sample_mode(req.sampling_method.as_deref(), req.sampling_period);
-        let status = match state.archiver.archive_pv(pv, &sample_mode).await {
+        let status = match state.archiver_cmd.archive_pv(pv, &sample_mode).await {
             Ok(()) => "Archive request submitted".to_string(),
             Err(e) => {
                 tracing::warn!(pv, "Failed to archive: {e}");
@@ -216,30 +216,24 @@ async fn archive_single_pv(
                         let bytes = axum::body::Bytes::from(body.to_string());
                         return match cluster.proxy_mgmt_post(&peer.mgmt_url, "archivePV", bytes).await {
                             Ok(resp) => resp,
-                            Err(e) => bad_gateway(e),
+                            Err(e) => ApiError::bad_gateway(e).into_response(),
                         };
                     }
-                    return (StatusCode::NOT_FOUND, format!("Appliance '{target}' not found in cluster")).into_response();
+                    return ApiError::NotFound(format!("Appliance '{target}' not found in cluster")).into_response();
                 }
             }
         }
 
         if let Some(ref cluster) = state.cluster {
             if cluster.resolve_peer(pv).await.is_some() {
-                return (StatusCode::CONFLICT, format!("PV {pv} is already archived on another appliance")).into_response();
+                return ApiError::Conflict(format!("PV {pv} is already archived on another appliance")).into_response();
             }
         }
     }
 
-    match state.archiver.archive_pv(pv, sample_mode).await {
-        Ok(()) => {
-            let msg = format!("Successfully started archiving PV {pv}");
-            (StatusCode::OK, msg).into_response()
-        }
-        Err(e) => {
-            tracing::error!(pv, "Failed to archive PV: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to archive PV {pv}")).into_response()
-        }
+    match crate::usecases::archive_pv::archive_pv(state.archiver_cmd.as_ref(), pv, sample_mode).await {
+        Ok(msg) => msg.into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -249,42 +243,33 @@ pub async fn pause_archiving_pv(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<PausePvParams>,
-) -> Response {
+) -> Result<impl IntoResponse, ApiError> {
     let qs = format!("pv={}", urlencoding::encode(&params.pv));
     if let Some(resp) = try_mgmt_dispatch(&state, &params.pv, "pauseArchivingPV", &qs, &headers).await {
-        return resp;
+        return Ok(resp);
     }
-    match state.archiver.pause_pv(&params.pv) {
-        Ok(()) => {
-            let msg = format!("Successfully paused PV {}", params.pv);
-            (StatusCode::OK, msg).into_response()
-        }
-        Err(e) => {
-            tracing::error!(pv = params.pv, "Failed to pause PV: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to pause PV {}", params.pv)).into_response()
-        }
-    }
+    state
+        .archiver_cmd
+        .pause_pv(&params.pv)
+        .map_err(|e| ApiError::Internal(format!("Failed to pause PV {}: {e}", params.pv)))?;
+    Ok(format!("Successfully paused PV {}", params.pv).into_response())
 }
 
 pub async fn resume_archiving_pv(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<PausePvParams>,
-) -> Response {
+) -> Result<impl IntoResponse, ApiError> {
     let qs = format!("pv={}", urlencoding::encode(&params.pv));
     if let Some(resp) = try_mgmt_dispatch(&state, &params.pv, "resumeArchivingPV", &qs, &headers).await {
-        return resp;
+        return Ok(resp);
     }
-    match state.archiver.resume_pv(&params.pv).await {
-        Ok(()) => {
-            let msg = format!("Successfully resumed PV {}", params.pv);
-            (StatusCode::OK, msg).into_response()
-        }
-        Err(e) => {
-            tracing::error!(pv = params.pv, "Failed to resume PV: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resume PV {}", params.pv)).into_response()
-        }
-    }
+    state
+        .archiver_cmd
+        .resume_pv(&params.pv)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to resume PV {}: {e}", params.pv)))?;
+    Ok(format!("Successfully resumed PV {}", params.pv).into_response())
 }
 
 // --- Bulk pause/resume (POST with body) ---
@@ -303,7 +288,7 @@ pub async fn bulk_pause_archiving_pv(
                 std::collections::HashMap::new();
             let mut local_pvs = Vec::new();
             for pv in &pvs {
-                if state.pv_repo.get_pv(pv).ok().flatten().is_some() {
+                if state.pv_query.get_pv(pv).ok().flatten().is_some() {
                     local_pvs.push(pv.clone());
                 } else if let Some(resolved) = cluster.resolve_peer(pv).await {
                     remote_batches
@@ -331,7 +316,7 @@ pub async fn bulk_pause_archiving_pv(
             }
 
             for pv in &local_pvs {
-                let status = match state.archiver.pause_pv(pv) {
+                let status = match state.archiver_cmd.pause_pv(pv) {
                     Ok(()) => "Successfully paused".to_string(),
                     Err(e) => {
                         tracing::warn!(pv, "Failed to pause: {e}");
@@ -348,7 +333,7 @@ pub async fn bulk_pause_archiving_pv(
     }
 
     for pv in &pvs {
-        let status = match state.archiver.pause_pv(pv) {
+        let status = match state.archiver_cmd.pause_pv(pv) {
             Ok(()) => "Successfully paused".to_string(),
             Err(e) => e.to_string(),
         };
@@ -374,7 +359,7 @@ pub async fn bulk_resume_archiving_pv(
                 std::collections::HashMap::new();
             let mut local_pvs = Vec::new();
             for pv in &pvs {
-                if state.pv_repo.get_pv(pv).ok().flatten().is_some() {
+                if state.pv_query.get_pv(pv).ok().flatten().is_some() {
                     local_pvs.push(pv.clone());
                 } else if let Some(resolved) = cluster.resolve_peer(pv).await {
                     remote_batches
@@ -402,7 +387,7 @@ pub async fn bulk_resume_archiving_pv(
             }
 
             for pv in &local_pvs {
-                let status = match state.archiver.resume_pv(pv).await {
+                let status = match state.archiver_cmd.resume_pv(pv).await {
                     Ok(()) => "Successfully resumed".to_string(),
                     Err(e) => {
                         tracing::warn!(pv, "Failed to resume: {e}");
@@ -419,7 +404,7 @@ pub async fn bulk_resume_archiving_pv(
     }
 
     for pv in &pvs {
-        let status = match state.archiver.resume_pv(pv).await {
+        let status = match state.archiver_cmd.resume_pv(pv).await {
             Ok(()) => "Successfully resumed".to_string(),
             Err(e) => e.to_string(),
         };
@@ -437,35 +422,27 @@ pub async fn delete_pv(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<DeletePvParams>,
-) -> Response {
+) -> Result<impl IntoResponse, ApiError> {
     let mut qs = format!("pv={}", urlencoding::encode(&params.pv));
     if params.delete_data.unwrap_or(false) {
         qs.push_str("&deleteData=true");
     }
     if let Some(resp) = try_mgmt_dispatch(&state, &params.pv, "deletePV", &qs, &headers).await {
-        return resp;
+        return Ok(resp);
     }
-    if let Err(e) = state.archiver.destroy_pv(&params.pv) {
-        tracing::error!(pv = params.pv, "Failed to delete PV: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete PV {}", params.pv)).into_response();
-    }
-
-    let mut files_deleted = 0u64;
-    if params.delete_data.unwrap_or(false) {
-        match state.storage.delete_pv_data(&params.pv).await {
-            Ok(n) => files_deleted = n,
-            Err(e) => {
-                tracing::error!(pv = params.pv, "Failed to delete PV data: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("PV {} removed but failed to delete data", params.pv)).into_response();
-            }
-        }
-    }
+    let result = crate::usecases::delete_pv::delete_pv(
+        state.archiver_cmd.as_ref(),
+        state.storage.as_ref(),
+        &params.pv,
+        params.delete_data.unwrap_or(false),
+    )
+    .await?;
 
     let msg = format!(
-        "Successfully deleted PV {} (data files removed: {files_deleted})",
-        params.pv
+        "Successfully deleted PV {} (data files removed: {})",
+        result.pv, result.files_deleted
     );
-    (StatusCode::OK, msg).into_response()
+    Ok(msg.into_response())
 }
 
 // --- Change archival parameters ---
@@ -474,7 +451,7 @@ pub async fn change_archival_parameters(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<ChangeParamsQuery>,
-) -> Response {
+) -> Result<impl IntoResponse, ApiError> {
     let mut qs = format!("pv={}", urlencoding::encode(&params.pv));
     if let Some(period) = params.samplingperiod {
         qs.push_str(&format!("&samplingperiod={period}"));
@@ -483,46 +460,23 @@ pub async fn change_archival_parameters(
         qs.push_str(&format!("&samplingmethod={method}"));
     }
     if let Some(resp) = try_mgmt_dispatch(&state, &params.pv, "changeArchivalParameters", &qs, &headers).await {
-        return resp;
+        return Ok(resp);
     }
     let new_mode = parse_sample_mode(
         params.samplingmethod.as_deref(),
         params.samplingperiod,
     );
 
-    match state.pv_repo.update_sample_mode(&params.pv, &new_mode) {
-        Ok(false) => {
-            let msg = format!("PV {} not found", params.pv);
-            return (StatusCode::NOT_FOUND, msg).into_response();
-        }
-        Err(e) => {
-            tracing::error!(pv = params.pv, "Failed to update parameters: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update parameters for {}", params.pv)).into_response();
-        }
-        Ok(true) => {}
-    }
+    let msg = crate::usecases::change_parameters::change_parameters(
+        state.pv_query.as_ref(),
+        state.pv_cmd.as_ref(),
+        state.archiver_cmd.as_ref(),
+        &params.pv,
+        &new_mode,
+    )
+    .await?;
 
-    let record = match state.pv_repo.get_pv(&params.pv) {
-        Ok(Some(r)) => r,
-        _ => {
-            return (
-                StatusCode::OK,
-                format!("Updated parameters for {}", params.pv),
-            )
-                .into_response();
-        }
-    };
-
-    if record.status == PvStatus::Active {
-        let _ = state.archiver.pause_pv(&params.pv);
-        if let Err(e) = state.archiver.resume_pv(&params.pv).await {
-            tracing::error!(pv = params.pv, "Updated parameters but failed to restart: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Updated parameters but failed to restart {}", params.pv)).into_response();
-        }
-    }
-
-    let msg = format!("Successfully updated parameters for {}", params.pv);
-    (StatusCode::OK, msg).into_response()
+    Ok(msg.into_response())
 }
 
 // --- Abort archiving ---
@@ -531,27 +485,17 @@ pub async fn abort_archiving_pv(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<PvNameParam>,
-) -> Response {
+) -> Result<impl IntoResponse, ApiError> {
     let qs = format!("pv={}", urlencoding::encode(&params.pv));
     if let Some(resp) = try_mgmt_dispatch(&state, &params.pv, "abortArchivingPV", &qs, &headers).await {
-        return resp;
+        return Ok(resp);
     }
 
-    match state.pv_repo.get_pv(&params.pv) {
-        Ok(Some(record)) => {
-            if record.status == PvStatus::Active {
-                return (StatusCode::BAD_REQUEST, "PV is actively archiving; pause first or use deletePV").into_response();
-            }
-        }
-        Ok(None) => return (StatusCode::NOT_FOUND, format!("PV {} not found", params.pv)).into_response(),
-        Err(e) => return internal_error(e),
-    }
+    let msg = crate::usecases::abort_archiving::abort_archiving(
+        state.pv_query.as_ref(),
+        state.archiver_cmd.as_ref(),
+        &params.pv,
+    )?;
 
-    if let Err(e) = state.archiver.stop_pv(&params.pv) {
-        tracing::error!(pv = params.pv, "Failed to abort archiving: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to abort archiving PV {}", params.pv)).into_response();
-    }
-
-    let msg = format!("Successfully aborted archiving PV {} (data retained)", params.pv);
-    (StatusCode::OK, msg).into_response()
+    Ok(msg.into_response())
 }

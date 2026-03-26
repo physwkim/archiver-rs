@@ -47,10 +47,14 @@ async fn build_retrieval_app() -> (axum::Router, SystemTime, SystemTime, tempfil
     let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
         .await
         .unwrap();
+    let repo = Arc::new(RegistryRepository::new(registry));
+    let archiver = Arc::new(ChannelArchiverControl::new(Arc::new(channel_mgr)));
     let state = AppState {
         storage,
-        pv_repo: Arc::new(RegistryRepository::new(registry)),
-        archiver: Arc::new(ChannelArchiverControl::new(Arc::new(channel_mgr))),
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
         cluster: None,
         api_keys: None,
         metrics_handle: None,

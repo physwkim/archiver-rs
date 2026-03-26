@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 use archiver_core::registry::{PvRecord, PvRegistry, PvStatus, SampleMode};
 use archiver_core::types::ArchDbType;
 
-use crate::services::traits::PvRepository;
+use crate::services::traits::{PvCommandRepository, PvQueryRepository};
 
 pub struct RegistryRepository {
     inner: Arc<PvRegistry>,
@@ -16,7 +16,7 @@ impl RegistryRepository {
     }
 }
 
-impl PvRepository for RegistryRepository {
+impl PvQueryRepository for RegistryRepository {
     fn get_pv(&self, pv: &str) -> anyhow::Result<Option<PvRecord>> {
         self.inner.get_pv(pv)
     }
@@ -31,26 +31,6 @@ impl PvRepository for RegistryRepository {
 
     fn count(&self, status: Option<PvStatus>) -> anyhow::Result<u64> {
         self.inner.count(status)
-    }
-
-    fn register_pv(&self, pv: &str, dbr_type: ArchDbType, mode: &SampleMode, element_count: i32) -> anyhow::Result<()> {
-        self.inner.register_pv(pv, dbr_type, mode, element_count)
-    }
-
-    fn remove_pv(&self, pv: &str) -> anyhow::Result<bool> {
-        self.inner.remove_pv(pv)
-    }
-
-    fn set_status(&self, pv: &str, status: PvStatus) -> anyhow::Result<bool> {
-        self.inner.set_status(pv, status)
-    }
-
-    fn update_sample_mode(&self, pv: &str, mode: &SampleMode) -> anyhow::Result<bool> {
-        self.inner.update_sample_mode(pv, mode)
-    }
-
-    fn update_metadata(&self, pv: &str, prec: Option<&str>, egu: Option<&str>) -> anyhow::Result<bool> {
-        self.inner.update_metadata(pv, prec, egu)
     }
 
     fn all_records(&self) -> anyhow::Result<Vec<PvRecord>> {
@@ -71,6 +51,28 @@ impl PvRepository for RegistryRepository {
 
     fn silent_pvs(&self, threshold: Duration) -> anyhow::Result<Vec<PvRecord>> {
         self.inner.silent_pvs(threshold)
+    }
+}
+
+impl PvCommandRepository for RegistryRepository {
+    fn register_pv(&self, pv: &str, dbr_type: ArchDbType, mode: &SampleMode, element_count: i32) -> anyhow::Result<()> {
+        self.inner.register_pv(pv, dbr_type, mode, element_count)
+    }
+
+    fn remove_pv(&self, pv: &str) -> anyhow::Result<bool> {
+        self.inner.remove_pv(pv)
+    }
+
+    fn set_status(&self, pv: &str, status: PvStatus) -> anyhow::Result<bool> {
+        self.inner.set_status(pv, status)
+    }
+
+    fn update_sample_mode(&self, pv: &str, mode: &SampleMode) -> anyhow::Result<bool> {
+        self.inner.update_sample_mode(pv, mode)
+    }
+
+    fn update_metadata(&self, pv: &str, prec: Option<&str>, egu: Option<&str>) -> anyhow::Result<bool> {
+        self.inner.update_metadata(pv, prec, egu)
     }
 
     fn import_pv(

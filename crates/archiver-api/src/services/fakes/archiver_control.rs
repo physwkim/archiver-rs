@@ -1,0 +1,96 @@
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+
+use archiver_core::registry::SampleMode;
+
+use crate::services::traits::{ArchiverCommand, ArchiverQuery, ConnectionInfoDto};
+
+struct FakeState {
+    archived: HashSet<String>,
+    paused: HashSet<String>,
+    stopped: HashSet<String>,
+}
+
+pub struct FakeArchiverControl {
+    state: Mutex<FakeState>,
+}
+
+impl FakeArchiverControl {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(FakeState {
+                archived: HashSet::new(),
+                paused: HashSet::new(),
+                stopped: HashSet::new(),
+            }),
+        }
+    }
+}
+
+impl Default for FakeArchiverControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArchiverQuery for FakeArchiverControl {
+    fn get_connection_info(&self, pv: &str) -> Option<ConnectionInfoDto> {
+        let state = self.state.lock().unwrap();
+        if state.archived.contains(pv) {
+            Some(ConnectionInfoDto {
+                connected_since: Some(std::time::SystemTime::now()),
+                last_event_time: None,
+                is_connected: !state.paused.contains(pv),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn get_never_connected_pvs(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn get_currently_disconnected_pvs(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        state.paused.iter().cloned().collect()
+    }
+}
+
+#[async_trait]
+impl ArchiverCommand for FakeArchiverControl {
+    async fn archive_pv(&self, pv: &str, _mode: &SampleMode) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.archived.insert(pv.to_string());
+        Ok(())
+    }
+
+    fn pause_pv(&self, pv: &str) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.paused.insert(pv.to_string());
+        Ok(())
+    }
+
+    async fn resume_pv(&self, pv: &str) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.paused.remove(pv);
+        Ok(())
+    }
+
+    fn stop_pv(&self, pv: &str) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.stopped.insert(pv.to_string());
+        state.archived.remove(pv);
+        Ok(())
+    }
+
+    fn destroy_pv(&self, pv: &str) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.archived.remove(pv);
+        state.paused.remove(pv);
+        state.stopped.remove(pv);
+        Ok(())
+    }
+}

@@ -3,6 +3,9 @@ name = "archiver-api"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 archiver-core = { workspace = true }
 archiver-proto = { workspace = true }

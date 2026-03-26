@@ -1,6 +1,6 @@
 pub mod cluster;
 pub mod dto;
-mod errors;
+pub mod errors;
 pub mod handlers;
 pub mod pv_data;
 pub mod pv_input;
@@ -8,6 +8,7 @@ pub mod security;
 pub mod services;
 mod state;
 pub mod ui;
+pub mod usecases;
 
 pub use state::AppState;
 

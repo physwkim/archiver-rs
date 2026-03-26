@@ -51,7 +51,7 @@ async fn try_mgmt_dispatch(
         return None;
     }
     let cluster = state.cluster.as_ref()?;
-    if state.pv_repo.get_pv(pv).ok().flatten().is_some() {
+    if state.pv_query.get_pv(pv).ok().flatten().is_some() {
         return None;
     }
     let resolved = cluster.resolve_peer(pv).await?;
