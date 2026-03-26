@@ -89,8 +89,8 @@ impl ChannelManager {
     /// Restore all active PVs from the registry (called on startup).
     pub async fn restore_from_registry(&self) -> anyhow::Result<u64> {
         let active_pvs = self.registry.pvs_by_status(PvStatus::Active)?;
-        let count = active_pvs.len() as u64;
-        info!(count, "Restoring PVs from registry");
+        let total = active_pvs.len() as u64;
+        info!(total, "Restoring PVs from registry");
 
         let mut restored = 0u64;
         for record in active_pvs {
@@ -102,8 +102,11 @@ impl ChannelManager {
             }
         }
         metrics::gauge!("archiver_pvs_active").set(restored as f64);
+        if restored < total {
+            warn!(restored, failed = total - restored, "Some PVs failed to restore");
+        }
 
-        Ok(count)
+        Ok(restored)
     }
 
     /// Start archiving a new PV.

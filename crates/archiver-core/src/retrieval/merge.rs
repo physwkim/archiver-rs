@@ -48,7 +48,7 @@ impl EventStream for MergedEventStream {
         let mut earliest_ts = None;
 
         for (i, head) in self.heads.iter().enumerate() {
-            if let Some((_, ref sample)) = head {
+            if let Some((_, sample)) = head {
                 let ts = sample.timestamp;
                 if earliest_ts.is_none_or(|e| ts < e) {
                     earliest_ts = Some(ts);

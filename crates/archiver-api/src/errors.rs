@@ -3,16 +3,23 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ApiError {
+    #[error("Bad request: {0}")]
     BadRequest(String),
+    #[error("Unauthorized")]
     Unauthorized,
+    #[error("Not found: {0}")]
     NotFound(String),
+    #[error("Conflict: {0}")]
     Conflict(String),
+    #[error("Too many requests")]
     TooManyRequests,
     /// 500 — logs the real error internally, returns a generic message to clients.
+    #[error("Internal error: {0}")]
     Internal(String),
     /// 502 — logs the real error internally, returns a generic message to clients.
+    #[error("Bad gateway: {0}")]
     BadGateway(String),
 }
 
@@ -45,20 +52,6 @@ impl IntoResponse for ApiError {
                 tracing::warn!("Gateway error: {msg}");
                 (StatusCode::BAD_GATEWAY, "Upstream service unavailable").into_response()
             }
-        }
-    }
-}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApiError::BadRequest(msg) => write!(f, "Bad request: {msg}"),
-            ApiError::Unauthorized => write!(f, "Unauthorized"),
-            ApiError::NotFound(msg) => write!(f, "Not found: {msg}"),
-            ApiError::Conflict(msg) => write!(f, "Conflict: {msg}"),
-            ApiError::TooManyRequests => write!(f, "Too many requests"),
-            ApiError::Internal(msg) => write!(f, "Internal error: {msg}"),
-            ApiError::BadGateway(msg) => write!(f, "Bad gateway: {msg}"),
         }
     }
 }

@@ -26,12 +26,11 @@ pub async fn archive_pv(
     };
 
     // Try parsing as single PV request first.
-    if let Ok(req) = serde_json::from_str::<ArchivePvRequest>(&body_str) {
-        if let Some(pv) = req.pv {
+    if let Ok(req) = serde_json::from_str::<ArchivePvRequest>(&body_str)
+        && let Some(pv) = req.pv {
             let sample_mode = parse_sample_mode(req.sampling_method.as_deref(), req.sampling_period);
             return archive_single_pv(&state, &pv, &sample_mode, req.appliance.as_deref(), &headers).await;
         }
-    }
 
     // Try as JSON array of ArchivePvRequest objects (with per-PV appliance + sampling).
     if let Ok(reqs) = serde_json::from_str::<Vec<ArchivePvRequest>>(&body_str) {
@@ -221,9 +220,9 @@ async fn archive_single_pv(
     let is_proxied = headers.get("X-Archiver-Proxied").is_some();
 
     if !is_proxied {
-        if let Some(target) = appliance {
-            if let Some(ref cluster) = state.cluster {
-                if target != cluster.identity_name() {
+        if let Some(target) = appliance
+            && let Some(ref cluster) = state.cluster
+                && target != cluster.identity_name() {
                     if let Some(peer) = cluster.find_peer_by_name(target) {
                         let mut body = serde_json::json!({ "pv": pv });
                         if let SampleMode::Scan { period_secs } = sample_mode {
@@ -238,14 +237,11 @@ async fn archive_single_pv(
                     }
                     return ApiError::NotFound(format!("Appliance '{target}' not found in cluster")).into_response();
                 }
-            }
-        }
 
-        if let Some(ref cluster) = state.cluster {
-            if cluster.resolve_peer(pv).await.is_some() {
+        if let Some(ref cluster) = state.cluster
+            && cluster.resolve_peer(pv).await.is_some() {
                 return ApiError::Conflict(format!("PV {pv} is already archived on another appliance")).into_response();
             }
-        }
     }
 
     match crate::usecases::archive_pv::archive_pv(state.archiver_cmd.as_ref(), pv, sample_mode).await {

@@ -22,7 +22,11 @@ pub struct AppState {
     pub archiver_query: Arc<dyn ArchiverQuery>,
     pub archiver_cmd: Arc<dyn ArchiverCommand>,
     pub cluster: Option<Arc<dyn ClusterRouter>>,
+    /// External API keys for client authentication on write endpoints.
     pub api_keys: Option<Vec<String>>,
+    /// Cluster-internal shared secret, checked separately from api_keys.
+    /// Accepted only on requests that also carry X-Archiver-Proxied.
+    pub cluster_api_key: Option<String>,
     pub metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub trust_proxy_headers: bool,
@@ -84,17 +88,30 @@ pub(crate) async fn api_key_auth(
         return next.run(request).await;
     }
 
-    if let Some(ref keys) = state.api_keys {
-        let provided_key = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .or_else(|| {
-                headers
-                    .get("x-api-key")
-                    .and_then(|v| v.to_str().ok())
-            });
+    // Extract the provided credential.
+    let provided_key = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+        });
 
+    // Cluster-internal requests: accept the cluster api_key, but only when
+    // the request carries X-Archiver-Proxied (set by ClusterClient, not forgeable
+    // without knowing the key — the key itself is the proof of authenticity).
+    let is_proxied = request.headers().get("X-Archiver-Proxied").is_some();
+    if is_proxied
+        && let Some(ref cluster_key) = state.cluster_api_key
+            && let Some(key) = provided_key
+                && bool::from(cluster_key.as_bytes().ct_eq(key.as_bytes())) {
+                    return next.run(request).await;
+                }
+
+    // External clients: check against api_keys.
+    if let Some(ref keys) = state.api_keys {
         match provided_key {
             Some(key) if keys.iter().any(|k| {
                 bool::from(k.as_bytes().ct_eq(key.as_bytes()))

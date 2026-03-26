@@ -57,6 +57,7 @@ async fn build_retrieval_app() -> (axum::Router, SystemTime, SystemTime, tempfil
         archiver_cmd: archiver,
         cluster: None,
         api_keys: None,
+        cluster_api_key: None,
         metrics_handle: None,
         rate_limiter: None,
         trust_proxy_headers: false,

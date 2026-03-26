@@ -103,11 +103,10 @@ pub(crate) async fn rate_limit(
             connect_ip
         };
 
-        if let Some(ip) = ip {
-            if !limiter.check(ip) {
+        if let Some(ip) = ip
+            && !limiter.check(ip) {
                 return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
             }
-        }
     }
     next.run(request).await
 }

@@ -48,6 +48,9 @@ pub fn build_router(state: AppState, security: &SecurityConfig) -> Router {
     }
 
     // Build CORS layer.
+    // Empty cors_origins = no Access-Control-Allow-Origin header is sent,
+    // which means browsers block all cross-origin requests (same-origin only).
+    // To allow cross-origin access, explicitly list origins in the config.
     let cors_layer = if security.cors_origins.is_empty() {
         CorsLayer::new()
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS])

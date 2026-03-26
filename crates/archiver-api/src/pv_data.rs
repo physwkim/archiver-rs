@@ -107,13 +107,12 @@ fn parse_iso8601(s: &str) -> Option<SystemTime> {
 
 /// Parse PV specification: optionally "postprocessor(pvname)" or just "pvname".
 fn parse_pv_spec(spec: &str) -> (String, Option<String>) {
-    if let Some(paren_pos) = spec.find('(') {
-        if spec.ends_with(')') {
+    if let Some(paren_pos) = spec.find('(')
+        && spec.ends_with(')') {
             let pp = &spec[..paren_pos];
             let pv = &spec[paren_pos + 1..spec.len() - 1];
             return (pv.to_string(), Some(pp.to_string()));
         }
-    }
     (spec.to_string(), None)
 }
 
@@ -220,11 +219,10 @@ fn drain_stream(
                 break;
             }
             count += 1;
-            if let Some(max) = limit {
-                if count >= max {
+            if let Some(max) = limit
+                && count >= max {
                     break;
                 }
-            }
         }
     }
 }
@@ -451,8 +449,8 @@ async fn get_data_raw(
                 if sample.timestamp > end {
                     break;
                 }
-                if sample.timestamp >= start {
-                    if let Ok(sample_bytes) =
+                if sample.timestamp >= start
+                    && let Ok(sample_bytes) =
                         archiver_core::storage::plainpb::writer::encode_sample(desc.db_type, &sample)
                     {
                         let mut escaped =
@@ -462,7 +460,6 @@ async fn get_data_raw(
                             return;
                         }
                     }
-                }
             }
         }
     });

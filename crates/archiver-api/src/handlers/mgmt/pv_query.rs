@@ -13,14 +13,13 @@ pub async fn get_all_pvs(
 ) -> Result<impl IntoResponse, ApiError> {
     let mut pvs = state.pv_query.all_pv_names().map_err(ApiError::internal)?;
 
-    if cp.cluster.unwrap_or(false) {
-        if let Some(ref cluster) = state.cluster {
+    if cp.cluster.unwrap_or(false)
+        && let Some(ref cluster) = state.cluster {
             let remote = cluster.aggregate_all_pvs().await;
             let mut all: std::collections::BTreeSet<String> = pvs.into_iter().collect();
             all.extend(remote);
             pvs = all.into_iter().collect();
         }
-    }
 
     Ok(axum::Json(pvs))
 }
@@ -34,14 +33,13 @@ pub async fn get_matching_pvs(
         .matching_pvs(&params.pv)
         .map_err(ApiError::internal)?;
 
-    if params.cluster.unwrap_or(false) {
-        if let Some(ref cluster) = state.cluster {
+    if params.cluster.unwrap_or(false)
+        && let Some(ref cluster) = state.cluster {
             let remote = cluster.aggregate_matching_pvs(&params.pv).await;
             let mut all: std::collections::BTreeSet<String> = pvs.into_iter().collect();
             all.extend(remote);
             pvs = all.into_iter().collect();
         }
-    }
 
     Ok(axum::Json(pvs))
 }
@@ -77,13 +75,11 @@ pub async fn get_pv_status(
         }
         None => {
             // PV not local — try cluster if requested.
-            if params.cluster.unwrap_or(false) {
-                if let Some(ref cluster) = state.cluster {
-                    if let Some(remote_status) = cluster.remote_pv_status(&params.pv).await {
+            if params.cluster.unwrap_or(false)
+                && let Some(ref cluster) = state.cluster
+                    && let Some(remote_status) = cluster.remote_pv_status(&params.pv).await {
                         return Ok(axum::Json(remote_status).into_response());
                     }
-                }
-            }
             let resp = PvStatusResponse {
                 pv_name: params.pv,
                 status: "Not being archived".to_string(),
@@ -105,14 +101,13 @@ pub async fn get_pv_count(
     let mut active = state.pv_query.count(Some(PvStatus::Active)).unwrap_or(0);
     let mut paused = state.pv_query.count(Some(PvStatus::Paused)).unwrap_or(0);
 
-    if cp.cluster.unwrap_or(false) {
-        if let Some(ref cluster) = state.cluster {
+    if cp.cluster.unwrap_or(false)
+        && let Some(ref cluster) = state.cluster {
             let (rt, ra, rp) = cluster.aggregate_pv_count().await;
             total += rt;
             active += ra;
             paused += rp;
         }
-    }
 
     let resp = PvCountResponse {
         total,

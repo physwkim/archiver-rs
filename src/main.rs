@@ -197,19 +197,7 @@ async fn main() -> anyhow::Result<()> {
     // Build REST API.
     let repo = Arc::new(RegistryRepository::new(registry.clone()));
     let archiver_impl = Arc::new(ChannelArchiverControl::new(channel_mgr.clone()));
-    // Merge the cluster internal API key into the effective API key list so that
-    // proxied requests from peers authenticate via the shared cluster secret.
-    let effective_api_keys = {
-        let mut keys = config.api_keys.clone().unwrap_or_default();
-        if let Some(ref cc) = config.cluster {
-            if let Some(ref cluster_key) = cc.api_key {
-                if !keys.contains(cluster_key) {
-                    keys.push(cluster_key.clone());
-                }
-            }
-        }
-        if keys.is_empty() { None } else { Some(keys) }
-    };
+    let cluster_api_key = config.cluster.as_ref().and_then(|cc| cc.api_key.clone());
 
     let app_state = AppState {
         storage: storage.clone(),
@@ -218,7 +206,8 @@ async fn main() -> anyhow::Result<()> {
         archiver_query: archiver_impl.clone(),
         archiver_cmd: archiver_impl,
         cluster,
-        api_keys: effective_api_keys,
+        api_keys: config.api_keys.clone(),
+        cluster_api_key,
         metrics_handle,
         rate_limiter,
         trust_proxy_headers: config.security.trust_proxy_headers,
