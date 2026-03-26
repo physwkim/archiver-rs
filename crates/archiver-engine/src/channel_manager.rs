@@ -40,6 +40,11 @@ struct PvHandle {
     conn_info: Arc<Mutex<ConnectionInfo>>,
 }
 
+/// Default capacity for the bounded sample channel.
+/// This limits memory usage when producers outpace the storage writer.
+/// At ~200 bytes per sample, 500K entries ≈ 100 MB worst-case.
+const SAMPLE_CHANNEL_CAPACITY: usize = 500_000;
+
 /// Manages EPICS Channel Access connections and dispatches archived samples to storage.
 pub struct ChannelManager {
     /// The CA client context.
@@ -52,7 +57,7 @@ pub struct ChannelManager {
     /// PV metadata registry.
     registry: Arc<PvRegistry>,
     /// Sample sender for the write thread.
-    sample_tx: mpsc::UnboundedSender<PvSample>,
+    sample_tx: mpsc::Sender<PvSample>,
     /// Optional policy configuration.
     policy: Option<PolicyConfig>,
 }
@@ -70,9 +75,9 @@ impl ChannelManager {
         storage: Arc<dyn StoragePlugin>,
         registry: Arc<PvRegistry>,
         policy: Option<PolicyConfig>,
-    ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<PvSample>)> {
+    ) -> anyhow::Result<(Self, mpsc::Receiver<PvSample>)> {
         let ca_client = CaClient::new().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(SAMPLE_CHANNEL_CAPACITY);
 
         let mgr = Self {
             ca_client,
@@ -317,7 +322,7 @@ async fn monitor_loop(
     dbr_type: ArchDbType,
     element_count: i32,
     channel: CaChannel,
-    tx: mpsc::UnboundedSender<PvSample>,
+    tx: mpsc::Sender<PvSample>,
     cancel_token: CancellationToken,
     conn_info: Arc<Mutex<ConnectionInfo>>,
 ) {
@@ -387,7 +392,7 @@ async fn monitor_loop(
                                 sample,
                                 element_count: Some(element_count),
                             };
-                            if tx.send(pv_sample).is_err() {
+                            if tx.send(pv_sample).await.is_err() {
                                 return; // Write loop shut down
                             }
                         }
@@ -416,7 +421,7 @@ async fn scan_loop(
     dbr_type: ArchDbType,
     element_count: i32,
     channel: CaChannel,
-    tx: mpsc::UnboundedSender<PvSample>,
+    tx: mpsc::Sender<PvSample>,
     cancel_token: CancellationToken,
     period_secs: f64,
     conn_info: Arc<Mutex<ConnectionInfo>>,
@@ -455,7 +460,7 @@ async fn scan_loop(
                     sample,
                     element_count: Some(element_count),
                 };
-                if tx.send(pv_sample).is_err() {
+                if tx.send(pv_sample).await.is_err() {
                     return;
                 }
             }
@@ -506,7 +511,7 @@ fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
 pub async fn write_loop(
     storage: Arc<dyn StoragePlugin>,
     registry: Arc<PvRegistry>,
-    mut rx: mpsc::UnboundedReceiver<PvSample>,
+    mut rx: mpsc::Receiver<PvSample>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     flush_period: Duration,
 ) {

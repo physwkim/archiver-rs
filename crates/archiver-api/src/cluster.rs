@@ -79,6 +79,12 @@ impl ClusterClient {
         }
     }
 
+    /// Remove all expired entries from the PV routing cache.
+    pub fn cleanup_cache(&self) {
+        let now = Instant::now();
+        self.pv_cache.retain(|_, entry| entry.expires_at > now);
+    }
+
     pub fn peers(&self) -> &[PeerConfig] {
         &self.peers
     }

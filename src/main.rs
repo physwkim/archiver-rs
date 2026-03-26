@@ -147,6 +147,24 @@ async fn main() -> anyhow::Result<()> {
             "Cluster mode enabled"
         );
         let client = Arc::new(ClusterClient::new(cc));
+
+        // Periodic cleanup of expired PV routing cache entries.
+        let cleanup_client = client.clone();
+        let mut cleanup_shutdown = supervisor.shutdown_rx();
+        supervisor.spawn("pv_cache_cleanup", async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        cleanup_client.cleanup_cache();
+                    }
+                    _ = cleanup_shutdown.changed() => {
+                        break;
+                    }
+                }
+            }
+        });
+
         Arc::new(ClusterClientRouter::new(client)) as Arc<dyn ClusterRouter>
     });
 
