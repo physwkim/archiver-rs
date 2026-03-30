@@ -104,7 +104,7 @@ pub trait ClusterRouter: Send + Sync {
     async fn proxy_mgmt_post(&self, mgmt_url: &str, endpoint: &str, body: axum::body::Bytes) -> anyhow::Result<axum::response::Response>;
     async fn aggregate_all_pvs(&self) -> Vec<String>;
     async fn aggregate_matching_pvs(&self, pattern: &str) -> Vec<String>;
-    async fn aggregate_pv_count(&self) -> (u64, u64, u64);
+    async fn aggregate_pv_count(&self) -> (u64, u64, u64, usize);
     async fn remote_pv_status(&self, pv: &str) -> Option<serde_json::Value>;
     async fn proxy_retrieval(&self, peer_retrieval_url: &str, path: &str, query_string: &str) -> anyhow::Result<axum::response::Response>;
 }

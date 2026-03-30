@@ -77,6 +77,7 @@
         <button class="btn-outline btn-sm" data-range="1w">1w</button>
       </div>
       <button class="btn-primary" onclick="plotData()">Plot</button>
+      <button class="btn-outline btn-sm active" id="btn-reduced" onclick="toggleReduced()">Reduced</button>
       <div class="auto-refresh">
         <label><input type="checkbox" id="auto-refresh"> Auto-refresh</label>
         <select id="refresh-interval">
@@ -124,10 +125,7 @@
 
 const COLORS = ['#1a237e','#c62828','#2e7d32','#e65100','#6a1b9a','#00838f','#4e342e','#37474f'];
 const RANGE_MS = { '5m': 5*60e3, '1h': 3600e3, '12h': 12*3600e3, '1d': 86400e3, '1w': 7*86400e3 };
-const DOWNSAMPLE_THRESHOLDS = [
-  { ms: 7*86400e3, operator: 'mean_600' },
-  { ms: 86400e3,   operator: 'mean_60' },
-];
+let usereduced = true;
 
 let pvList = [];
 let activeRange = '1d';
@@ -245,21 +243,19 @@ function syncDateInputs() {
   document.getElementById('time-to').value = toLocalISO(new Date(to));
 }
 
-// ── Auto-downsampling ──
+// ── Reduced toggle (TwoWeekRaw) ──
 
-function applyDownsampling(pvName, rangeMs) {
-  // If user already specified a post-processor, don't touch it
-  if (/^\w+\(/.test(pvName)) return pvName;
-  for (const { ms, operator } of DOWNSAMPLE_THRESHOLDS) {
-    if (rangeMs >= ms) return `${operator}(${pvName})`;
-  }
-  return pvName;
+function toggleReduced() {
+  usereduced = !usereduced;
+  document.getElementById('btn-reduced').classList.toggle('active', usereduced);
+  if (pvList.length) plotData();
 }
 
 // ── Data fetch ──
 
 async function fetchPV(pvName, from, to) {
-  const url = `/retrieval/data/getData.json?pv=${encodeURIComponent(pvName)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+  let url = `/retrieval/data/getData.json?pv=${encodeURIComponent(pvName)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+  if (usereduced) url += '&usereduced=true';
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
   const data = await resp.json();
@@ -276,12 +272,10 @@ async function plotData() {
   statusBar.textContent = '';
 
   const { from, to } = getTimeRange();
-  const rangeMs = new Date(to).getTime() - new Date(from).getTime();
 
   try {
     const fetches = pvList.map(pv => {
-      const qpv = applyDownsampling(pv, rangeMs);
-      return fetchPV(qpv, from, to).then(result => ({ pv, result })).catch(err => ({ pv, error: err }));
+      return fetchPV(pv, from, to).then(result => ({ pv, result })).catch(err => ({ pv, error: err }));
     });
     const results = await Promise.all(fetches);
 

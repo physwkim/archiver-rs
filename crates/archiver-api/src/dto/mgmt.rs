@@ -74,6 +74,9 @@ pub struct PvCountResponse {
     pub total: u64,
     pub active: u64,
     pub paused: u64,
+    /// Number of cluster peers that failed to respond (omitted when zero).
+    #[serde(rename = "failedPeers", skip_serializing_if = "Option::is_none")]
+    pub failed_peers: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -142,11 +145,15 @@ pub struct ExportRecord {
 
 // --- Conversion functions ---
 
+/// Minimum allowed scan period (100ms).
+const MIN_SCAN_PERIOD_SECS: f64 = 0.1;
+
 pub fn parse_sample_mode(method: Option<&str>, period: Option<f64>) -> SampleMode {
     match method {
-        Some("scan") | Some("Scan") | Some("SCAN") => SampleMode::Scan {
-            period_secs: period.unwrap_or(1.0),
-        },
+        Some("scan") | Some("Scan") | Some("SCAN") => {
+            let period_secs = period.unwrap_or(1.0).max(MIN_SCAN_PERIOD_SECS);
+            SampleMode::Scan { period_secs }
+        }
         _ => SampleMode::Monitor,
     }
 }

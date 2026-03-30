@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use dashmap::DashMap;
-use epics_base_rs::client::{CaChannel, CaClient, ConnectionEvent};
+use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -45,12 +45,28 @@ struct PvHandle {
 /// At ~200 bytes per sample, 500K entries ≈ 100 MB worst-case.
 const SAMPLE_CHANNEL_CAPACITY: usize = 500_000;
 
+/// RAII guard that removes a key from `pending_archives` on drop,
+/// ensuring cleanup even if the owning future is cancelled.
+struct PendingGuard<'a> {
+    map: &'a DashMap<String, ()>,
+    key: String,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.map.remove(&self.key);
+    }
+}
+
 /// Manages EPICS Channel Access connections and dispatches archived samples to storage.
 pub struct ChannelManager {
     /// The CA client context.
     ca_client: CaClient,
     /// Active channels: PV name → handle with cancellation.
     channels: DashMap<String, PvHandle>,
+    /// PVs currently being archived (in-progress CA connect). Prevents TOCTOU races
+    /// where two concurrent `archive_pv` calls could double-subscribe the same PV.
+    pending_archives: DashMap<String, ()>,
     /// Storage backend.
     #[allow(dead_code)]
     storage: Arc<dyn StoragePlugin>,
@@ -82,6 +98,7 @@ impl ChannelManager {
         let mgr = Self {
             ca_client,
             channels: DashMap::new(),
+            pending_archives: DashMap::new(),
             storage,
             registry,
             sample_tx: tx,
@@ -120,6 +137,30 @@ impl ChannelManager {
         pv_name: &str,
         sample_mode: &SampleMode,
     ) -> anyhow::Result<()> {
+        if self.channels.contains_key(pv_name) {
+            anyhow::bail!("PV {pv_name} is already being archived");
+        }
+
+        // Atomically claim the PV to prevent concurrent archive_pv races.
+        // The guard ensures cleanup even if this future is cancelled.
+        if self.pending_archives.insert(pv_name.to_string(), ()).is_some() {
+            anyhow::bail!("PV {pv_name} archive operation already in progress");
+        }
+        let _guard = PendingGuard {
+            map: &self.pending_archives,
+            key: pv_name.to_string(),
+        };
+
+        self.archive_pv_inner(pv_name, sample_mode).await
+    }
+
+    /// Inner implementation of archive_pv, separated for cleanup safety.
+    async fn archive_pv_inner(
+        &self,
+        pv_name: &str,
+        sample_mode: &SampleMode,
+    ) -> anyhow::Result<()> {
+        // Re-check after acquiring the pending slot (another task may have completed).
         if self.channels.contains_key(pv_name) {
             anyhow::bail!("PV {pv_name} is already being archived");
         }
@@ -345,6 +386,7 @@ async fn monitor_loop(
                                 match event {
                                     Ok(ConnectionEvent::Connected) => break,
                                     Ok(ConnectionEvent::Disconnected) => continue,
+                                    Ok(_) => continue,
                                     Err(_) => return,
                                 }
                             }
@@ -516,7 +558,10 @@ pub async fn write_loop(
     flush_period: Duration,
 ) {
     info!("Write loop started");
-    let mut ts_updates: Vec<(String, SystemTime)> = Vec::new();
+    // HashMap keyed by PV name → latest timestamp. Avoids duplicate entries
+    // when the same PV receives many samples between flushes.
+    let mut ts_updates: std::collections::HashMap<String, SystemTime> =
+        std::collections::HashMap::new();
     let mut last_flush = std::time::Instant::now();
 
     loop {
@@ -539,10 +584,10 @@ pub async fn write_loop(
                     error!(pv = pv_sample.pv_name, "Write error: {e}");
                 } else {
                     metrics::counter!("archiver_events_stored_total").increment(1);
-                    ts_updates.push((pv_sample.pv_name, ts));
+                    ts_updates.insert(pv_sample.pv_name, ts);
                 }
 
-                // Batch flush timestamps to SQLite.
+                // Periodic flush: timestamps to SQLite + buffered writes to disk.
                 if last_flush.elapsed() > flush_period && !ts_updates.is_empty() {
                     let refs: Vec<(&str, SystemTime)> = ts_updates
                         .iter()
@@ -550,6 +595,9 @@ pub async fn write_loop(
                         .collect();
                     if let Err(e) = registry.batch_update_timestamps(&refs) {
                         error!("Failed to flush timestamps: {e}");
+                    }
+                    if let Err(e) = storage.flush_writes().await {
+                        error!("Failed to flush storage writes: {e}");
                     }
                     ts_updates.clear();
                     last_flush = std::time::Instant::now();
@@ -574,7 +622,7 @@ pub async fn write_loop(
                         warn!(pv = pv_sample.pv_name, "Shutdown drain write error: {e}");
                     }
                 }
-                // Final timestamp flush.
+                // Final flush: timestamps + buffered writes.
                 if !ts_updates.is_empty() {
                     let refs: Vec<(&str, SystemTime)> = ts_updates
                         .iter()
@@ -583,6 +631,9 @@ pub async fn write_loop(
                     if let Err(e) = registry.batch_update_timestamps(&refs) {
                         warn!("Shutdown timestamp flush failed: {e}");
                     }
+                }
+                if let Err(e) = storage.flush_writes().await {
+                    warn!("Shutdown storage flush failed: {e}");
                 }
                 info!("Write loop shutting down");
                 break;

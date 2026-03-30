@@ -12,7 +12,7 @@ pub struct PvPolicy {
     pub pv: String,
     /// Sampling mode.
     #[serde(default = "default_sample_mode")]
-    pub sample_mode: PolicSampleMode,
+    pub sample_mode: PolicySampleMode,
     /// Expected DBR type (auto-detected if None).
     pub dbr_type: Option<ArchDbType>,
     /// Sampling period in seconds (only for Scan mode).
@@ -21,21 +21,21 @@ pub struct PvPolicy {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum PolicSampleMode {
+pub enum PolicySampleMode {
     #[default]
     Monitor,
     Scan,
 }
 
-fn default_sample_mode() -> PolicSampleMode {
-    PolicSampleMode::Monitor
+fn default_sample_mode() -> PolicySampleMode {
+    PolicySampleMode::Monitor
 }
 
 impl PvPolicy {
     pub fn to_sample_mode(&self) -> SampleMode {
         match self.sample_mode {
-            PolicSampleMode::Monitor => SampleMode::Monitor,
-            PolicSampleMode::Scan => SampleMode::Scan {
+            PolicySampleMode::Monitor => SampleMode::Monitor,
+            PolicySampleMode::Scan => SampleMode::Scan {
                 period_secs: self.sampling_period.unwrap_or(1.0),
             },
         }
@@ -67,44 +67,36 @@ impl PolicyConfig {
     }
 }
 
-/// Simple glob matching (supports `*` and `?`).
+/// Iterative glob matching (supports `*` and `?`).
+/// Uses a two-pointer backtracking approach — O(n*m) worst-case, no recursion.
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let mut pi = pattern.chars().peekable();
-    let mut ti = text.chars().peekable();
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
 
-    while pi.peek().is_some() || ti.peek().is_some() {
-        match pi.peek() {
-            Some('*') => {
-                pi.next();
-                if pi.peek().is_none() {
-                    return true;
-                }
-                while ti.peek().is_some() {
-                    let remaining_pattern: String = pi.clone().collect();
-                    let remaining_text: String = ti.clone().collect();
-                    if glob_match(&remaining_pattern, &remaining_text) {
-                        return true;
-                    }
-                    ti.next();
-                }
-                return false;
-            }
-            Some('?') => {
-                pi.next();
-                if ti.next().is_none() {
-                    return false;
-                }
-            }
-            Some(&pc) => {
-                if ti.next() != Some(pc) {
-                    return false;
-                }
-                pi.next();
-            }
-            None => return false,
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
         }
     }
-    true
+
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+
+    pi == p.len()
 }
 
 #[cfg(test)]
@@ -118,5 +110,19 @@ mod tests {
         assert!(!glob_match("SIM:*", "OTHER:Sine"));
         assert!(glob_match("SIM:?ine", "SIM:Sine"));
         assert!(glob_match("*", "anything"));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+        assert!(!glob_match("x", ""));
+        assert!(glob_match("**", "abc"));
+        assert!(glob_match("a*b*c", "aXXbYYc"));
+        assert!(!glob_match("a*b*c", "aXXbYY"));
+    }
+
+    #[test]
+    fn test_glob_no_exponential_backtracking() {
+        // Pattern that would cause exponential backtracking in a naive recursive impl.
+        let pattern = "*a*a*a*a*b";
+        let text = "aaaaaaaaaaaaaaaaaaaaaaaa"; // no 'b' → must fail fast
+        assert!(!glob_match(pattern, text));
     }
 }

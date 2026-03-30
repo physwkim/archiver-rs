@@ -122,7 +122,7 @@ async fn bulk_archive_requests(
             Ok(()) => "Archive request submitted".to_string(),
             Err(e) => {
                 tracing::warn!(pv, "Failed to archive: {e}");
-                "Failed to archive".to_string()
+                format!("Failed to archive: {e}")
             }
         };
         results.push(BulkResult {
@@ -185,11 +185,12 @@ async fn bulk_archive_requests(
                     {
                         results.extend(peer_results);
                     } else {
-                        let msg = String::from_utf8_lossy(&body_bytes);
+                        let raw = String::from_utf8_lossy(&body_bytes);
+                        let msg = super::truncate_for_display(&raw, 200);
                         for req in batch {
                             results.push(BulkResult {
                                 pv_name: req.pv.clone().unwrap_or_default(),
-                                status: format!("Forwarded to {peer_name} ({status_code}): {msg}"),
+                                status: format!("Peer {peer_name} error ({status_code}): {msg}"),
                             });
                         }
                     }
@@ -308,7 +309,7 @@ pub async fn bulk_pause_archiving_pv(
             Ok(()) => "Successfully paused".to_string(),
             Err(e) => {
                 tracing::warn!(pv, "Failed to pause: {e}");
-                "Failed to pause".to_string()
+                format!("Failed to pause: {e}")
             }
         };
         results.push(BulkResult {
@@ -341,7 +342,7 @@ pub async fn bulk_resume_archiving_pv(
             Ok(()) => "Successfully resumed".to_string(),
             Err(e) => {
                 tracing::warn!(pv, "Failed to resume: {e}");
-                "Failed to resume".to_string()
+                format!("Failed to resume: {e}")
             }
         };
         results.push(BulkResult {

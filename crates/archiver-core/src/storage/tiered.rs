@@ -114,4 +114,11 @@ impl StoragePlugin for TieredStorage {
         let lts_count = self.lts.delete_pv_data(pv).await?;
         Ok(sts_count + mts_count + lts_count)
     }
+
+    async fn flush_writes(&self) -> anyhow::Result<()> {
+        self.sts.flush_writes().await?;
+        self.mts.flush_writes().await?;
+        self.lts.flush_writes().await?;
+        Ok(())
+    }
 }

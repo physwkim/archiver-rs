@@ -64,6 +64,11 @@ pub trait StoragePlugin: Send + Sync {
     async fn delete_pv_data(&self, _pv: &str) -> anyhow::Result<u64> {
         Ok(0)
     }
+
+    /// Flush any buffered writes to disk. Default is no-op.
+    async fn flush_writes(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Post-processor trait for data reduction (mean, max, min, etc.).

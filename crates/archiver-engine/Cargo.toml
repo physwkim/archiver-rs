@@ -15,5 +15,6 @@ toml = { workspace = true }
 dashmap = { workspace = true }
 chrono = { workspace = true }
 epics-base-rs = { workspace = true }
+epics-ca-rs = { workspace = true }
 tokio-util = { workspace = true }
 metrics = { workspace = true }

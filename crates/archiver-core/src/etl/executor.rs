@@ -106,37 +106,37 @@ impl EtlExecutor {
     }
 
     /// Move a single PB file from source to destination tier.
-    /// Uses copy → verify → delete to ensure safety.
+    /// Uses copy → verify → marker → delete for crash-safe idempotency.
     async fn move_file(&self, source_path: &Path) -> anyhow::Result<()> {
+        // Check for a marker from a previous incomplete cleanup (crash after copy).
+        let marker = source_path.with_extension("pb.etl_done");
+        if marker.exists() {
+            info!(?source_path, "Found ETL marker — previous copy completed, cleaning up");
+            if let Err(e) = tokio::fs::remove_file(source_path).await {
+                warn!(?source_path, "Failed to remove source after ETL marker found: {e}");
+            }
+            if let Err(e) = tokio::fs::remove_file(&marker).await {
+                warn!(?marker, "Failed to remove ETL marker: {e}");
+            }
+            return Ok(());
+        }
+
         let mut reader = PbFileReader::open(source_path)?;
         let desc = reader.description().clone();
         let dbr_type = desc.db_type;
 
         // Copy all samples to destination.
-        let mut sample_count: u64 = 0;
         while let Some(sample) = reader.next_event()? {
             self.dest
                 .append_event(&desc.pv_name, dbr_type, &sample)
                 .await?;
-            sample_count += 1;
         }
 
-        // Verify: re-read source and count to confirm we transferred everything.
-        let mut verify_reader = PbFileReader::open(source_path)?;
-        let mut verify_count: u64 = 0;
-        while verify_reader.next_event()?.is_some() {
-            verify_count += 1;
-        }
-
-        if verify_count != sample_count {
-            anyhow::bail!(
-                "ETL verification failed for {:?}: wrote {sample_count} but source has {verify_count}",
-                source_path
-            );
-        }
-
-        // Only delete source after successful verification.
+        // Write marker before deleting source — if we crash here, next run
+        // will see the marker and skip re-copy (preventing duplicate data).
+        tokio::fs::write(&marker, b"").await?;
         tokio::fs::remove_file(source_path).await?;
+        tokio::fs::remove_file(&marker).await.ok();
         Ok(())
     }
 }

@@ -47,7 +47,7 @@ pub fn import_config(
             Ok(()) => imported += 1,
             Err(e) => {
                 tracing::warn!(pv = r.pv_name, "Import failed: {e}");
-                errors.push(format!("Failed to import {}", r.pv_name));
+                errors.push(format!("{}: {e}", r.pv_name));
             }
         }
     }

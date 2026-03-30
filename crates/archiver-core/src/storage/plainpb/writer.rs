@@ -70,7 +70,7 @@ impl<'a> PbFileWriter<'a> {
     }
 }
 
-fn build_payload_info(
+pub(crate) fn build_payload_info(
     pv: &str,
     dbr_type: ArchDbType,
     year: i32,

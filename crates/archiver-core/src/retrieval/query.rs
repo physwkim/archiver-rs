@@ -1,8 +1,8 @@
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::retrieval::merge::MergedEventStream;
 use crate::storage::traits::{EventStream, PostProcessor, StoragePlugin};
-use crate::types::EventStreamDesc;
+use crate::types::{ArchiverSample, EventStreamDesc};
 
 /// Execute a data query across a storage plugin, optionally applying a post-processor.
 pub async fn query_data(
@@ -62,6 +62,75 @@ pub fn parse_post_processor(spec: &str) -> Option<Box<dyn PostProcessor>> {
 }
 
 use chrono::Datelike;
+
+// ── TwoWeekRaw post-processor ──
+// Compatible with Java EPICS Archiver Appliance's TwoWeekRaw policy:
+// - Data within the last 2 weeks: pass through raw
+// - Data older than 2 weeks: firstSample binning (one per 15-minute bin)
+
+const TWO_WEEKS_SECS: u64 = 2 * 7 * 86400;
+const SPARSIFY_INTERVAL_SECS: u64 = 900; // 15 minutes (PostProcessors.DEFAULT_SUMMARIZING_INTERVAL)
+
+pub struct TwoWeekRawProcessor;
+
+impl PostProcessor for TwoWeekRawProcessor {
+    fn name(&self) -> &str {
+        "twoweek"
+    }
+
+    fn interval_secs(&self) -> u64 {
+        SPARSIFY_INTERVAL_SECS
+    }
+
+    fn process(&self, input: Box<dyn EventStream>) -> Box<dyn EventStream> {
+        let two_weeks_ago = SystemTime::now() - Duration::from_secs(TWO_WEEKS_SECS);
+        Box::new(TwoWeekRawStream {
+            input,
+            two_weeks_ago,
+            interval_secs: SPARSIFY_INTERVAL_SECS,
+            last_bin: None,
+        })
+    }
+}
+
+struct TwoWeekRawStream {
+    input: Box<dyn EventStream>,
+    two_weeks_ago: SystemTime,
+    interval_secs: u64,
+    last_bin: Option<u64>,
+}
+
+impl EventStream for TwoWeekRawStream {
+    fn description(&self) -> &EventStreamDesc {
+        self.input.description()
+    }
+
+    fn next_event(&mut self) -> anyhow::Result<Option<ArchiverSample>> {
+        loop {
+            match self.input.next_event()? {
+                Some(sample) => {
+                    if sample.timestamp >= self.two_weeks_ago {
+                        // Recent data: pass through raw
+                        return Ok(Some(sample));
+                    }
+                    // Old data: firstSample binning
+                    let epoch_secs = sample
+                        .timestamp
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let bin = epoch_secs / self.interval_secs;
+                    if self.last_bin != Some(bin) {
+                        self.last_bin = Some(bin);
+                        return Ok(Some(sample));
+                    }
+                    // Skip: same bin as previous sample
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
 
 struct EmptyStream {
     desc: EventStreamDesc,

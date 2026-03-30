@@ -33,11 +33,13 @@ pub struct AppState {
 }
 
 /// Middleware that records HTTP request metrics.
+/// Uses the path (without query string) as a label.
 pub(crate) async fn http_metrics(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let method = request.method().to_string();
+    // Use only the path component, not the query string, to keep label cardinality bounded.
     let path = request.uri().path().to_string();
     let start = std::time::Instant::now();
     let resp = next.run(request).await;
@@ -65,24 +67,27 @@ pub(crate) async fn api_key_auth(
         || path == "/mgmt/bpl/health"
         || path.starts_with("/mgmt/ui");
 
-    // Also exempt read-only mgmt GET endpoints.
+    // Also exempt read-only mgmt GET endpoints (exact path match).
+    const READ_ONLY_MGMT_PATHS: &[&str] = &[
+        "/mgmt/bpl/getAllPVs",
+        "/mgmt/bpl/getMatchingPVs",
+        "/mgmt/bpl/getPVStatus",
+        "/mgmt/bpl/getPVCount",
+        "/mgmt/bpl/getPausedPVsReport",
+        "/mgmt/bpl/getNeverConnectedPVs",
+        "/mgmt/bpl/getCurrentlyDisconnectedPVs",
+        "/mgmt/bpl/getRecentlyAddedPVs",
+        "/mgmt/bpl/getRecentlyModifiedPVs",
+        "/mgmt/bpl/getSilentPVsReport",
+        "/mgmt/bpl/getVersions",
+        "/mgmt/bpl/getAppliancesInCluster",
+        "/mgmt/bpl/getApplianceInfo",
+        "/mgmt/bpl/getPVTypeInfo",
+        "/mgmt/bpl/getPVDetails",
+        "/mgmt/bpl/exportConfig",
+    ];
     let is_read_only_mgmt = request.method() == axum::http::Method::GET
-        && (path.contains("getAllPVs")
-            || path.contains("getMatchingPVs")
-            || path.contains("getPVStatus")
-            || path.contains("getPVCount")
-            || path.contains("getPausedPVsReport")
-            || path.contains("getNeverConnectedPVs")
-            || path.contains("getCurrentlyDisconnectedPVs")
-            || path.contains("getRecentlyAddedPVs")
-            || path.contains("getRecentlyModifiedPVs")
-            || path.contains("getSilentPVsReport")
-            || path.contains("getVersions")
-            || path.contains("getAppliancesInCluster")
-            || path.contains("getApplianceInfo")
-            || path.contains("getPVTypeInfo")
-            || path.contains("getPVDetails")
-            || path.contains("exportConfig"));
+        && READ_ONLY_MGMT_PATHS.contains(&path);
 
     if is_exempt || is_read_only_mgmt {
         return next.run(request).await;

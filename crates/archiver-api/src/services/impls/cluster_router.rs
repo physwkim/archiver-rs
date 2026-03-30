@@ -71,7 +71,7 @@ impl ClusterRouter for ClusterClientRouter {
         self.inner.aggregate_matching_pvs(pattern).await
     }
 
-    async fn aggregate_pv_count(&self) -> (u64, u64, u64) {
+    async fn aggregate_pv_count(&self) -> (u64, u64, u64, usize) {
         self.inner.aggregate_pv_count().await
     }
 

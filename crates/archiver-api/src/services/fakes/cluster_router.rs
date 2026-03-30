@@ -75,8 +75,8 @@ impl ClusterRouter for FakeClusterRouter {
         Vec::new()
     }
 
-    async fn aggregate_pv_count(&self) -> (u64, u64, u64) {
-        (0, 0, 0)
+    async fn aggregate_pv_count(&self) -> (u64, u64, u64, usize) {
+        (0, 0, 0, 0)
     }
 
     async fn remote_pv_status(&self, _pv: &str) -> Option<serde_json::Value> {

@@ -197,6 +197,12 @@ impl ArchiverConfig {
             }
         }
         if let Some(ref cluster) = self.cluster {
+            if cluster.peer_timeout_secs == 0 {
+                anyhow::bail!("cluster.peer_timeout_secs must be > 0");
+            }
+            if cluster.cache_ttl_secs == 0 {
+                anyhow::bail!("cluster.cache_ttl_secs must be > 0");
+            }
             // When external API keys are enabled, each peer must have an outbound
             // credential — either its own `api_key` or the cluster-level fallback.
             if self.api_keys.is_some() && !cluster.peers.is_empty() {

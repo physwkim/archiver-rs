@@ -101,18 +101,23 @@ pub async fn get_pv_count(
     let mut active = state.pv_query.count(Some(PvStatus::Active)).unwrap_or(0);
     let mut paused = state.pv_query.count(Some(PvStatus::Paused)).unwrap_or(0);
 
+    let mut failed_peers = None;
     if cp.cluster.unwrap_or(false)
         && let Some(ref cluster) = state.cluster {
-            let (rt, ra, rp) = cluster.aggregate_pv_count().await;
+            let (rt, ra, rp, failed) = cluster.aggregate_pv_count().await;
             total += rt;
             active += ra;
             paused += rp;
+            if failed > 0 {
+                failed_peers = Some(failed);
+            }
         }
 
     let resp = PvCountResponse {
         total,
         active,
         paused,
+        failed_peers,
     };
     Ok(axum::Json(resp))
 }

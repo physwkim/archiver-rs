@@ -81,8 +81,16 @@ async fn route_pvs(
         None => return (pvs.to_vec(), remote),
     };
 
+    // Pre-fetch all local PV names in a single query to avoid N+1 lookups.
+    let local_set: std::collections::HashSet<String> = state
+        .pv_query
+        .all_pv_names()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
     for pv in pvs {
-        if state.pv_query.get_pv(pv).ok().flatten().is_some() {
+        if local_set.contains(pv) {
             local.push(pv.clone());
         } else if let Some(resolved) = cluster.resolve_peer(pv).await {
             remote
@@ -113,6 +121,20 @@ async fn forward_all_peer_batches(
     results.into_iter().flatten().collect()
 }
 
+/// Truncate a string to a safe length for inclusion in client-facing messages.
+pub(super) fn truncate_for_display(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        s
+    } else {
+        // Find a valid UTF-8 boundary.
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+}
+
 /// Forward a batch of PV names to a peer and parse the response as Vec<BulkResult>.
 async fn forward_pv_batch_to_peer(
     cluster: &dyn ClusterRouter,
@@ -133,12 +155,14 @@ async fn forward_pv_batch_to_peer(
             if let Ok(peer_results) = serde_json::from_slice::<Vec<BulkResult>>(&body_bytes) {
                 peer_results
             } else {
-                let msg = String::from_utf8_lossy(&body_bytes);
+                // Truncate raw peer response to avoid leaking internal details.
+                let raw = String::from_utf8_lossy(&body_bytes);
+                let msg = truncate_for_display(&raw, 200);
                 pv_names
                     .iter()
                     .map(|pv| BulkResult {
                         pv_name: pv.clone(),
-                        status: format!("Peer response ({status_code}): {msg}"),
+                        status: format!("Peer error ({status_code}): {msg}"),
                     })
                     .collect()
             }

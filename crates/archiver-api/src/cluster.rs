@@ -265,7 +265,8 @@ impl ClusterClient {
     }
 
     /// Aggregate PV count from all peers.
-    pub async fn aggregate_pv_count(&self) -> (u64, u64, u64) {
+    /// Returns (total, active, paused, failed_peer_count).
+    pub async fn aggregate_pv_count(&self) -> (u64, u64, u64, usize) {
         let futures: Vec<_> = self
             .peers
             .iter()
@@ -279,11 +280,11 @@ impl ClusterClient {
                             let total = body.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                             let active = body.get("active").and_then(|v| v.as_u64()).unwrap_or(0);
                             let paused = body.get("paused").and_then(|v| v.as_u64()).unwrap_or(0);
-                            (total, active, paused)
+                            Ok((total, active, paused))
                         }
                         Err(e) => {
                             warn!(peer = url, "Failed to get PV count from peer: {e}");
-                            (0, 0, 0)
+                            Err(())
                         }
                     }
                 }
@@ -294,12 +295,18 @@ impl ClusterClient {
         let mut total = 0u64;
         let mut active = 0u64;
         let mut paused = 0u64;
-        for (t, a, p) in results {
-            total += t;
-            active += a;
-            paused += p;
+        let mut failed = 0usize;
+        for result in results {
+            match result {
+                Ok((t, a, p)) => {
+                    total += t;
+                    active += a;
+                    paused += p;
+                }
+                Err(()) => failed += 1,
+            }
         }
-        (total, active, paused)
+        (total, active, paused, failed)
     }
 
     /// Aggregate all PV names from all peers + dedup + sort.

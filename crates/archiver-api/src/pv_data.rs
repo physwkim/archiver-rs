@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
 
-use archiver_core::retrieval::query::{parse_post_processor, query_data};
+use archiver_core::retrieval::query::{parse_post_processor, query_data, TwoWeekRawProcessor};
 use archiver_core::storage::traits::EventStream;
 use archiver_core::types::{ArchiverSample, ArchiverValue};
 
@@ -18,6 +18,8 @@ use crate::AppState;
 
 /// Default time range when no `from` parameter is specified (1 hour).
 const DEFAULT_TIME_RANGE_SECS: u64 = 3600;
+/// Maximum number of samples a single retrieval request can return.
+const MAX_RETRIEVAL_LIMIT: usize = 1_000_000;
 
 /// Try to proxy a data request to the correct cluster peer.
 /// Returns Some(Response) if proxied, None if should handle locally.
@@ -67,6 +69,9 @@ struct GetDataParams {
     from: Option<String>,
     to: Option<String>,
     limit: Option<usize>,
+    /// When "true", applies TwoWeekRaw policy (raw for last 2 weeks,
+    /// sparsified for older data). Compatible with Java Archiver Appliance.
+    usereduced: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -120,6 +125,7 @@ fn parse_pv_spec(spec: &str) -> (String, Option<String>) {
 struct RetrievalParams {
     pv_name: String,
     pp_spec: Option<String>,
+    use_reduced: bool,
     start: SystemTime,
     end: SystemTime,
     limit: Option<usize>,
@@ -139,13 +145,43 @@ fn parse_retrieval_params(params: &GetDataParams) -> RetrievalParams {
         .as_deref()
         .and_then(parse_iso8601)
         .unwrap_or(now);
+    let limit = Some(params.limit.unwrap_or(MAX_RETRIEVAL_LIMIT).min(MAX_RETRIEVAL_LIMIT));
+    let use_reduced = params
+        .usereduced
+        .as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
     RetrievalParams {
         pv_name,
         pp_spec,
+        use_reduced,
         start,
         end,
-        limit: params.limit,
+        limit,
     }
+}
+
+/// Resolve the post-processor for a retrieval request.
+/// Priority: explicit PV spec (e.g. `mean_600(PV)`) > usereduced toggle > none.
+///
+/// `optimized_N` is handled specially here because it needs the time range
+/// to calculate the bin interval: interval = (end - start) / N.
+fn resolve_post_processor(
+    rp: &RetrievalParams,
+) -> Option<Box<dyn archiver_core::storage::traits::PostProcessor>> {
+    if let Some(ref spec) = rp.pp_spec {
+        if let Some(num_bins) = spec.strip_prefix("optimized_").and_then(|s| s.parse::<u64>().ok()) {
+            let range_secs = rp.end.duration_since(rp.start).unwrap_or_default().as_secs();
+            let interval = range_secs.checked_div(num_bins).unwrap_or(1).max(1);
+            return Some(Box::new(
+                archiver_core::etl::decimation::MeanDecimation::new(interval),
+            ));
+        }
+        return parse_post_processor(spec);
+    }
+    if rp.use_reduced {
+        return Some(Box::new(TwoWeekRawProcessor));
+    }
+    None
 }
 
 fn sample_to_json_value(value: &ArchiverValue) -> serde_json::Value {
@@ -187,7 +223,7 @@ fn sample_to_csv_row(s: &ArchiverSample) -> String {
         ArchiverValue::ScalarInt(v) => v.to_string(),
         ArchiverValue::ScalarShort(v) => v.to_string(),
         ArchiverValue::ScalarEnum(v) => v.to_string(),
-        ArchiverValue::ScalarString(v) => format!("\"{v}\""),
+        ArchiverValue::ScalarString(v) => csv_escape(v),
         other => format!("{other:?}"),
     };
     format!(
@@ -200,30 +236,67 @@ fn sample_to_csv_row(s: &ArchiverSample) -> String {
     )
 }
 
-/// Iterate an EventStream, sending each sample through the channel.
+/// RFC 4180 CSV escaping: wrap in quotes if the value contains comma,
+/// quote, or newline, and double any internal quotes.
+fn csv_escape(s: &str) -> String {
+    if s.contains('"') || s.contains(',') || s.contains('\n') || s.contains('\r') {
+        let escaped = s.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        format!("\"{s}\"")
+    }
+}
+
+/// Maximum time a single retrieval query may run before being terminated.
+const RETRIEVAL_DEADLINE_SECS: u64 = 300;
+
+/// Batch size for draining samples through the channel.
+/// Sending batches instead of individual samples reduces channel overhead.
+const DRAIN_BATCH_SIZE: usize = 256;
+
+/// Iterate an EventStream, sending batches of samples through the channel.
 /// Runs synchronously (EventStream::next_event is sync) inside spawn_blocking.
+/// Terminates if the deadline is exceeded to prevent thread-pool starvation.
 fn drain_stream(
     mut stream: Box<dyn EventStream>,
     start: SystemTime,
     end: SystemTime,
     limit: Option<usize>,
-    tx: std::sync::mpsc::Sender<ArchiverSample>,
+    tx: std::sync::mpsc::Sender<Vec<ArchiverSample>>,
 ) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(RETRIEVAL_DEADLINE_SECS);
     let mut count = 0usize;
+    let mut batch = Vec::with_capacity(DRAIN_BATCH_SIZE);
+
     while let Ok(Some(sample)) = stream.next_event() {
         if sample.timestamp > end {
             break;
         }
         if sample.timestamp >= start {
-            if tx.send(sample).is_err() {
-                break;
-            }
+            batch.push(sample);
             count += 1;
+
+            if batch.len() >= DRAIN_BATCH_SIZE
+                && tx.send(std::mem::replace(&mut batch, Vec::with_capacity(DRAIN_BATCH_SIZE))).is_err()
+            {
+                return;
+            }
+
             if let Some(max) = limit
                 && count >= max {
                     break;
                 }
         }
+        // Check deadline every 10k samples to avoid excessive clock reads.
+        if count.is_multiple_of(10_000) && std::time::Instant::now() > deadline {
+            tracing::warn!(count, "Retrieval deadline exceeded, truncating response");
+            break;
+        }
+    }
+
+    // Send remaining samples.
+    if !batch.is_empty() {
+        let _ = tx.send(batch);
     }
 }
 
@@ -239,7 +312,7 @@ async fn get_data_json(
         return resp;
     }
 
-    let post_processor = rp.pp_spec.and_then(|s| parse_post_processor(&s));
+    let post_processor = resolve_post_processor(&rp);
 
     let stream = match query_data(state.storage.as_ref(), &rp.pv_name, rp.start, rp.end, post_processor)
         .await
@@ -255,7 +328,8 @@ async fn get_data_json(
     let limit = rp.limit;
 
     // Stream JSON: [{"meta":...,"data":[sample,sample,...]}]
-    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(64);
+    // Use larger channel buffer (512) to reduce backpressure stalls.
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(512);
 
     // Look up metadata from registry.
     let (prec, egu) = state
@@ -286,29 +360,35 @@ async fn get_data_json(
             return;
         }
 
-        // Drain the EventStream in a blocking task.
-        let (sample_tx, sample_rx) = std::sync::mpsc::channel::<ArchiverSample>();
+        // Drain the EventStream in batches via a blocking task.
+        let (sample_tx, sample_rx) = std::sync::mpsc::channel::<Vec<ArchiverSample>>();
         tokio::task::spawn_blocking(move || {
             drain_stream(stream, start, end, limit, sample_tx);
         });
 
+        // Serialize batches of samples into a single String chunk to reduce
+        // per-sample allocation and channel overhead.
         let mut first = true;
-        while let Ok(sample) = sample_rx.recv() {
-            let js = sample_to_json(&sample);
-            let json_str = match serde_json::to_string(&js) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Failed to serialize sample: {e}");
-                    continue;
+        let mut buf = String::with_capacity(32 * 1024);
+        while let Ok(batch) = sample_rx.recv() {
+            buf.clear();
+            for sample in &batch {
+                let js = sample_to_json(sample);
+                if first {
+                    first = false;
+                } else {
+                    buf.push(',');
                 }
-            };
-            let chunk = if first {
-                first = false;
-                json_str
-            } else {
-                format!(",{json_str}")
-            };
-            if chunk_tx.send(Ok(chunk)).await.is_err() {
+                match serde_json::to_string(&js) {
+                    Ok(s) => buf.push_str(&s),
+                    Err(e) => {
+                        tracing::warn!("Failed to serialize sample: {e}");
+                    }
+                }
+            }
+            if !buf.is_empty()
+                && chunk_tx.send(Ok(buf.clone())).await.is_err()
+            {
                 break;
             }
         }
@@ -337,7 +417,7 @@ async fn get_data_csv(
         return resp;
     }
 
-    let post_processor = rp.pp_spec.and_then(|s| parse_post_processor(&s));
+    let post_processor = resolve_post_processor(&rp);
 
     let stream = match query_data(state.storage.as_ref(), &rp.pv_name, rp.start, rp.end, post_processor)
         .await
@@ -352,7 +432,7 @@ async fn get_data_csv(
     let end = rp.end;
     let limit = rp.limit;
 
-    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(64);
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(512);
 
     tokio::spawn(async move {
         if chunk_tx
@@ -363,14 +443,20 @@ async fn get_data_csv(
             return;
         }
 
-        let (sample_tx, sample_rx) = std::sync::mpsc::channel::<ArchiverSample>();
+        let (sample_tx, sample_rx) = std::sync::mpsc::channel::<Vec<ArchiverSample>>();
         tokio::task::spawn_blocking(move || {
             drain_stream(stream, start, end, limit, sample_tx);
         });
 
-        while let Ok(sample) = sample_rx.recv() {
-            let row = sample_to_csv_row(&sample);
-            if chunk_tx.send(Ok(row)).await.is_err() {
+        let mut buf = String::with_capacity(32 * 1024);
+        while let Ok(batch) = sample_rx.recv() {
+            buf.clear();
+            for sample in &batch {
+                buf.push_str(&sample_to_csv_row(sample));
+            }
+            if !buf.is_empty()
+                && chunk_tx.send(Ok(buf.clone())).await.is_err()
+            {
                 break;
             }
         }

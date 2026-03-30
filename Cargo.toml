@@ -70,7 +70,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
 
 # EPICS Channel Access
-epics-base-rs = "0.4"
+epics-base-rs = { git = "https://github.com/epics-rs/epics-rs", tag = "v0.7.2", package = "epics-base-rs" }
+epics-ca-rs = { git = "https://github.com/epics-rs/epics-rs", tag = "v0.7.2", package = "epics-ca-rs" }
 
 # URL encoding
 urlencoding = "2"

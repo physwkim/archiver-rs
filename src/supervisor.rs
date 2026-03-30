@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tokio::task::{AbortHandle, JoinHandle};
+use tracing::{error, info, warn};
 
 pub struct RuntimeSupervisor {
     shutdown_rx: watch::Receiver<bool>,
     handles: Vec<(String, JoinHandle<()>)>,
+    abort_handles: Vec<(String, AbortHandle)>,
 }
 
 impl RuntimeSupervisor {
@@ -14,6 +15,7 @@ impl RuntimeSupervisor {
         Self {
             shutdown_rx,
             handles: Vec::new(),
+            abort_handles: Vec::new(),
         }
     }
 
@@ -27,16 +29,17 @@ impl RuntimeSupervisor {
         fut: impl std::future::Future<Output = ()> + Send + 'static,
     ) {
         let handle = tokio::spawn(fut);
+        self.abort_handles
+            .push((name.to_string(), handle.abort_handle()));
         info!(task = name, "Spawned background task");
         self.handles.push((name.to_string(), handle));
     }
 
     pub async fn shutdown(self, timeout: Duration) {
-        info!(
-            tasks = self.handles.len(),
-            "Waiting for background tasks to complete"
-        );
+        let count = self.handles.len();
+        info!(tasks = count, "Waiting for background tasks to complete");
 
+        let abort_handles = self.abort_handles;
         let result = tokio::time::timeout(timeout, async {
             for (name, handle) in self.handles {
                 match handle.await {
@@ -48,10 +51,16 @@ impl RuntimeSupervisor {
         .await;
 
         if result.is_err() {
-            error!(
-                "Shutdown timed out after {}s, some tasks may still be running",
+            warn!(
+                "Shutdown timed out after {}s, aborting remaining tasks",
                 timeout.as_secs()
             );
+            for (name, abort) in &abort_handles {
+                if !abort.is_finished() {
+                    abort.abort();
+                    warn!(task = name, "Aborted task");
+                }
+            }
         }
     }
 }

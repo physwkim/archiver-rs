@@ -236,10 +236,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Serve with optional TLS.
     if let Some(ref tls) = config.tls {
-        // Install ring crypto provider for rustls.
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("rustls crypto provider already installed or ring unavailable");
+        // Install ring crypto provider for rustls (ignore if already installed).
+        let _ = rustls::crypto::ring::default_provider().install_default();
 
         let rustls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
