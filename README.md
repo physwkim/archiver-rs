@@ -221,7 +221,7 @@ max_body_size = 5242880  # 5 MB
 
 ## EPICS CA Environment Variables
 
-The archiver uses the `epics-base-rs` library, which respects standard EPICS Channel Access environment variables:
+The archiver uses the `epics-rs` library, which respects standard EPICS Channel Access environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
