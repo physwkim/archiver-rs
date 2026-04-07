@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use dashmap::DashMap;
-use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent};
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_rs::ca::client::{CaChannel, CaClient, ConnectionEvent};
+use epics_rs::base::types::{DbFieldType, EpicsValue};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -416,7 +416,7 @@ async fn monitor_loop(
                 _ = cancel_token.cancelled() => return,
                 result = monitor.recv() => {
                     match result {
-                        Some(Ok(epics_val)) => {
+                        Some(Ok(snapshot)) => {
                             let now = SystemTime::now();
                             {
                                 let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
@@ -426,7 +426,7 @@ async fn monitor_loop(
                                 ci.is_connected = true;
                                 ci.last_event_time = Some(now);
                             }
-                            let archiver_val = epics_value_to_archiver(&epics_val);
+                            let archiver_val = epics_value_to_archiver(&snapshot.value);
                             let sample = ArchiverSample::new(now, archiver_val);
                             let pv_sample = PvSample {
                                 pv_name: pv_name.clone(),
