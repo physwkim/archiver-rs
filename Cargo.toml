@@ -16,8 +16,9 @@ license = "MIT"
 
 [workspace.dependencies]
 # Protobuf
-prost = "0.13"
-prost-build = "0.13"
+prost = "0.14"
+prost-build = "0.14"
+protox = "0.9"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

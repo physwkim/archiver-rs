@@ -8,3 +8,4 @@ prost = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }
+protox = { workspace = true }
