@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "archiver"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "archiver-api",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "archiver-core",
@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "archiver-proto",
@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "archiver-core",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -532,8 +532,8 @@ checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.8.2"
-source = "git+https://github.com/epics-rs/epics-rs#c959530d7ad0fb579fe4ef7a7723b410c797fe0d"
+version = "0.9.0"
+source = "git+https://github.com/epics-rs/epics-rs#64f597717e94151201579cce8f5db1a3de096748"
 dependencies = [
  "bytes",
  "chrono",
@@ -548,8 +548,8 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.8.2"
-source = "git+https://github.com/epics-rs/epics-rs#c959530d7ad0fb579fe4ef7a7723b410c797fe0d"
+version = "0.9.0"
+source = "git+https://github.com/epics-rs/epics-rs#64f597717e94151201579cce8f5db1a3de096748"
 dependencies = [
  "chrono",
  "clap",
@@ -560,8 +560,8 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.8.2"
-source = "git+https://github.com/epics-rs/epics-rs#c959530d7ad0fb579fe4ef7a7723b410c797fe0d"
+version = "0.9.0"
+source = "git+https://github.com/epics-rs/epics-rs#64f597717e94151201579cce8f5db1a3de096748"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -570,8 +570,8 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
-version = "0.8.2"
-source = "git+https://github.com/epics-rs/epics-rs#c959530d7ad0fb579fe4ef7a7723b410c797fe0d"
+version = "0.9.0"
+source = "git+https://github.com/epics-rs/epics-rs#64f597717e94151201579cce8f5db1a3de096748"
 dependencies = [
  "epics-base-rs",
  "epics-ca-rs",
