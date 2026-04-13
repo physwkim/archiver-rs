@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.3 — 2026-04-13
+
+### Changed
+
+- **Upgrade epics-rs** (`d593a27` → `5c27fff`):
+  - `5c27fff` ca: Pre-connection subscription, get_with_timeout, tool
+    refinements
+  - `0b9be88` CA tools: Parallel PV handling, timeout plumbing, error
+    distinction
+  - `b1ca96a` epics-macros-rs: Resolve epics_base_rs path for umbrella
+    crate users
+  - `934095b` epics-rs: Add ioc feature to umbrella crate
+
 ## v0.1.2 — 2026-04-13
 
 ### Changed
