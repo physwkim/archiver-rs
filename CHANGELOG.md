@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.1.2 — 2026-04-13
+
+### Changed
+
+- **Upgrade epics-rs** (`64f5977` → `d593a27`):
+  - `d593a27` ca: Rewrite monitor flow control to track application backlog
+    (C parity) — replaces TCP read count heuristic with actual
+    application-level backlog tracking; the old implementation counted TCP
+    reads and sent CA_PROTO_EVENTS_OFF after 10 reads, which overshoots on
+    fragmented links and stalls remote C IOCs. Server side now properly
+    implements EVENTS_OFF/ON with coalesce-while-paused semantics matching
+    C EPICS dbEvent.c behavior.
+  - `4c589f1` ca-rs: Send NORD elements for waveform instead of
+    NELM-padded array — fixes CA clients that compute dimensions from
+    element count.
+
 ## v0.1.1 — 2026-04-13
 
 ### Fixed
