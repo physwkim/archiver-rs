@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "archiver"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "archiver-api",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-api"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "archiver-core",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "archiver-proto",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-engine"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "archiver-core",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-proto"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "prost",
  "prost-build",

@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.1.5 — 2026-04-14
+
+### Fixed
+
+- **Write-cache file-handle leak in `PlainPbStoragePlugin`.** The cache
+  was keyed by partition path and `flush_writes()` only evicted entries
+  whose flush failed, so every hourly partition rollover added a new
+  `BufWriter` + file descriptor per PV without ever releasing the old
+  one. With 500 PVs and hourly STS partitions the cache grew by ~500
+  fds/hour, eventually hitting the process fd limit after about a day —
+  matching the observed "archiver stops ingesting after ~24 h" symptom.
+  Cache is now keyed by PV name (one writer per PV); on partition
+  rollover the old writer is flushed and dropped before the new one is
+  opened.
+- **Monitor-loop reconnection race.** After `wait_connected` timed out,
+  the code subscribed to `connection_events()` and waited for a
+  `Connected` event, but `tokio::sync::broadcast` only delivers
+  messages sent after `subscribe()`. Any `Connected` firing between the
+  timeout and the subscribe call was lost and the PV stayed
+  disconnected until the next full disconnect/reconnect cycle (a PV
+  could go zombie for the remaining lifetime of the process). Subscribe
+  before probing, re-probe with a short `wait_connected` to cover the
+  subscribe-time window, and handle `broadcast::RecvError::Lagged` by
+  re-probing instead of killing the monitor task.
+- **Unbounded `/data/getData.raw` blocking task.** The raw-format
+  handler spawned a `spawn_blocking` task without the
+  `RETRIEVAL_DEADLINE_SECS` (300 s) wall-clock cap that the JSON and
+  CSV handlers already enforce. A slow or stalled client could pin a
+  blocking worker, the `EventStream`s it owns, and the underlying file
+  handles indefinitely. Same 300 s cap now applies to raw.
+
 ## v0.1.4 — 2026-04-14
 
 ### Added
