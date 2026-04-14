@@ -497,6 +497,9 @@ async fn get_data_raw(
     let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
 
     tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(RETRIEVAL_DEADLINE_SECS);
+        let mut count = 0usize;
         for mut stream in streams {
             let desc = stream.description().clone();
             let header = archiver_proto::epics_event::PayloadInfo {
@@ -545,7 +548,14 @@ async fn get_data_raw(
                         if chunk_tx.blocking_send(Ok(escaped)).is_err() {
                             return;
                         }
+                        count += 1;
                     }
+                // Bound total wall-clock time so a slow/stalled client cannot
+                // tie up a blocking worker indefinitely.
+                if count.is_multiple_of(10_000) && std::time::Instant::now() > deadline {
+                    tracing::warn!(count, "Raw retrieval deadline exceeded, truncating response");
+                    return;
+                }
             }
         }
     });
