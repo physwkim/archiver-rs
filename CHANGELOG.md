@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.1.4 — 2026-04-14
+
+### Added
+
+- **Bundle `ca-repeater-rs` binary alongside `archiver`.** On startup,
+  `epics-ca-rs`'s `CaClient::new()` calls `ensure_repeater()`, which
+  registers with an existing repeater or spawns one from the sibling
+  `ca-repeater-rs` binary next to the running executable (falling back
+  to an in-process thread if the binary is absent). Shipping the binary
+  lets the repeater run as an independent process — matching the C
+  EPICS `caRepeater` model — so a repeater crash or restart doesn't
+  share a failure domain with the archiver, and the single
+  host-wide repeater is cleanly shared with other CA clients on the
+  host (no port-5065 contention within our own process tree).
+
+### Changed
+
+- Upgrade epics-rs pin (`5c27fff` → `7f9a6c0`). No client-facing
+  functional changes in this range; the audit commit touches CA
+  server-side code (`WRITE_NOTIFY` `write_count` echo, `CLEAR_CHANNEL`
+  cleanup) and non-CA records/records-engine paths, none of which
+  affect archiver-rs as a CA client.
+
 ## v0.1.3 — 2026-04-13
 
 ### Changed
