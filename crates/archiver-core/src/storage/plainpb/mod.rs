@@ -19,8 +19,9 @@ use crate::types::{ArchDbType, ArchiverSample};
 
 use self::reader::PbFileReader;
 
-/// Cached file handle for writing.
+/// Cached file handle for writing the current partition of a PV.
 struct CachedWriter {
+    path: PathBuf,
     writer: BufWriter<std::fs::File>,
 }
 
@@ -29,9 +30,10 @@ pub struct PlainPbStoragePlugin {
     plugin_name: String,
     root_folder: PathBuf,
     granularity: PartitionGranularity,
-    /// Cached BufWriter handles, keyed by file path.
-    /// Avoids open/flush/close per sample.
-    write_cache: Mutex<HashMap<PathBuf, CachedWriter>>,
+    /// One `BufWriter` per PV, pointing at that PV's current partition file.
+    /// When the partition rolls over (hour/day/year boundary), the old writer
+    /// is flushed and dropped so we never accumulate stale file handles.
+    write_cache: Mutex<HashMap<String, CachedWriter>>,
     /// Directories known to exist. Avoids redundant create_dir_all syscalls.
     known_dirs: Mutex<HashSet<PathBuf>>,
 }
@@ -116,7 +118,24 @@ impl PlainPbStoragePlugin {
             .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
 
         let path_buf = path.to_path_buf();
-        if !cache.contains_key(&path_buf) {
+
+        // If the cached writer points at a different path, the partition has
+        // rolled over — flush and drop the old writer before opening the new
+        // one so we don't leak file handles.
+        if let Some(existing) = cache.get_mut(pv) {
+            if existing.path != path_buf {
+                if let Err(e) = existing.writer.flush() {
+                    tracing::warn!(
+                        pv,
+                        old_path = ?existing.path,
+                        "Failed to flush writer on partition rollover: {e}"
+                    );
+                }
+                cache.remove(pv);
+            }
+        }
+
+        if !cache.contains_key(pv) {
             let file_exists = path.exists();
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -135,10 +154,13 @@ impl PlainPbStoragePlugin {
                 bw.write_all(&[codec::NEWLINE])?;
             }
 
-            cache.insert(path_buf.clone(), CachedWriter { writer: bw });
+            cache.insert(
+                pv.to_string(),
+                CachedWriter { path: path_buf, writer: bw },
+            );
         }
 
-        let cached = cache.get_mut(&path_buf).expect("just inserted");
+        let cached = cache.get_mut(pv).expect("just inserted");
         cached.writer.write_all(&escaped_sample)?;
         cached.writer.write_all(&[codec::NEWLINE])?;
         Ok(())
@@ -331,18 +353,13 @@ impl StoragePlugin for PlainPbStoragePlugin {
     }
 
     async fn delete_pv_data(&self, pv: &str) -> anyhow::Result<u64> {
-        // Evict any cached writers for this PV before deleting files.
+        // Evict the cached writer for this PV before deleting files.
         {
-            let pv_key = pv_name_to_key(pv);
             let mut cache = self.write_cache.lock()
                 .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
-            cache.retain(|path, cached| {
-                let dominated = path.to_string_lossy().contains(&pv_key);
-                if dominated {
-                    let _ = cached.writer.flush();
-                }
-                !dominated
-            });
+            if let Some(mut cached) = cache.remove(pv) {
+                let _ = cached.writer.flush();
+            }
         }
 
         let entries = list_pv_pb_files(&self.root_folder, pv)?;
@@ -370,14 +387,14 @@ impl StoragePlugin for PlainPbStoragePlugin {
         let mut cache = self.write_cache.lock()
             .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
         let mut to_remove = Vec::new();
-        for (path, cached) in cache.iter_mut() {
+        for (pv, cached) in cache.iter_mut() {
             if let Err(e) = cached.writer.flush() {
-                tracing::warn!(?path, "Failed to flush cached writer: {e}");
-                to_remove.push(path.clone());
+                tracing::warn!(pv, path = ?cached.path, "Failed to flush cached writer: {e}");
+                to_remove.push(pv.clone());
             }
         }
-        for path in to_remove {
-            cache.remove(&path);
+        for pv in to_remove {
+            cache.remove(&pv);
         }
         Ok(())
     }

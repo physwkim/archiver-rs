@@ -377,17 +377,44 @@ async fn monitor_loop(
                         let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
                         ci.is_connected = false;
                     }
-                    // Wait for reconnection via connection events.
+                    // Subscribe BEFORE re-checking the current state. If we
+                    // subscribed after a state check, a Connected event
+                    // firing in between would be lost forever, leaving this
+                    // loop hung until the next disconnect/reconnect cycle.
                     let mut conn_rx = channel.connection_events();
-                    loop {
-                        tokio::select! {
-                            _ = cancel_token.cancelled() => return,
-                            event = conn_rx.recv() => {
-                                match event {
-                                    Ok(ConnectionEvent::Connected) => break,
-                                    Ok(ConnectionEvent::Disconnected) => continue,
-                                    Ok(_) => continue,
-                                    Err(_) => return,
+
+                    // Close the remaining race: the channel may have become
+                    // connected between the outer `wait_connected` timeout
+                    // and our `subscribe()` above, in which case no new event
+                    // will arrive. A short re-probe catches that case.
+                    if channel
+                        .wait_connected(Duration::from_millis(100))
+                        .await
+                        .is_err()
+                    {
+                        loop {
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => return,
+                                event = conn_rx.recv() => {
+                                    use tokio::sync::broadcast::error::RecvError;
+                                    match event {
+                                        Ok(ConnectionEvent::Connected) => break,
+                                        Ok(_) => continue,
+                                        // Lagged: we missed some events but
+                                        // the channel is still live. Re-probe
+                                        // state and otherwise keep waiting.
+                                        Err(RecvError::Lagged(_)) => {
+                                            if channel
+                                                .wait_connected(Duration::from_millis(100))
+                                                .await
+                                                .is_ok()
+                                            {
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                        Err(RecvError::Closed) => return,
+                                    }
                                 }
                             }
                         }
