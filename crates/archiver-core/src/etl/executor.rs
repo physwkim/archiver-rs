@@ -174,6 +174,12 @@ impl EtlExecutor {
         tokio::fs::write(&marker, b"").await?;
         tokio::fs::remove_file(source_path).await?;
         tokio::fs::remove_file(&marker).await.ok();
+        metrics::counter!(
+            "archiver_etl_files_moved_total",
+            "source" => self.source.name().to_string(),
+            "dest" => self.dest.name().to_string(),
+        )
+        .increment(1);
         Ok(())
     }
 }

@@ -276,6 +276,7 @@ impl ChannelManager {
                 child,
             );
         }
+        metrics::gauge!("archiver_extra_field_tasks").increment(record.archive_fields.len() as f64);
         drop(_guard);
 
         let tx = self.sample_tx.clone();
@@ -363,6 +364,7 @@ impl ChannelManager {
             .filter(|e| !wanted.contains(e.key().as_str()))
             .map(|e| e.key().clone())
             .collect();
+        let removed_count = to_remove.len();
         for key in to_remove {
             if let Some((_, token)) = field_tokens.remove(&key) {
                 token.cancel();
@@ -372,6 +374,7 @@ impl ChannelManager {
 
         // Spawn tasks for fields newly added. Existing fields keep their
         // task and their last cached value.
+        let mut added_count = 0usize;
         for f in fields {
             if !field_tokens.contains_key(f) {
                 let child = parent_token.child_token();
@@ -383,7 +386,12 @@ impl ChannelManager {
                     extras.clone(),
                     child,
                 );
+                added_count += 1;
             }
+        }
+        let net = added_count as i64 - removed_count as i64;
+        if net != 0 {
+            metrics::gauge!("archiver_extra_field_tasks").increment(net as f64);
         }
         Ok(())
     }
@@ -391,8 +399,12 @@ impl ChannelManager {
     /// Pause archiving for a PV.
     pub fn pause_pv(&self, pv_name: &str) -> anyhow::Result<()> {
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
+            let extra_count = handle.field_tokens.len() as f64;
             handle.cancel_token.cancel();
             metrics::gauge!("archiver_pvs_active").decrement(1.0);
+            if extra_count > 0.0 {
+                metrics::gauge!("archiver_extra_field_tasks").decrement(extra_count);
+            }
         }
         self.registry.set_status(pv_name, PvStatus::Paused)?;
         info!(pv = pv_name, "Paused archiving");
@@ -415,7 +427,11 @@ impl ChannelManager {
 
         // Cancel any orphaned task to prevent duplicate subscriptions.
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
+            let extra_count = handle.field_tokens.len() as f64;
             handle.cancel_token.cancel();
+            if extra_count > 0.0 {
+                metrics::gauge!("archiver_extra_field_tasks").decrement(extra_count);
+            }
         }
 
         // Start the task first; only mark Active if it succeeds.
@@ -430,8 +446,12 @@ impl ChannelManager {
     /// Sets the PV status to Inactive (data retained, monitoring stopped).
     pub fn stop_pv(&self, pv_name: &str) -> anyhow::Result<()> {
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
+            let extra_count = handle.field_tokens.len() as f64;
             handle.cancel_token.cancel();
             metrics::gauge!("archiver_pvs_active").decrement(1.0);
+            if extra_count > 0.0 {
+                metrics::gauge!("archiver_extra_field_tasks").decrement(extra_count);
+            }
         }
         self.registry.set_status(pv_name, PvStatus::Inactive)?;
         info!(pv = pv_name, "Stopped archiving (inactive)");
@@ -441,8 +461,12 @@ impl ChannelManager {
     /// Remove a PV from archiving entirely.
     pub fn destroy_pv(&self, pv_name: &str) -> anyhow::Result<()> {
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
+            let extra_count = handle.field_tokens.len() as f64;
             handle.cancel_token.cancel();
             metrics::gauge!("archiver_pvs_active").decrement(1.0);
+            if extra_count > 0.0 {
+                metrics::gauge!("archiver_extra_field_tasks").decrement(extra_count);
+            }
         }
         self.registry.remove_pv(pv_name)?;
         info!(pv = pv_name, "Destroyed archiving channel");

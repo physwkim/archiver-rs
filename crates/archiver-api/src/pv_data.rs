@@ -284,9 +284,21 @@ async fn build_retrieval_stream(
 
     for peer in &failover.peers {
         match fetch_peer_raw_stream(peer, &rp.pv_name, rp.start, rp.end, failover.timeout).await {
-            Ok(s) => streams.push(s),
+            Ok(s) => {
+                streams.push(s);
+                metrics::counter!(
+                    "archiver_failover_peer_fetch_total",
+                    "result" => "ok",
+                )
+                .increment(1);
+            }
             Err(e) => {
                 tracing::warn!(peer, pv = rp.pv_name, "Failover peer fetch failed: {e}");
+                metrics::counter!(
+                    "archiver_failover_peer_fetch_total",
+                    "result" => "error",
+                )
+                .increment(1);
             }
         }
     }

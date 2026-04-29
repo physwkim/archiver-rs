@@ -8,6 +8,7 @@ use tower::ServiceExt;
 use archiver_core::registry::{PvRegistry, PvStatus, SampleMode};
 use archiver_core::storage::partition::PartitionGranularity;
 use archiver_core::storage::plainpb::PlainPbStoragePlugin;
+use archiver_core::storage::traits::StoragePlugin as _;
 use archiver_engine::channel_manager::ChannelManager;
 use archiver_core::config::SecurityConfig;
 use archiver_api::{build_router, AppState};
@@ -1483,4 +1484,172 @@ async fn test_p2_aggregated_appliance_info_standalone() {
     let arr = body.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["name"], "standalone");
+}
+
+#[tokio::test]
+async fn test_d_consolidate_pv_actually_moves_files() {
+    use archiver_core::storage::traits::AppendMeta;
+    use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
+    use std::sync::Arc;
+
+    // Two-tier storage so consolidate has somewhere to move data to.
+    let dir = tempfile::tempdir().unwrap();
+    let sts_dir = dir.path().join("sts");
+    let mts_dir = dir.path().join("mts");
+    let sts = Arc::new(PlainPbStoragePlugin::new(
+        "STS",
+        sts_dir.clone(),
+        archiver_core::storage::partition::PartitionGranularity::Hour,
+    ));
+    let mts = Arc::new(PlainPbStoragePlugin::new(
+        "MTS",
+        mts_dir.clone(),
+        archiver_core::storage::partition::PartitionGranularity::Day,
+    ));
+
+    // Write a sample to STS so consolidate has something to move.
+    let now = std::time::SystemTime::now();
+    let sample = ArchiverSample::new(now, ArchiverValue::ScalarDouble(1.0));
+    sts.append_event_with_meta("PV:Move", ArchDbType::ScalarDouble, &sample, &AppendMeta::default())
+        .await
+        .unwrap();
+    sts.flush_writes().await.unwrap();
+
+    let executor = archiver_core::etl::executor::EtlExecutor::new(
+        sts.clone(),
+        mts.clone(),
+        3600,
+        5,
+        3,
+    );
+    let moved = executor.consolidate_pv("PV:Move").await.unwrap();
+    assert_eq!(moved, 1);
+
+    // STS empty, MTS has the sample.
+    let sts_streams = sts
+        .get_data("PV:Move", now - std::time::Duration::from_secs(60), now + std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(sts_streams.is_empty());
+    let mts_streams = mts
+        .get_data("PV:Move", now - std::time::Duration::from_secs(60), now + std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(mts_streams.len(), 1);
+}
+
+#[tokio::test]
+async fn test_d_get_data_at_time_stage_2_walkback() {
+    use archiver_core::storage::traits::AppendMeta;
+    use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(PlainPbStoragePlugin::new(
+        "sts",
+        dir.path().to_path_buf(),
+        archiver_core::storage::partition::PartitionGranularity::Hour,
+    ));
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry
+        .register_pv("PV:Walk", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+
+    // Two samples: t=10 and t=100.
+    let base = std::time::SystemTime::now() - std::time::Duration::from_secs(200);
+    for (offset, val) in [(10u64, 1.0), (100u64, 2.0)] {
+        let s = ArchiverSample::new(base + std::time::Duration::from_secs(offset), ArchiverValue::ScalarDouble(val));
+        storage
+            .append_event_with_meta("PV:Walk", ArchDbType::ScalarDouble, &s, &AppendMeta::default())
+            .await
+            .unwrap();
+    }
+    storage.flush_writes().await.unwrap();
+
+    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
+        .await
+        .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
+    let repo = Arc::new(RegistryRepository::new(registry));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
+    let state = AppState {
+        storage,
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
+        cluster: None,
+        api_keys: None,
+        cluster_api_key: None,
+        metrics_handle: None,
+        rate_limiter: None,
+        trust_proxy_headers: false,
+        failover: None,
+        etl_chain: Vec::new(),
+    };
+    let app = build_router(state, &SecurityConfig::default());
+
+    // Query for time between samples — should pick t=10 (last <= target).
+    let target = base + std::time::Duration::from_secs(50);
+    let target_iso = chrono::DateTime::<chrono::Utc>::from(target).to_rfc3339();
+    let body = serde_json::json!(["PV:Walk"]).to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/retrieval/data/getDataAtTime?at={}", urlencoding::encode(&target_iso)))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["PV:Walk"]["val"], 1.0);
+}
+
+#[tokio::test]
+async fn test_d_update_archive_fields_concurrent_no_duplicate_tasks() {
+    use std::sync::Arc;
+    let (_app, registry, _dir) = build_test_app_with_pvs().await;
+    // Pause SIM:Sine so we can manipulate fields freely (engine accepts
+    // updates regardless of status; this is just for clarity).
+    registry.set_status("SIM:Sine", PvStatus::Paused).unwrap();
+
+    // Hit update_archive_fields concurrently 16 times with overlapping sets.
+    // The per-PV update_lock should serialise them; final state must reflect
+    // the last writer, and field_tokens count should equal the final field
+    // set (no orphans).
+    //
+    // We can't observe field_tokens directly through the public API, but we
+    // can at least verify the registry persists the last update correctly.
+    let cm = Arc::new({
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(PlainPbStoragePlugin::new(
+            "sts",
+            dir.path().to_path_buf(),
+            archiver_core::storage::partition::PartitionGranularity::Hour,
+        ));
+        let (cm, _rx) = ChannelManager::new(storage, registry.clone(), None).await.unwrap();
+        cm
+    });
+
+    let mut handles = Vec::new();
+    for i in 0..16 {
+        let cm = cm.clone();
+        let fields: Vec<String> = if i % 2 == 0 {
+            vec!["HIHI".into(), "LOLO".into()]
+        } else {
+            vec!["EGU".into(), "PREC".into()]
+        };
+        handles.push(tokio::spawn(async move {
+            cm.update_archive_fields("SIM:Sine", &fields).await.unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    // Final registry state matches one of the two sets (whichever ran last).
+    let r = registry.get_pv("SIM:Sine").unwrap().unwrap();
+    assert!(
+        r.archive_fields == vec!["HIHI".to_string(), "LOLO".to_string()]
+            || r.archive_fields == vec!["EGU".to_string(), "PREC".to_string()],
+    );
 }
