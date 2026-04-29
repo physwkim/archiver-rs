@@ -48,7 +48,12 @@ pub async fn get_pv_status(
     State(state): State<AppState>,
     Query(params): Query<PvStatusParams>,
 ) -> Result<impl IntoResponse, ApiError> {
-    match state.pv_query.get_pv(&params.pv).map_err(ApiError::internal)? {
+    // Resolve aliases so getPVStatus?pv=Alias returns the target's status.
+    let canonical = state
+        .pv_query
+        .canonical_name(&params.pv)
+        .unwrap_or_else(|_| params.pv.clone());
+    match state.pv_query.get_pv(&canonical).map_err(ApiError::internal)? {
         Some(record) => {
             let status_str = match record.status {
                 PvStatus::Active => "Being archived",

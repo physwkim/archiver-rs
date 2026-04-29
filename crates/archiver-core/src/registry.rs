@@ -83,6 +83,14 @@ pub struct PvRecord {
     pub updated_at: DateTime<Utc>,
     pub prec: Option<String>,
     pub egu: Option<String>,
+    /// When set, this row is an alias pointing at another PV name.
+    /// Lookups should resolve to that target before reading/writing data.
+    pub alias_for: Option<String>,
+    /// Names of EPICS metadata fields (e.g. ["HIHI","LOLO","EGU"]) that the
+    /// engine should sample alongside the main value and attach to events.
+    pub archive_fields: Vec<String>,
+    /// Name of the policy that selected this PV's sampling configuration.
+    pub policy_name: Option<String>,
 }
 
 /// SQLite-backed PV metadata registry.
@@ -119,6 +127,8 @@ impl PvRegistry {
 
     fn init_schema(&self) -> anyhow::Result<()> {
         let conn = self.lock_conn()?;
+        // Step 1: create the table (idempotent) and indexes that don't depend
+        // on columns added by later migrations.
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS pv_info (
@@ -132,18 +142,34 @@ impl PvRegistry {
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL,
                 prec            TEXT,
-                egu             TEXT
+                egu             TEXT,
+                alias_for       TEXT,
+                archive_fields  TEXT,
+                policy_name     TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_pv_status ON pv_info(status);
             CREATE INDEX IF NOT EXISTS idx_pv_prefix ON pv_info(pv_name COLLATE NOCASE);
             ",
         )?;
-        // Migration: add prec/egu columns if table was created with old schema.
-        let _ = conn.execute_batch(
-            "ALTER TABLE pv_info ADD COLUMN prec TEXT;
-             ALTER TABLE pv_info ADD COLUMN egu TEXT;",
-        );
+        // Step 2: migrations for tables created with older schemas. Each statement
+        // runs independently because SQLite stops on the first duplicate-column
+        // error when batched.
+        for stmt in [
+            "ALTER TABLE pv_info ADD COLUMN prec TEXT",
+            "ALTER TABLE pv_info ADD COLUMN egu TEXT",
+            "ALTER TABLE pv_info ADD COLUMN alias_for TEXT",
+            "ALTER TABLE pv_info ADD COLUMN archive_fields TEXT",
+            "ALTER TABLE pv_info ADD COLUMN policy_name TEXT",
+        ] {
+            let _ = conn.execute(stmt, []);
+        }
+        // Step 3: indexes that reference newly-added columns. Done after ALTER
+        // so an upgraded database has the columns to index.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_pv_alias \
+             ON pv_info(alias_for) WHERE alias_for IS NOT NULL;",
+        )?;
         info!("PV registry schema initialized");
         Ok(())
     }
@@ -208,7 +234,8 @@ impl PvRegistry {
         let conn = self.lock_conn()?;
         conn.query_row(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-                    last_timestamp, created_at, updated_at, prec, egu
+                    last_timestamp, created_at, updated_at, prec, egu,
+                    alias_for, archive_fields, policy_name
              FROM pv_info WHERE pv_name = ?1",
             params![pv_name],
             row_to_record,
@@ -232,7 +259,8 @@ impl PvRegistry {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-                    last_timestamp, created_at, updated_at, prec, egu
+                    last_timestamp, created_at, updated_at, prec, egu,
+                    alias_for, archive_fields, policy_name
              FROM pv_info WHERE status = ?1 ORDER BY pv_name",
         )?;
         let records = stmt
@@ -294,7 +322,8 @@ impl PvRegistry {
         let since_str = DateTime::<Utc>::from(since).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-                    last_timestamp, created_at, updated_at, prec, egu
+                    last_timestamp, created_at, updated_at, prec, egu,
+                    alias_for, archive_fields, policy_name
              FROM pv_info WHERE created_at >= ?1 ORDER BY created_at DESC",
         )?;
         let records = stmt
@@ -309,7 +338,8 @@ impl PvRegistry {
         let since_str = DateTime::<Utc>::from(since).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-                    last_timestamp, created_at, updated_at, prec, egu
+                    last_timestamp, created_at, updated_at, prec, egu,
+                    alias_for, archive_fields, policy_name
              FROM pv_info WHERE updated_at >= ?1 ORDER BY updated_at DESC",
         )?;
         let records = stmt
@@ -359,17 +389,25 @@ impl PvRegistry {
         created_at: Option<&str>,
         prec: Option<&str>,
         egu: Option<&str>,
+        alias_for: Option<&str>,
+        archive_fields: &[String],
+        policy_name: Option<&str>,
     ) -> anyhow::Result<()> {
         let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let (mode_str, period) = sample_mode.to_db();
         let created = created_at.unwrap_or(&now);
+        let archive_fields_json = if archive_fields.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(archive_fields)?)
+        };
 
         conn.execute(
             "INSERT OR REPLACE INTO pv_info
              (pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-              created_at, updated_at, prec, egu)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              created_at, updated_at, prec, egu, alias_for, archive_fields, policy_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 pv_name,
                 dbr_type as i32,
@@ -381,9 +419,161 @@ impl PvRegistry {
                 now,
                 prec,
                 egu,
+                alias_for,
+                archive_fields_json,
+                policy_name,
             ],
         )?;
         Ok(())
+    }
+
+    /// Set or clear the archive_fields list for a PV.
+    pub fn update_archive_fields(
+        &self,
+        pv_name: &str,
+        fields: &[String],
+    ) -> anyhow::Result<bool> {
+        let conn = self.lock_conn()?;
+        let now = Utc::now().to_rfc3339();
+        let json = if fields.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(fields)?)
+        };
+        let rows = conn.execute(
+            "UPDATE pv_info SET archive_fields = ?1, updated_at = ?2 WHERE pv_name = ?3",
+            params![json, now, pv_name],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Set or clear the policy_name on a PV.
+    pub fn update_policy_name(
+        &self,
+        pv_name: &str,
+        policy_name: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let conn = self.lock_conn()?;
+        let now = Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE pv_info SET policy_name = ?1, updated_at = ?2 WHERE pv_name = ?3",
+            params![policy_name, now, pv_name],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Add an alias `alias` that points at the existing PV `target`.
+    /// Fails if target does not exist or if `alias` already maps elsewhere.
+    /// The alias row mirrors target's dbr_type/sample_mode/element_count for
+    /// display, but `alias_for` distinguishes it from real PVs.
+    pub fn add_alias(&self, alias: &str, target: &str) -> anyhow::Result<()> {
+        if alias == target {
+            anyhow::bail!("alias and target must differ");
+        }
+        let conn = self.lock_conn()?;
+        // Resolve target (must be a real PV, not itself an alias).
+        let row: Option<(i32, String, f64, i32, Option<String>)> = conn
+            .query_row(
+                "SELECT dbr_type, sample_mode, sample_period, element_count, alias_for
+                 FROM pv_info WHERE pv_name = ?1",
+                params![target],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let (dbr_type, mode, period, ec, target_alias) = row
+            .ok_or_else(|| anyhow::anyhow!("target PV '{target}' not found"))?;
+        if target_alias.is_some() {
+            anyhow::bail!("target PV '{target}' is itself an alias; aliases of aliases are not allowed");
+        }
+        // Reject if `alias` already exists either as a real PV or different alias.
+        let existing: Option<Option<String>> = conn
+            .query_row(
+                "SELECT alias_for FROM pv_info WHERE pv_name = ?1",
+                params![alias],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(existing_alias) = existing {
+            if existing_alias.as_deref() == Some(target) {
+                return Ok(()); // idempotent
+            }
+            anyhow::bail!("'{alias}' already exists in registry");
+        }
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO pv_info
+             (pv_name, dbr_type, sample_mode, sample_period, status, element_count,
+              created_at, updated_at, alias_for)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?6, ?7)",
+            params![alias, dbr_type, mode, period, ec, now, target],
+        )?;
+        Ok(())
+    }
+
+    /// Remove an alias row. Returns true if removed, false if the row was not
+    /// an alias or did not exist. Real PVs are not removed by this method.
+    pub fn remove_alias(&self, alias: &str) -> anyhow::Result<bool> {
+        let conn = self.lock_conn()?;
+        let rows = conn.execute(
+            "DELETE FROM pv_info WHERE pv_name = ?1 AND alias_for IS NOT NULL",
+            params![alias],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// If `name` is an alias, return its target. Returns None if `name` is
+    /// already a real PV or does not exist.
+    pub fn resolve_alias(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.lock_conn()?;
+        let row: Option<Option<String>> = conn
+            .query_row(
+                "SELECT alias_for FROM pv_info WHERE pv_name = ?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.flatten())
+    }
+
+    /// Return the canonical PV name. If `name` is an alias, returns the target;
+    /// otherwise returns the input unchanged. Used by lookup/retrieval paths.
+    pub fn canonical_name(&self, name: &str) -> anyhow::Result<String> {
+        Ok(self.resolve_alias(name)?.unwrap_or_else(|| name.to_string()))
+    }
+
+    /// List all alias names pointing at a given target PV.
+    pub fn aliases_for(&self, target: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT pv_name FROM pv_info WHERE alias_for = ?1 ORDER BY pv_name",
+        )?;
+        let names = stmt
+            .query_map(params![target], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(names)
+    }
+
+    /// All `(alias, target)` pairs in the registry.
+    pub fn all_aliases(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT pv_name, alias_for FROM pv_info
+             WHERE alias_for IS NOT NULL ORDER BY pv_name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// All PV names including aliases (`getAllExpandedPVNames`).
+    pub fn expanded_pv_names(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare("SELECT pv_name FROM pv_info ORDER BY pv_name")?;
+        let names = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(names)
     }
 
     /// Get all PV records (for export).
@@ -391,7 +581,8 @@ impl PvRegistry {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-                    last_timestamp, created_at, updated_at, prec, egu
+                    last_timestamp, created_at, updated_at, prec, egu,
+                    alias_for, archive_fields, policy_name
              FROM pv_info ORDER BY pv_name",
         )?;
         let records = stmt
@@ -410,7 +601,8 @@ impl PvRegistry {
         let cutoff_str = DateTime::<Utc>::from(cutoff).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-                    last_timestamp, created_at, updated_at, prec, egu
+                    last_timestamp, created_at, updated_at, prec, egu,
+                    alias_for, archive_fields, policy_name
              FROM pv_info WHERE last_timestamp IS NOT NULL AND last_timestamp < ?1
              ORDER BY last_timestamp ASC",
         )?;
@@ -433,12 +625,20 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<PvRecord> {
     let updated_str: String = row.get(8)?;
     let prec: Option<String> = row.get(9).unwrap_or(None);
     let egu: Option<String> = row.get(10).unwrap_or(None);
+    let alias_for: Option<String> = row.get(11).unwrap_or(None);
+    let archive_fields_json: Option<String> = row.get(12).unwrap_or(None);
+    let policy_name: Option<String> = row.get(13).unwrap_or(None);
 
     let last_timestamp = last_ts_str.and_then(|s| {
         DateTime::parse_from_rfc3339(&s)
             .ok()
             .map(|dt| dt.with_timezone(&Utc).into())
     });
+
+    let archive_fields = archive_fields_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default();
 
     Ok(PvRecord {
         pv_name,
@@ -455,6 +655,9 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<PvRecord> {
             .unwrap_or_else(|_| Utc::now()),
         prec,
         egu,
+        alias_for,
+        archive_fields,
+        policy_name,
     })
 }
 
@@ -587,6 +790,191 @@ mod tests {
 
         let r = reg.get_pv("PV:Mode").unwrap().unwrap();
         assert_eq!(r.sample_mode, SampleMode::Scan { period_secs: 5.0 });
+    }
+
+    #[test]
+    fn test_archive_fields_roundtrip() {
+        let reg = PvRegistry::in_memory().unwrap();
+        reg.register_pv("PV:Fields", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+
+        // Default is empty.
+        let r = reg.get_pv("PV:Fields").unwrap().unwrap();
+        assert!(r.archive_fields.is_empty());
+
+        // Set and read back.
+        let fields = vec!["HIHI".to_string(), "LOLO".to_string(), "EGU".to_string()];
+        assert!(reg.update_archive_fields("PV:Fields", &fields).unwrap());
+        let r = reg.get_pv("PV:Fields").unwrap().unwrap();
+        assert_eq!(r.archive_fields, fields);
+
+        // Clearing with [] removes the JSON entry.
+        assert!(reg.update_archive_fields("PV:Fields", &[]).unwrap());
+        let r = reg.get_pv("PV:Fields").unwrap().unwrap();
+        assert!(r.archive_fields.is_empty());
+    }
+
+    #[test]
+    fn test_policy_name_roundtrip() {
+        let reg = PvRegistry::in_memory().unwrap();
+        reg.register_pv("PV:Pol", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+
+        let r = reg.get_pv("PV:Pol").unwrap().unwrap();
+        assert!(r.policy_name.is_none());
+
+        assert!(reg.update_policy_name("PV:Pol", Some("fast")).unwrap());
+        let r = reg.get_pv("PV:Pol").unwrap().unwrap();
+        assert_eq!(r.policy_name.as_deref(), Some("fast"));
+
+        assert!(reg.update_policy_name("PV:Pol", None).unwrap());
+        let r = reg.get_pv("PV:Pol").unwrap().unwrap();
+        assert!(r.policy_name.is_none());
+    }
+
+    #[test]
+    fn test_import_pv_with_alias_and_fields() {
+        let reg = PvRegistry::in_memory().unwrap();
+        let fields = vec!["HIHI".to_string(), "LOLO".to_string()];
+        reg.import_pv(
+            "PV:Aliased",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+            PvStatus::Active,
+            None,
+            Some("3"),
+            Some("mA"),
+            Some("PV:Real"),
+            &fields,
+            Some("ring"),
+        )
+        .unwrap();
+
+        let r = reg.get_pv("PV:Aliased").unwrap().unwrap();
+        assert_eq!(r.alias_for.as_deref(), Some("PV:Real"));
+        assert_eq!(r.archive_fields, fields);
+        assert_eq!(r.policy_name.as_deref(), Some("ring"));
+        assert_eq!(r.prec.as_deref(), Some("3"));
+        assert_eq!(r.egu.as_deref(), Some("mA"));
+    }
+
+    #[test]
+    fn test_migration_from_old_schema() {
+        // Build a connection with the v0.1.4 schema (no alias/archive_fields/policy)
+        // to verify ALTER TABLE migrations succeed and old rows decode cleanly.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pv_info (
+                pv_name        TEXT PRIMARY KEY NOT NULL,
+                dbr_type       INTEGER NOT NULL,
+                sample_mode    TEXT NOT NULL DEFAULT 'monitor',
+                sample_period  REAL NOT NULL DEFAULT 0.0,
+                status         TEXT NOT NULL DEFAULT 'active',
+                element_count  INTEGER NOT NULL DEFAULT 1,
+                last_timestamp TEXT,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL,
+                prec           TEXT,
+                egu            TEXT
+            );",
+        )
+        .unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO pv_info
+             (pv_name, dbr_type, sample_mode, sample_period, status, element_count,
+              created_at, updated_at, prec, egu)
+             VALUES (?1, ?2, 'monitor', 0.0, 'active', 1, ?3, ?3, NULL, NULL)",
+            params!["PV:Legacy", ArchDbType::ScalarDouble as i32, now],
+        )
+        .unwrap();
+
+        let reg = PvRegistry {
+            conn: Mutex::new(conn),
+        };
+        // Re-running init_schema should add the new columns without dropping data.
+        reg.init_schema().unwrap();
+
+        let r = reg.get_pv("PV:Legacy").unwrap().unwrap();
+        assert_eq!(r.pv_name, "PV:Legacy");
+        assert!(r.alias_for.is_none());
+        assert!(r.archive_fields.is_empty());
+        assert!(r.policy_name.is_none());
+
+        // New writes work too.
+        assert!(reg
+            .update_archive_fields("PV:Legacy", &["HIHI".to_string()])
+            .unwrap());
+        let r = reg.get_pv("PV:Legacy").unwrap().unwrap();
+        assert_eq!(r.archive_fields, vec!["HIHI".to_string()]);
+    }
+
+    #[test]
+    fn test_aliases_basic() {
+        let reg = PvRegistry::in_memory().unwrap();
+        reg.register_pv("RING:Current", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+
+        // Add an alias and verify resolution.
+        reg.add_alias("DEV:Current", "RING:Current").unwrap();
+        assert_eq!(
+            reg.resolve_alias("DEV:Current").unwrap().as_deref(),
+            Some("RING:Current"),
+        );
+        assert!(reg.resolve_alias("RING:Current").unwrap().is_none()); // real PV
+        assert!(reg.resolve_alias("Nonexistent").unwrap().is_none());
+
+        assert_eq!(reg.canonical_name("DEV:Current").unwrap(), "RING:Current");
+        assert_eq!(reg.canonical_name("RING:Current").unwrap(), "RING:Current");
+
+        // Aliases for / all aliases.
+        assert_eq!(
+            reg.aliases_for("RING:Current").unwrap(),
+            vec!["DEV:Current".to_string()],
+        );
+        assert_eq!(
+            reg.all_aliases().unwrap(),
+            vec![("DEV:Current".to_string(), "RING:Current".to_string())],
+        );
+
+        // Expanded names contains both real and alias.
+        let expanded = reg.expanded_pv_names().unwrap();
+        assert!(expanded.contains(&"RING:Current".to_string()));
+        assert!(expanded.contains(&"DEV:Current".to_string()));
+
+        // Idempotent re-add.
+        reg.add_alias("DEV:Current", "RING:Current").unwrap();
+        assert_eq!(reg.aliases_for("RING:Current").unwrap().len(), 1);
+
+        // Remove alias.
+        assert!(reg.remove_alias("DEV:Current").unwrap());
+        assert!(reg.resolve_alias("DEV:Current").unwrap().is_none());
+        assert!(!reg.remove_alias("DEV:Current").unwrap()); // already gone
+    }
+
+    #[test]
+    fn test_alias_conflicts() {
+        let reg = PvRegistry::in_memory().unwrap();
+        reg.register_pv("PV:A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+        reg.register_pv("PV:B", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+
+        // Cannot alias to nonexistent target.
+        assert!(reg.add_alias("Alias:X", "Nonexistent").is_err());
+
+        // Cannot self-alias.
+        assert!(reg.add_alias("PV:A", "PV:A").is_err());
+
+        // Alias name conflicts with existing real PV.
+        assert!(reg.add_alias("PV:B", "PV:A").is_err());
+
+        // Alias of alias not allowed.
+        reg.add_alias("Alias:A", "PV:A").unwrap();
+        assert!(reg.add_alias("Alias:Two", "Alias:A").is_err());
+
+        // remove_alias does NOT delete real PVs.
+        assert!(!reg.remove_alias("PV:A").unwrap());
+        assert!(reg.get_pv("PV:A").unwrap().is_some());
     }
 
     #[test]

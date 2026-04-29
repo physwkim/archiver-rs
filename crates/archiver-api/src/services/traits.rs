@@ -17,6 +17,12 @@ pub trait PvQueryRepository: Send + Sync {
     fn recently_added_pvs(&self, since: SystemTime) -> anyhow::Result<Vec<PvRecord>>;
     fn recently_modified_pvs(&self, since: SystemTime) -> anyhow::Result<Vec<PvRecord>>;
     fn silent_pvs(&self, threshold: Duration) -> anyhow::Result<Vec<PvRecord>>;
+    /// Return canonical PV name: if `name` is an alias, return its target;
+    /// otherwise return the input unchanged. Used by lookup paths.
+    fn canonical_name(&self, name: &str) -> anyhow::Result<String>;
+    fn aliases_for(&self, target: &str) -> anyhow::Result<Vec<String>>;
+    fn all_aliases(&self) -> anyhow::Result<Vec<(String, String)>>;
+    fn expanded_pv_names(&self) -> anyhow::Result<Vec<String>>;
 }
 
 // --- PvCommandRepository (sync — write operations) ---
@@ -38,7 +44,15 @@ pub trait PvCommandRepository: Send + Sync {
         created_at: Option<&str>,
         prec: Option<&str>,
         egu: Option<&str>,
+        alias_for: Option<&str>,
+        archive_fields: &[String],
+        policy_name: Option<&str>,
     ) -> anyhow::Result<()>;
+
+    fn update_archive_fields(&self, pv: &str, fields: &[String]) -> anyhow::Result<bool>;
+    fn update_policy_name(&self, pv: &str, policy_name: Option<&str>) -> anyhow::Result<bool>;
+    fn add_alias(&self, alias: &str, target: &str) -> anyhow::Result<()>;
+    fn remove_alias(&self, alias: &str) -> anyhow::Result<bool>;
 }
 
 // --- ArchiverQuery (sync — read-only operations on archiver engine) ---

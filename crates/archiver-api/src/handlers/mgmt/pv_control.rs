@@ -220,6 +220,18 @@ async fn archive_single_pv(
 ) -> Response {
     let is_proxied = headers.get("X-Archiver-Proxied").is_some();
 
+    // Refuse to archive PVs whose name already exists as an alias — the user
+    // should archive the target PV directly. (Aliases are added with addAlias
+    // after archiving the real PV.)
+    if let Ok(Some(target)) = state.pv_query.canonical_name(pv).map(|c| {
+        if c != pv { Some(c) } else { None }
+    }) {
+        return ApiError::Conflict(format!(
+            "'{pv}' is an alias for '{target}'; archive the target PV instead",
+        ))
+        .into_response();
+    }
+
     if !is_proxied {
         if let Some(target) = appliance
             && let Some(ref cluster) = state.cluster

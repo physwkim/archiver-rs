@@ -43,6 +43,9 @@ pub fn import_config(
             r.created_at.as_deref(),
             r.prec.as_deref(),
             r.egu.as_deref(),
+            r.alias_for.as_deref(),
+            r.archive_fields.as_deref().unwrap_or(&[]),
+            r.policy_name.as_deref(),
         ) {
             Ok(()) => imported += 1,
             Err(e) => {

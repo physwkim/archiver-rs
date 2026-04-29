@@ -119,6 +119,12 @@ pub struct PvTypeInfoResponse {
     pub egu: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    #[serde(rename = "aliasFor", skip_serializing_if = "Option::is_none")]
+    pub alias_for: Option<String>,
+    #[serde(rename = "archiveFields", skip_serializing_if = "Vec::is_empty", default)]
+    pub archive_fields: Vec<String>,
+    #[serde(rename = "policyName", skip_serializing_if = "Option::is_none")]
+    pub policy_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -141,6 +147,15 @@ pub struct ExportRecord {
     pub status: Option<String>,
     #[serde(rename = "createdAt", skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    /// When set, the row is an alias pointing at this target PV name.
+    #[serde(rename = "aliasFor", skip_serializing_if = "Option::is_none", default)]
+    pub alias_for: Option<String>,
+    /// EPICS metadata field names archived alongside the value (.HIHI/.LOLO/...).
+    #[serde(rename = "archiveFields", skip_serializing_if = "Option::is_none", default)]
+    pub archive_fields: Option<Vec<String>>,
+    /// Policy that selected the sampling configuration for this PV.
+    #[serde(rename = "policyName", skip_serializing_if = "Option::is_none", default)]
+    pub policy_name: Option<String>,
 }
 
 // --- Conversion functions ---
@@ -195,5 +210,8 @@ pub fn record_to_type_info(r: &PvRecord) -> PvTypeInfoResponse {
         prec: r.prec.clone(),
         egu: r.egu.clone(),
         created_at: r.created_at.to_rfc3339(),
+        alias_for: r.alias_for.clone(),
+        archive_fields: r.archive_fields.clone(),
+        policy_name: r.policy_name.clone(),
     }
 }

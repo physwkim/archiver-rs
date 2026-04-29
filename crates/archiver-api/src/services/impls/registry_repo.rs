@@ -52,6 +52,22 @@ impl PvQueryRepository for RegistryRepository {
     fn silent_pvs(&self, threshold: Duration) -> anyhow::Result<Vec<PvRecord>> {
         self.inner.silent_pvs(threshold)
     }
+
+    fn canonical_name(&self, name: &str) -> anyhow::Result<String> {
+        self.inner.canonical_name(name)
+    }
+
+    fn aliases_for(&self, target: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.aliases_for(target)
+    }
+
+    fn all_aliases(&self) -> anyhow::Result<Vec<(String, String)>> {
+        self.inner.all_aliases()
+    }
+
+    fn expanded_pv_names(&self) -> anyhow::Result<Vec<String>> {
+        self.inner.expanded_pv_names()
+    }
 }
 
 impl PvCommandRepository for RegistryRepository {
@@ -85,7 +101,38 @@ impl PvCommandRepository for RegistryRepository {
         created_at: Option<&str>,
         prec: Option<&str>,
         egu: Option<&str>,
+        alias_for: Option<&str>,
+        archive_fields: &[String],
+        policy_name: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.inner.import_pv(pv, dbr_type, mode, element_count, status, created_at, prec, egu)
+        self.inner.import_pv(
+            pv,
+            dbr_type,
+            mode,
+            element_count,
+            status,
+            created_at,
+            prec,
+            egu,
+            alias_for,
+            archive_fields,
+            policy_name,
+        )
+    }
+
+    fn update_archive_fields(&self, pv: &str, fields: &[String]) -> anyhow::Result<bool> {
+        self.inner.update_archive_fields(pv, fields)
+    }
+
+    fn update_policy_name(&self, pv: &str, policy_name: Option<&str>) -> anyhow::Result<bool> {
+        self.inner.update_policy_name(pv, policy_name)
+    }
+
+    fn add_alias(&self, alias: &str, target: &str) -> anyhow::Result<()> {
+        self.inner.add_alias(alias, target)
+    }
+
+    fn remove_alias(&self, alias: &str) -> anyhow::Result<bool> {
+        self.inner.remove_alias(alias)
     }
 }

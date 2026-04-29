@@ -119,6 +119,39 @@ impl PvQueryRepository for InMemoryPvRepository {
             .collect();
         Ok(records)
     }
+
+    fn canonical_name(&self, name: &str) -> anyhow::Result<String> {
+        let lock = self.pvs.lock().unwrap();
+        Ok(lock
+            .get(name)
+            .and_then(|r| r.alias_for.clone())
+            .unwrap_or_else(|| name.to_string()))
+    }
+
+    fn aliases_for(&self, target: &str) -> anyhow::Result<Vec<String>> {
+        let lock = self.pvs.lock().unwrap();
+        let mut names: Vec<String> = lock
+            .values()
+            .filter(|r| r.alias_for.as_deref() == Some(target))
+            .map(|r| r.pv_name.clone())
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    fn all_aliases(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let lock = self.pvs.lock().unwrap();
+        let mut pairs: Vec<(String, String)> = lock
+            .values()
+            .filter_map(|r| r.alias_for.clone().map(|t| (r.pv_name.clone(), t)))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(pairs)
+    }
+
+    fn expanded_pv_names(&self) -> anyhow::Result<Vec<String>> {
+        self.all_pv_names()
+    }
 }
 
 impl PvCommandRepository for InMemoryPvRepository {
@@ -141,6 +174,9 @@ impl PvCommandRepository for InMemoryPvRepository {
             last_timestamp: None,
             prec: None,
             egu: None,
+            alias_for: None,
+            archive_fields: Vec::new(),
+            policy_name: None,
         };
         self.pvs.lock().unwrap().insert(pv.to_string(), record);
         Ok(())
@@ -197,6 +233,9 @@ impl PvCommandRepository for InMemoryPvRepository {
         created_at: Option<&str>,
         prec: Option<&str>,
         egu: Option<&str>,
+        alias_for: Option<&str>,
+        archive_fields: &[String],
+        policy_name: Option<&str>,
     ) -> anyhow::Result<()> {
         let created = created_at
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -215,8 +254,81 @@ impl PvCommandRepository for InMemoryPvRepository {
             last_timestamp: None,
             prec: prec.map(|s| s.to_string()),
             egu: egu.map(|s| s.to_string()),
+            alias_for: alias_for.map(|s| s.to_string()),
+            archive_fields: archive_fields.to_vec(),
+            policy_name: policy_name.map(|s| s.to_string()),
         };
         self.pvs.lock().unwrap().insert(pv.to_string(), record);
         Ok(())
+    }
+
+    fn update_archive_fields(&self, pv: &str, fields: &[String]) -> anyhow::Result<bool> {
+        if let Some(record) = self.pvs.lock().unwrap().get_mut(pv) {
+            record.archive_fields = fields.to_vec();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn update_policy_name(&self, pv: &str, policy_name: Option<&str>) -> anyhow::Result<bool> {
+        if let Some(record) = self.pvs.lock().unwrap().get_mut(pv) {
+            record.policy_name = policy_name.map(|s| s.to_string());
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn add_alias(&self, alias: &str, target: &str) -> anyhow::Result<()> {
+        if alias == target {
+            anyhow::bail!("alias and target must differ");
+        }
+        let mut lock = self.pvs.lock().unwrap();
+        let target_record = lock
+            .get(target)
+            .ok_or_else(|| anyhow::anyhow!("target PV '{target}' not found"))?
+            .clone();
+        if target_record.alias_for.is_some() {
+            anyhow::bail!("target '{target}' is itself an alias");
+        }
+        if let Some(existing) = lock.get(alias) {
+            if existing.alias_for.as_deref() == Some(target) {
+                return Ok(());
+            }
+            anyhow::bail!("'{alias}' already exists in registry");
+        }
+        let now = chrono::Utc::now();
+        let row = PvRecord {
+            pv_name: alias.to_string(),
+            dbr_type: target_record.dbr_type,
+            sample_mode: target_record.sample_mode.clone(),
+            element_count: target_record.element_count,
+            status: PvStatus::Active,
+            created_at: now,
+            updated_at: now,
+            last_timestamp: None,
+            prec: None,
+            egu: None,
+            alias_for: Some(target.to_string()),
+            archive_fields: Vec::new(),
+            policy_name: None,
+        };
+        lock.insert(alias.to_string(), row);
+        Ok(())
+    }
+
+    fn remove_alias(&self, alias: &str) -> anyhow::Result<bool> {
+        let mut lock = self.pvs.lock().unwrap();
+        let is_alias = lock
+            .get(alias)
+            .map(|r| r.alias_for.is_some())
+            .unwrap_or(false);
+        if is_alias {
+            lock.remove(alias);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }

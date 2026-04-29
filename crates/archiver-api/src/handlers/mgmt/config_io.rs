@@ -20,6 +20,11 @@ pub async fn export_config(
                 SampleMode::Scan { period_secs } => ("Scan".to_string(), *period_secs),
             };
             let status_str = r.status.as_str().to_string();
+            let archive_fields = if r.archive_fields.is_empty() {
+                None
+            } else {
+                Some(r.archive_fields)
+            };
             ExportRecord {
                 pv_name: r.pv_name,
                 dbr_type: r.dbr_type as i32,
@@ -30,6 +35,9 @@ pub async fn export_config(
                 egu: r.egu,
                 status: Some(status_str),
                 created_at: Some(r.created_at.to_rfc3339()),
+                alias_for: r.alias_for,
+                archive_fields,
+                policy_name: r.policy_name,
             }
         })
         .collect();

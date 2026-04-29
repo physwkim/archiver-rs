@@ -131,6 +131,15 @@ struct RetrievalParams {
     limit: Option<usize>,
 }
 
+/// If the requested PV is an alias, return its target. Falls back to the input
+/// on errors so proxying can still route to a peer that may know the name.
+fn resolve_alias(state: &AppState, name: &str) -> String {
+    state
+        .pv_query
+        .canonical_name(name)
+        .unwrap_or_else(|_| name.to_string())
+}
+
 /// Parse and validate common retrieval parameters.
 fn parse_retrieval_params(params: &GetDataParams) -> RetrievalParams {
     let (pv_name, pp_spec) = parse_pv_spec(&params.pv);
@@ -306,7 +315,8 @@ async fn get_data_json(
     headers: HeaderMap,
     Query(params): Query<GetDataParams>,
 ) -> Response {
-    let rp = parse_retrieval_params(&params);
+    let mut rp = parse_retrieval_params(&params);
+    rp.pv_name = resolve_alias(&state, &rp.pv_name);
 
     if let Some(resp) = try_cluster_proxy(&state, &rp.pv_name, "data/getData.json", &headers, &uri).await {
         return resp;
@@ -411,7 +421,8 @@ async fn get_data_csv(
     headers: HeaderMap,
     Query(params): Query<GetDataParams>,
 ) -> Response {
-    let rp = parse_retrieval_params(&params);
+    let mut rp = parse_retrieval_params(&params);
+    rp.pv_name = resolve_alias(&state, &rp.pv_name);
 
     if let Some(resp) = try_cluster_proxy(&state, &rp.pv_name, "data/getData.csv", &headers, &uri).await {
         return resp;
@@ -477,7 +488,8 @@ async fn get_data_raw(
     headers: HeaderMap,
     Query(params): Query<GetDataParams>,
 ) -> Response {
-    let rp = parse_retrieval_params(&params);
+    let mut rp = parse_retrieval_params(&params);
+    rp.pv_name = resolve_alias(&state, &rp.pv_name);
 
     if let Some(resp) = try_cluster_proxy(&state, &rp.pv_name, "data/getData.raw", &headers, &uri).await {
         return resp;

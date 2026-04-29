@@ -775,3 +775,92 @@ async fn test_rate_limiter_isolates_by_ip() {
     let resp = app.clone().oneshot(req_b).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_add_alias_and_get_all_aliases() {
+    let (app, registry, _dir) = build_test_app_with_pvs().await;
+
+    // Add alias DEV:Sine -> SIM:Sine.
+    let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Sine");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify in registry directly.
+    assert_eq!(
+        registry.resolve_alias("DEV:Sine").unwrap().as_deref(),
+        Some("SIM:Sine"),
+    );
+
+    // getAllAliases returns the pair.
+    let req = get_request("/mgmt/bpl/getAllAliases");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["aliasName"], "DEV:Sine");
+    assert_eq!(arr[0]["srcPVName"], "SIM:Sine");
+
+    // getAllExpandedPVNames includes both alias and target.
+    let req = get_request("/mgmt/bpl/getAllExpandedPVNames");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let names: Vec<String> = serde_json::from_value(body_to_json(resp.into_body()).await).unwrap();
+    assert!(names.contains(&"DEV:Sine".to_string()));
+    assert!(names.contains(&"SIM:Sine".to_string()));
+}
+
+#[tokio::test]
+async fn test_remove_alias() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+
+    let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Cosine&aliasname=DEV:Cos");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = get_request("/mgmt/bpl/removeAlias?pv=SIM:Cosine&aliasname=DEV:Cos");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["status"], "ok");
+
+    // Removing again returns not_found.
+    let req = get_request("/mgmt/bpl/removeAlias?pv=SIM:Cosine&aliasname=DEV:Cos");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["status"], "not_found");
+}
+
+#[tokio::test]
+async fn test_get_pv_status_resolves_alias() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+
+    let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Foo");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Querying the alias returns the target's status.
+    let req = get_request("/mgmt/bpl/getPVStatus?pv=DEV:Foo");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["pv_name"], "SIM:Sine");
+    assert_eq!(body["status"], "Being archived");
+}
+
+#[tokio::test]
+async fn test_archive_pv_rejects_alias_name() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+
+    let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Bar");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // POST archivePV with the alias name should be rejected.
+    let body = serde_json::json!({"pv": "DEV:Bar"}).to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/archivePV")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}

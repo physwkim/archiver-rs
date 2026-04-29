@@ -1,3 +1,4 @@
+mod aliases;
 mod config_io;
 mod pv_control;
 mod pv_query;
@@ -36,6 +37,13 @@ pub fn routes() -> Router<AppState> {
         .route("/mgmt/bpl/abortArchivingPV", get(pv_control::abort_archiving_pv))
         .route("/mgmt/bpl/exportConfig", get(config_io::export_config))
         .route("/mgmt/bpl/importConfig", post(config_io::import_config))
+        .route("/mgmt/bpl/addAlias", get(aliases::add_alias))
+        .route("/mgmt/bpl/removeAlias", get(aliases::remove_alias))
+        .route("/mgmt/bpl/getAllAliases", get(aliases::get_all_aliases))
+        .route(
+            "/mgmt/bpl/getAllExpandedPVNames",
+            get(aliases::get_all_expanded_pv_names),
+        )
 }
 
 /// Try to forward a management GET request to the peer that owns the PV.
