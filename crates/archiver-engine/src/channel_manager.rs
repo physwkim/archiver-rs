@@ -989,6 +989,15 @@ fn spawn_extra_field_monitor(
             );
         }
 
+        // Exponential backoff for misconfigured fields (e.g. operator
+        // listed `.HIHI` on a PV that doesn't expose it). Without this
+        // we'd retry every 5s forever, churning CA search packets and
+        // file descriptors. The cap is 60s; one warn at the cap so
+        // ops know to fix archive_fields.
+        let mut backoff = CA_RETRY_DELAY;
+        let max_backoff = Duration::from_secs(60);
+        let mut warned_at_cap = false;
+
         loop {
             // Cancel-aware subscribe attempt.
             tokio::select! {
@@ -1000,14 +1009,30 @@ fn spawn_extra_field_monitor(
                             debug!(
                                 pv = pv_owned,
                                 field = field_owned,
+                                ?backoff,
                                 "Extra-field subscribe failed: {e}; retrying"
                             );
+                            if backoff >= max_backoff && !warned_at_cap {
+                                warn!(
+                                    pv = pv_owned,
+                                    field = field_owned,
+                                    "Extra-field repeatedly fails to subscribe; \
+                                     check archive_fields config (now retrying every 60s)"
+                                );
+                                warned_at_cap = true;
+                            }
+                            let sleep_for = backoff;
+                            backoff = (backoff * 2).min(max_backoff);
                             tokio::select! {
                                 _ = parent_token.cancelled() => return,
-                                _ = tokio::time::sleep(CA_RETRY_DELAY) => continue,
+                                _ = tokio::time::sleep(sleep_for) => continue,
                             }
                         }
                     };
+                    // Subscribe succeeded — reset backoff so the next
+                    // failure starts at the short delay again.
+                    backoff = CA_RETRY_DELAY;
+                    warned_at_cap = false;
                     loop {
                         tokio::select! {
                             _ = parent_token.cancelled() => return,

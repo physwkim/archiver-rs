@@ -76,7 +76,27 @@ pub async fn append_and_alias_pv(
         return ApiError::internal(e).into_response();
     }
     if let Err(e) = state.pv_cmd.add_alias(&q.aliasname, &q.pv) {
-        return ApiError::BadRequest(format!("alias add failed after archive: {e}")).into_response();
+        // Roll back the archive so the caller doesn't end up with a
+        // half-applied state — they asked for "atomic archive + alias",
+        // not "archive without alias". destroy_pv tears down the
+        // monitor task and removes the registry row.
+        let alias_err = format!("{e}");
+        if let Err(cleanup_err) = state.archiver_cmd.destroy_pv(&q.pv) {
+            tracing::error!(
+                pv = q.pv,
+                "appendAndAliasPV: alias add failed AND archive rollback failed: \
+                 alias error: {alias_err}; cleanup error: {cleanup_err}"
+            );
+            return ApiError::Internal(format!(
+                "alias add failed ({alias_err}) and archive rollback also failed \
+                 ({cleanup_err}); manual cleanup needed"
+            ))
+            .into_response();
+        }
+        return ApiError::BadRequest(format!(
+            "alias add failed; archive rolled back: {alias_err}"
+        ))
+        .into_response();
     }
     axum::Json(serde_json::json!({
         "status": "ok",
