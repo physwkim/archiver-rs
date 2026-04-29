@@ -14,7 +14,7 @@ use prost::Message;
 use tracing::debug;
 
 use crate::storage::partition::PartitionGranularity;
-use crate::storage::traits::{AppendMeta, EventStream, StoragePlugin};
+use crate::storage::traits::{AppendMeta, EventStream, StoragePlugin, StoreSummary};
 use crate::types::{ArchDbType, ArchiverSample};
 
 use self::reader::PbFileReader;
@@ -398,4 +398,121 @@ impl StoragePlugin for PlainPbStoragePlugin {
         }
         Ok(())
     }
+
+    fn stores_for_pv(&self, pv: &str) -> anyhow::Result<Vec<StoreSummary>> {
+        let count = list_pv_pb_files(&self.root_folder, pv)
+            .map(|f| f.len() as u64)
+            .unwrap_or(0);
+        Ok(vec![StoreSummary {
+            name: self.plugin_name.clone(),
+            root_folder: self.root_folder.clone(),
+            granularity: self.granularity,
+            pv_file_count: Some(count),
+            total_size_bytes: None,
+            total_files: None,
+        }])
+    }
+
+    fn appliance_metrics(&self) -> anyhow::Result<Vec<StoreSummary>> {
+        let (total_files, total_size) = total_pb_stats(&self.root_folder);
+        Ok(vec![StoreSummary {
+            name: self.plugin_name.clone(),
+            root_folder: self.root_folder.clone(),
+            granularity: self.granularity,
+            pv_file_count: None,
+            total_size_bytes: Some(total_size),
+            total_files: Some(total_files),
+        }])
+    }
+
+    async fn rename_pv(&self, from: &str, to: &str) -> anyhow::Result<u64> {
+        // Evict any cached writers for the source PV so they don't keep an
+        // open handle on a soon-to-be-renamed file.
+        {
+            let mut cache = self.write_cache.lock()
+                .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
+            if let Some(mut cached) = cache.remove(from) {
+                let _ = cached.writer.flush();
+            }
+            // Also evict the destination cache entry if any (defensive).
+            if let Some(mut cached) = cache.remove(to) {
+                let _ = cached.writer.flush();
+            }
+        }
+
+        let from_files = list_pv_pb_files(&self.root_folder, from)?;
+        if from_files.is_empty() {
+            return Ok(0);
+        }
+        let from_key = pv_name_to_key(from);
+        let from_leaf = from_key.rsplit('/').next().unwrap_or(&from_key).to_string();
+        let to_key = pv_name_to_key(to);
+        let to_leaf = to_key.rsplit('/').next().unwrap_or(&to_key).to_string();
+
+        // Ensure destination parent directory exists so std::fs::rename can
+        // place files across PV-name prefixes (e.g. SIM:Sine -> RING:Current
+        // changes the parent dir from SIM/ to RING/).
+        let (to_dir_part, _) = pv_file_parts(to);
+        let to_dir = self.root_folder.join(&to_dir_part);
+        if !to_dir.as_os_str().is_empty() && !to_dir.exists() {
+            std::fs::create_dir_all(&to_dir)?;
+        }
+
+        let mut moved = 0u64;
+        for src in &from_files {
+            let file_name = src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| anyhow::anyhow!("non-utf8 filename: {src:?}"))?;
+            // file is "{from_leaf}:{partition}.pb" — replace the leaf prefix.
+            let suffix = file_name
+                .strip_prefix(&from_leaf)
+                .and_then(|s| s.strip_prefix(':'))
+                .ok_or_else(|| anyhow::anyhow!("filename {file_name} did not match expected PV leaf"))?;
+            let new_name = format!("{to_leaf}:{suffix}");
+            let dst = to_dir.join(new_name);
+            std::fs::rename(src, &dst)?;
+            moved += 1;
+        }
+
+        // Clean up empty source directory.
+        let (from_dir_part, _) = pv_file_parts(from);
+        let from_dir = self.root_folder.join(&from_dir_part);
+        if !from_dir_part.as_os_str().is_empty()
+            && from_dir.exists()
+            && std::fs::read_dir(&from_dir)?.next().is_none()
+        {
+            let _ = std::fs::remove_dir(&from_dir);
+        }
+
+        Ok(moved)
+    }
+}
+
+/// Sum sizes and counts of `.pb` files under `root` recursively. Errors are
+/// logged and ignored so a single unreadable file doesn't poison the metric.
+fn total_pb_stats(root: &Path) -> (u64, u64) {
+    fn walk(p: &Path, files: &mut u64, bytes: &mut u64) {
+        let entries = match std::fs::read_dir(p) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, files, bytes);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("pb") {
+                *files += 1;
+                if let Ok(meta) = entry.metadata() {
+                    *bytes += meta.len();
+                }
+            }
+        }
+    }
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    if root.exists() {
+        walk(root, &mut files, &mut bytes);
+    }
+    (files, bytes)
 }

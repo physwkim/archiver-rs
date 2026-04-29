@@ -93,4 +93,10 @@ impl ArchiverCommand for FakeArchiverControl {
         state.stopped.remove(pv);
         Ok(())
     }
+
+    async fn update_archive_fields(&self, _pv: &str, _fields: &[String]) -> anyhow::Result<()> {
+        // No-op for fakes — the command just persists to the registry which
+        // is exercised separately. The real engine respawns CA tasks here.
+        Ok(())
+    }
 }

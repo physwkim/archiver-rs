@@ -17,6 +17,11 @@ pub struct ArchiverConfig {
 
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
+    /// Optional list of external archivers used for failover-merged retrieval.
+    /// When set, retrieval handlers fetch from each peer in addition to local
+    /// data and merge by timestamp (with duplicate-timestamp drop).
+    #[serde(default)]
+    pub failover: Option<FailoverConfig>,
     /// Optional API keys for management endpoint authentication.
     /// If set, mgmt write endpoints require `Authorization: Bearer <key>` or `X-API-Key: <key>`.
     /// Retrieval GET endpoints remain open.
@@ -177,6 +182,27 @@ fn default_cache_ttl() -> u64 {
 }
 
 fn default_peer_timeout() -> u64 {
+    30
+}
+
+/// Failover retrieval configuration.
+///
+/// `peers` is a list of external archiver URLs serving the same Java-style
+/// retrieval endpoint (`/retrieval/data/getData.raw`). At query time, the
+/// archiver fetches the same `pv` + time range from each peer and merges
+/// the results with the local stream, dropping samples with duplicate
+/// timestamps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailoverConfig {
+    /// Per-peer retrieval base URLs (e.g. `https://archiver-b.example/retrieval`).
+    /// `getData.raw` is appended automatically.
+    pub peers: Vec<String>,
+    /// HTTP timeout per peer fetch (seconds).
+    #[serde(default = "default_failover_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_failover_timeout() -> u64 {
     30
 }
 

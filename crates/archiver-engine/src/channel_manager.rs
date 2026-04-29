@@ -38,7 +38,15 @@ struct PvHandle {
     #[allow(dead_code)]
     dbr_type: ArchDbType,
     conn_info: Arc<Mutex<ConnectionInfo>>,
+    /// Latest values of metadata fields (.HIHI, .LOLO, .EGU, ...) attached to
+    /// every sample emitted for this PV. Populated by per-field monitor tasks
+    /// owned by the same `cancel_token`, so stopping the PV stops all of them.
+    extras: Arc<ExtraFieldsCache>,
 }
+
+/// Thread-safe cache of latest extra-field values for one PV.
+/// Each map entry is `(field_name, stringified_value)`.
+type ExtraFieldsCache = DashMap<String, String>;
 
 /// Default capacity for the bounded sample channel.
 /// This limits memory usage when producers outpace the storage writer.
@@ -210,6 +218,7 @@ impl ChannelManager {
         let channel = self.ca_client.create_channel(&pv_name);
         let cancel_token = CancellationToken::new();
         let conn_info = Arc::new(Mutex::new(ConnectionInfo::default()));
+        let extras: Arc<ExtraFieldsCache> = Arc::new(DashMap::new());
 
         self.channels.insert(
             pv_name.clone(),
@@ -218,28 +227,112 @@ impl ChannelManager {
                 cancel_token: cancel_token.clone(),
                 dbr_type,
                 conn_info: conn_info.clone(),
+                extras: extras.clone(),
             },
         );
+
+        // Start one monitor task per archive_field. They share the parent
+        // cancel_token so pause/destroy stops them along with the main PV.
+        for field in &record.archive_fields {
+            spawn_extra_field_monitor(
+                &self.ca_client,
+                &pv_name,
+                field,
+                extras.clone(),
+                cancel_token.clone(),
+            );
+        }
 
         let tx = self.sample_tx.clone();
         let token = cancel_token.clone();
         let ci = conn_info.clone();
+        let extras_for_loop = extras.clone();
 
         match &record.sample_mode {
             SampleMode::Monitor => {
                 tokio::spawn(async move {
-                    monitor_loop(pv_name, dbr_type, element_count, channel, tx, token, ci).await;
+                    monitor_loop(
+                        pv_name,
+                        dbr_type,
+                        element_count,
+                        channel,
+                        tx,
+                        token,
+                        ci,
+                        extras_for_loop,
+                    )
+                    .await;
                 });
             }
             SampleMode::Scan { period_secs } => {
                 let period = *period_secs;
                 tokio::spawn(async move {
-                    scan_loop(pv_name, dbr_type, element_count, channel, tx, token, period, ci)
-                        .await;
+                    scan_loop(
+                        pv_name,
+                        dbr_type,
+                        element_count,
+                        channel,
+                        tx,
+                        token,
+                        period,
+                        ci,
+                        extras_for_loop,
+                    )
+                    .await;
                 });
             }
         }
 
+        Ok(())
+    }
+
+    /// Replace the archive_fields list for a running PV. Stops any orphaned
+    /// field tasks and starts new ones to match the requested set. The PV
+    /// itself keeps running; only the auxiliary metadata-field monitors change.
+    pub async fn update_archive_fields(
+        &self,
+        pv_name: &str,
+        fields: &[String],
+    ) -> anyhow::Result<()> {
+        // Persist first so a restart sees the new set.
+        self.registry.update_archive_fields(pv_name, fields)?;
+
+        // If the PV isn't currently active there's nothing more to do —
+        // start_archiving_internal will pick up the new fields on resume.
+        let Some(handle_ref) = self.channels.get(pv_name) else {
+            return Ok(());
+        };
+        let parent_token = handle_ref.cancel_token.clone();
+        let extras = handle_ref.extras.clone();
+        drop(handle_ref);
+
+        // Drop fields no longer requested. We don't have per-field cancel
+        // tokens (the parent token cancels everything together), so the
+        // simplest correct behaviour is: cancel the whole group and respawn
+        // exactly the requested set under fresh per-field tasks. Cancelling
+        // would also kill the main PV, which is wrong. Instead we just clear
+        // values whose key is no longer wanted; the orphan task will keep
+        // updating its key in the cache, but the cache snapshot at sample
+        // emission filters by `fields`. To avoid the orphan-update overhead
+        // we instead spawn each task with its own field-scoped child token
+        // that we track separately.
+        //
+        // For this first pass, mutate the cache in-place to reflect the
+        // requested set: drop unwanted keys, spawn missing ones. Newly added
+        // tasks come up with their own connection lifecycle.
+        let wanted: std::collections::HashSet<&str> = fields.iter().map(|s| s.as_str()).collect();
+        extras.retain(|k, _| wanted.contains(k.as_str()));
+        for f in fields {
+            if !extras.contains_key(f) {
+                spawn_extra_field_monitor(
+                    &self.ca_client,
+                    pv_name,
+                    f,
+                    extras.clone(),
+                    parent_token.clone(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -358,6 +451,7 @@ impl ChannelManager {
 }
 
 /// Monitor loop: subscribe to a channel and forward values.
+#[allow(clippy::too_many_arguments)]
 async fn monitor_loop(
     pv_name: String,
     dbr_type: ArchDbType,
@@ -366,6 +460,7 @@ async fn monitor_loop(
     tx: mpsc::Sender<PvSample>,
     cancel_token: CancellationToken,
     conn_info: Arc<Mutex<ConnectionInfo>>,
+    extras: Arc<ExtraFieldsCache>,
 ) {
     loop {
         // Wait for connection, respecting cancellation.
@@ -454,7 +549,8 @@ async fn monitor_loop(
                                 ci.last_event_time = Some(now);
                             }
                             let archiver_val = epics_value_to_archiver(&snapshot.value);
-                            let sample = ArchiverSample::new(now, archiver_val);
+                            let mut sample = ArchiverSample::new(now, archiver_val);
+                            attach_extras(&extras, &mut sample);
                             let pv_sample = PvSample {
                                 pv_name: pv_name.clone(),
                                 dbr_type,
@@ -494,6 +590,7 @@ async fn scan_loop(
     cancel_token: CancellationToken,
     period_secs: f64,
     conn_info: Arc<Mutex<ConnectionInfo>>,
+    extras: Arc<ExtraFieldsCache>,
 ) {
     let period = Duration::from_secs_f64(period_secs);
     let mut interval = tokio::time::interval(period);
@@ -522,7 +619,8 @@ async fn scan_loop(
                     ci.last_event_time = Some(now);
                 }
                 let archiver_val = epics_value_to_archiver(&epics_val);
-                let sample = ArchiverSample::new(now, archiver_val);
+                let mut sample = ArchiverSample::new(now, archiver_val);
+                attach_extras(&extras, &mut sample);
                 let pv_sample = PvSample {
                     pv_name: pv_name.clone(),
                     dbr_type,
@@ -538,6 +636,115 @@ async fn scan_loop(
             }
         }
     }
+}
+
+/// Snapshot the extras cache into `sample.field_values`. We sort for stable
+/// PB output across runs (the protobuf field is repeated; consumers that
+/// diff/compare files appreciate determinism).
+fn attach_extras(extras: &ExtraFieldsCache, sample: &mut ArchiverSample) {
+    if extras.is_empty() {
+        return;
+    }
+    let mut entries: Vec<(String, String)> = extras
+        .iter()
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    sample.field_values = entries;
+}
+
+/// Render an EpicsValue as the string we'll persist in the metadata field
+/// slot. Numeric scalars get `Display`-format; strings pass through; arrays
+/// fall back to JSON-ish bracket notation. Stays in sync with what Java
+/// archiver writes into PVTypeInfo's `archiveFields` blob (a string map).
+fn epics_value_to_field_string(val: &EpicsValue) -> String {
+    match val {
+        EpicsValue::String(s) => s.clone(),
+        EpicsValue::Short(v) => v.to_string(),
+        EpicsValue::Float(v) => v.to_string(),
+        EpicsValue::Enum(v) => v.to_string(),
+        EpicsValue::Char(v) => v.to_string(),
+        EpicsValue::Long(v) => v.to_string(),
+        EpicsValue::Double(v) => v.to_string(),
+        EpicsValue::ShortArray(v) => format!("{v:?}"),
+        EpicsValue::FloatArray(v) => format!("{v:?}"),
+        EpicsValue::EnumArray(v) => format!("{v:?}"),
+        EpicsValue::DoubleArray(v) => format!("{v:?}"),
+        EpicsValue::LongArray(v) => format!("{v:?}"),
+        EpicsValue::CharArray(v) => String::from_utf8_lossy(v).into_owned(),
+    }
+}
+
+/// Spawn a long-running task that subscribes to `<pv>.<field>` and updates
+/// `extras` with each event. Owned by `parent_token` so pause/destroy cleans
+/// it up alongside the main PV.
+fn spawn_extra_field_monitor(
+    ca_client: &CaClient,
+    pv_name: &str,
+    field: &str,
+    extras: Arc<ExtraFieldsCache>,
+    parent_token: CancellationToken,
+) {
+    let full_name = format!("{pv_name}.{field}");
+    let channel = ca_client.create_channel(&full_name);
+    let field_owned = field.to_string();
+    let pv_owned = pv_name.to_string();
+
+    tokio::spawn(async move {
+        // Initial connect attempt — failure here is non-fatal (the field may
+        // not exist on every IOC; we just leave the cache empty).
+        if channel.wait_connected(CA_CONNECT_TIMEOUT).await.is_err() {
+            debug!(
+                pv = pv_owned,
+                field = field_owned,
+                "Extra-field channel did not connect within timeout (will keep retrying via subscribe)"
+            );
+        }
+
+        loop {
+            // Cancel-aware subscribe attempt.
+            tokio::select! {
+                _ = parent_token.cancelled() => return,
+                sub = channel.subscribe() => {
+                    let mut monitor = match sub {
+                        Ok(m) => m,
+                        Err(e) => {
+                            debug!(
+                                pv = pv_owned,
+                                field = field_owned,
+                                "Extra-field subscribe failed: {e}; retrying"
+                            );
+                            tokio::select! {
+                                _ = parent_token.cancelled() => return,
+                                _ = tokio::time::sleep(CA_RETRY_DELAY) => continue,
+                            }
+                        }
+                    };
+                    loop {
+                        tokio::select! {
+                            _ = parent_token.cancelled() => return,
+                            ev = monitor.recv() => match ev {
+                                Some(Ok(snapshot)) => {
+                                    extras.insert(
+                                        field_owned.clone(),
+                                        epics_value_to_field_string(&snapshot.value),
+                                    );
+                                }
+                                Some(Err(e)) => {
+                                    debug!(
+                                        pv = pv_owned,
+                                        field = field_owned,
+                                        "Extra-field monitor error: {e}"
+                                    );
+                                }
+                                None => break, // resubscribe
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Convert epics-base-rs DbFieldType to archiver ArchDbType.

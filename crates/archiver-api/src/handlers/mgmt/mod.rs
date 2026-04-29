@@ -1,9 +1,11 @@
 mod aliases;
 mod config_io;
+mod operations;
 mod pv_control;
 mod pv_query;
 mod reports;
 mod system;
+mod type_info;
 
 use axum::http::HeaderMap;
 use axum::response::Response;
@@ -43,6 +45,30 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/mgmt/bpl/getAllExpandedPVNames",
             get(aliases::get_all_expanded_pv_names),
+        )
+        .route("/mgmt/bpl/putPVTypeInfo", post(type_info::put_pv_type_info))
+        .route(
+            "/mgmt/bpl/getPVTypeInfoKeys",
+            get(type_info::get_pv_type_info_keys),
+        )
+        .route("/mgmt/bpl/getStoresForPV", get(type_info::get_stores_for_pv))
+        .route("/mgmt/bpl/renamePV", get(type_info::rename_pv))
+        .route("/mgmt/bpl/modifyMetaFields", get(type_info::modify_meta_fields))
+        .route(
+            "/mgmt/bpl/getApplianceMetrics",
+            get(operations::get_appliance_metrics),
+        )
+        .route(
+            "/mgmt/bpl/consolidateDataForPV",
+            get(operations::consolidate_data_for_pv),
+        )
+        .route(
+            "/mgmt/bpl/getStorageUsageForPV",
+            get(operations::get_storage_usage_for_pv),
+        )
+        .route(
+            "/mgmt/bpl/resetFailoverCaches",
+            get(operations::reset_failover_caches),
         )
 }
 

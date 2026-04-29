@@ -97,6 +97,57 @@ impl EventStream for PbFileReader {
     }
 }
 
+/// In-memory PB stream reader. Reads the same line-escaped PB format as
+/// `PbFileReader` but from a `Vec<u8>` (e.g. an HTTP response body from a
+/// failover peer). Yields `ArchiverSample`s through `EventStream`.
+pub struct PbBytesReader {
+    desc: EventStreamDesc,
+    reader: BufReader<std::io::Cursor<Vec<u8>>>,
+}
+
+impl PbBytesReader {
+    /// Decode header + samples from a complete in-memory PB body.
+    pub fn from_bytes(bytes: Vec<u8>) -> anyhow::Result<Self> {
+        let mut reader = BufReader::new(std::io::Cursor::new(bytes));
+
+        let mut header_line = Vec::new();
+        reader.read_until(codec::NEWLINE, &mut header_line)?;
+        if header_line.last() == Some(&codec::NEWLINE) {
+            header_line.pop();
+        }
+        let header_bytes = codec::unescape(&header_line);
+        let payload_info = PayloadInfo::decode(header_bytes.as_slice())?;
+        let desc = EventStreamDesc::from_payload_info(&payload_info);
+
+        Ok(Self { desc, reader })
+    }
+}
+
+impl EventStream for PbBytesReader {
+    fn description(&self) -> &EventStreamDesc {
+        &self.desc
+    }
+
+    fn next_event(&mut self) -> anyhow::Result<Option<ArchiverSample>> {
+        loop {
+            let mut line_buf = Vec::new();
+            let bytes_read = self.reader.read_until(codec::NEWLINE, &mut line_buf)?;
+            if bytes_read == 0 {
+                return Ok(None);
+            }
+            if line_buf.last() == Some(&codec::NEWLINE) {
+                line_buf.pop();
+            }
+            if line_buf.is_empty() {
+                continue;
+            }
+            let raw_bytes = codec::unescape(&line_buf);
+            let sample = decode_sample(self.desc.db_type, self.desc.year, &raw_bytes)?;
+            return Ok(Some(sample));
+        }
+    }
+}
+
 /// Decode a protobuf sample from raw bytes based on the DBR type.
 pub fn decode_sample(
     dbr_type: ArchDbType,

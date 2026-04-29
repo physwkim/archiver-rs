@@ -120,8 +120,11 @@ tower = { workspace = true }
 archiver-api = { workspace = true, features = ["test-support"] }
 archiver-core = { workspace = true }
 archiver-engine = { workspace = true }
+archiver-proto = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 hyper = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
+prost = { workspace = true }
+urlencoding = { workspace = true }

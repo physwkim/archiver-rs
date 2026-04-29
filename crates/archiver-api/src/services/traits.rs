@@ -72,6 +72,11 @@ pub trait ArchiverCommand: Send + Sync {
     async fn resume_pv(&self, pv: &str) -> anyhow::Result<()>;
     fn stop_pv(&self, pv: &str) -> anyhow::Result<()>;
     fn destroy_pv(&self, pv: &str) -> anyhow::Result<()>;
+    /// Replace the set of EPICS metadata fields (.HIHI, .LOLO, .EGU, ...)
+    /// that the engine samples alongside the main value for `pv`. Persists
+    /// to the registry and (re)spawns per-field monitor tasks if the PV
+    /// is currently active.
+    async fn update_archive_fields(&self, pv: &str, fields: &[String]) -> anyhow::Result<()>;
 }
 
 // --- DTOs ---

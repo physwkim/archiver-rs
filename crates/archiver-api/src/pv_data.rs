@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
 
-use archiver_core::retrieval::query::{parse_post_processor, query_data, TwoWeekRawProcessor};
+use archiver_core::retrieval::query::{parse_post_processor, TwoWeekRawProcessor};
 use archiver_core::storage::traits::EventStream;
 use archiver_core::types::{ArchiverSample, ArchiverValue};
 
@@ -138,6 +138,113 @@ fn resolve_alias(state: &AppState, name: &str) -> String {
         .pv_query
         .canonical_name(name)
         .unwrap_or_else(|_| name.to_string())
+}
+
+/// Build the EventStream for a retrieval request, applying failover merge if
+/// configured. The post-processor (if any) runs on the merged + deduped
+/// stream, so peer samples are summarised together with local ones rather
+/// than each side being summarised independently and then mixed.
+async fn build_retrieval_stream(
+    state: &AppState,
+    rp: &RetrievalParams,
+) -> anyhow::Result<Box<dyn archiver_core::storage::traits::EventStream>> {
+    use archiver_core::retrieval::merge::{DedupTimestampStream, MergedEventStream};
+    use archiver_core::retrieval::query::query_data;
+
+    let post = resolve_post_processor(rp);
+
+    // Fast path: no failover peers configured. Keep behaviour identical to
+    // pre-Phase-7 by handing post-processing to query_data.
+    let Some(ref failover) = state.failover else {
+        return query_data(state.storage.as_ref(), &rp.pv_name, rp.start, rp.end, post).await;
+    };
+
+    // Fetch local + each peer as raw streams (no post-processing yet).
+    let local = query_data(state.storage.as_ref(), &rp.pv_name, rp.start, rp.end, None).await?;
+    let mut streams: Vec<Box<dyn archiver_core::storage::traits::EventStream>> = vec![local];
+
+    for peer in &failover.peers {
+        match fetch_peer_raw_stream(peer, &rp.pv_name, rp.start, rp.end, failover.timeout).await {
+            Ok(s) => streams.push(s),
+            Err(e) => {
+                tracing::warn!(peer, pv = rp.pv_name, "Failover peer fetch failed: {e}");
+            }
+        }
+    }
+
+    let desc = streams[0].description().clone();
+    let merged: Box<dyn archiver_core::storage::traits::EventStream> =
+        Box::new(MergedEventStream::new(desc, streams));
+    let dedup: Box<dyn archiver_core::storage::traits::EventStream> =
+        Box::new(DedupTimestampStream::new(merged));
+
+    Ok(match post {
+        Some(pp) => pp.process(dedup),
+        None => dedup,
+    })
+}
+
+/// HTTP GET `<peer>/data/getData.raw?pv=...&from=...&to=...` and parse the
+/// PlainPB response into an in-memory EventStream. The peer URL is expected
+/// to be the retrieval base (e.g. `https://archiver-b/retrieval`).
+async fn fetch_peer_raw_stream(
+    peer_base: &str,
+    pv: &str,
+    start: SystemTime,
+    end: SystemTime,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Box<dyn archiver_core::storage::traits::EventStream>> {
+    use archiver_core::storage::plainpb::reader::PbBytesReader;
+
+    let from_iso = chrono::DateTime::<chrono::Utc>::from(start).to_rfc3339();
+    let to_iso = chrono::DateTime::<chrono::Utc>::from(end).to_rfc3339();
+    let url = format!(
+        "{}/data/getData.raw?pv={}&from={}&to={}",
+        peer_base.trim_end_matches('/'),
+        urlencoding::encode(pv),
+        urlencoding::encode(&from_iso),
+        urlencoding::encode(&to_iso),
+    );
+
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    let resp = client
+        .get(&url)
+        .header("X-Archiver-Failover", "1")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("peer {peer_base} returned {}", resp.status());
+    }
+    let bytes = resp.bytes().await?.to_vec();
+    if bytes.is_empty() {
+        // Empty body — return an empty stream by feeding an empty Vec yields
+        // an error from PbBytesReader (no header). Return a no-op stream.
+        return Ok(Box::new(EmptyFailoverStream::default()));
+    }
+    let reader = PbBytesReader::from_bytes(bytes)?;
+    Ok(Box::new(reader))
+}
+
+#[derive(Default)]
+struct EmptyFailoverStream;
+
+impl archiver_core::storage::traits::EventStream for EmptyFailoverStream {
+    fn description(&self) -> &archiver_core::types::EventStreamDesc {
+        // A static empty desc; this stream yields nothing so the desc is
+        // never consumed in practice (MergedEventStream uses streams[0].desc).
+        static DESC: std::sync::OnceLock<archiver_core::types::EventStreamDesc> =
+            std::sync::OnceLock::new();
+        DESC.get_or_init(|| archiver_core::types::EventStreamDesc {
+            pv_name: String::new(),
+            db_type: archiver_core::types::ArchDbType::ScalarDouble,
+            year: 1970,
+            element_count: None,
+            headers: Vec::new(),
+        })
+    }
+    fn next_event(&mut self) -> anyhow::Result<Option<archiver_core::types::ArchiverSample>> {
+        Ok(None)
+    }
 }
 
 /// Parse and validate common retrieval parameters.
@@ -322,11 +429,7 @@ async fn get_data_json(
         return resp;
     }
 
-    let post_processor = resolve_post_processor(&rp);
-
-    let stream = match query_data(state.storage.as_ref(), &rp.pv_name, rp.start, rp.end, post_processor)
-        .await
-    {
+    let stream = match build_retrieval_stream(&state, &rp).await {
         Ok(s) => s,
         Err(e) => {
             return ApiError::internal(e).into_response();
@@ -428,11 +531,7 @@ async fn get_data_csv(
         return resp;
     }
 
-    let post_processor = resolve_post_processor(&rp);
-
-    let stream = match query_data(state.storage.as_ref(), &rp.pv_name, rp.start, rp.end, post_processor)
-        .await
-    {
+    let stream = match build_retrieval_stream(&state, &rp).await {
         Ok(s) => s,
         Err(e) => {
             return ApiError::internal(e).into_response();

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use crate::config::StorageConfig;
 use crate::storage::partition::PartitionGranularity;
 use crate::storage::plainpb::PlainPbStoragePlugin;
-use crate::storage::traits::{AppendMeta, EventStream, StoragePlugin};
+use crate::storage::traits::{AppendMeta, EventStream, StoragePlugin, StoreSummary};
 use crate::types::{ArchDbType, ArchiverSample};
 
 /// 3-tier storage manager: STS (short-term) → MTS (medium-term) → LTS (long-term).
@@ -120,5 +120,28 @@ impl StoragePlugin for TieredStorage {
         self.mts.flush_writes().await?;
         self.lts.flush_writes().await?;
         Ok(())
+    }
+
+    fn stores_for_pv(&self, pv: &str) -> anyhow::Result<Vec<StoreSummary>> {
+        let mut all = Vec::with_capacity(3);
+        all.extend(self.sts.stores_for_pv(pv)?);
+        all.extend(self.mts.stores_for_pv(pv)?);
+        all.extend(self.lts.stores_for_pv(pv)?);
+        Ok(all)
+    }
+
+    fn appliance_metrics(&self) -> anyhow::Result<Vec<StoreSummary>> {
+        let mut all = Vec::with_capacity(3);
+        all.extend(self.sts.appliance_metrics()?);
+        all.extend(self.mts.appliance_metrics()?);
+        all.extend(self.lts.appliance_metrics()?);
+        Ok(all)
+    }
+
+    async fn rename_pv(&self, from: &str, to: &str) -> anyhow::Result<u64> {
+        let s = self.sts.rename_pv(from, to).await?;
+        let m = self.mts.rename_pv(from, to).await?;
+        let l = self.lts.rename_pv(from, to).await?;
+        Ok(s + m + l)
     }
 }

@@ -41,22 +41,19 @@ pub fn parse_post_processor(spec: &str) -> Option<Box<dyn PostProcessor>> {
         return None;
     }
     let interval: u64 = parts[1].parse().ok()?;
+    use crate::retrieval::postprocessors::{counts, last_sample, statistics};
     match parts[0] {
-        "mean" => Some(Box::new(
-            crate::etl::decimation::MeanDecimation::new(interval),
-        )),
-        "firstSample" => Some(Box::new(
-            crate::etl::decimation::FirstSampleDecimation::new(interval),
-        )),
-        "max" => Some(Box::new(
-            crate::retrieval::postprocessors::statistics::MaxPostProcessor::new(interval),
-        )),
-        "min" => Some(Box::new(
-            crate::retrieval::postprocessors::statistics::MinPostProcessor::new(interval),
-        )),
-        "std" => Some(Box::new(
-            crate::retrieval::postprocessors::statistics::StdPostProcessor::new(interval),
-        )),
+        "mean" => Some(Box::new(crate::etl::decimation::MeanDecimation::new(interval))),
+        "firstSample" => Some(Box::new(crate::etl::decimation::FirstSampleDecimation::new(interval))),
+        "max" => Some(Box::new(statistics::MaxPostProcessor::new(interval))),
+        "min" => Some(Box::new(statistics::MinPostProcessor::new(interval))),
+        "std" => Some(Box::new(statistics::StdPostProcessor::new(interval))),
+        "median" => Some(Box::new(statistics::MedianPostProcessor::new(interval))),
+        "variance" => Some(Box::new(statistics::VariancePostProcessor::new(interval))),
+        "rms" => Some(Box::new(statistics::RmsPostProcessor::new(interval))),
+        "count" => Some(Box::new(counts::CountPostProcessor::new(interval))),
+        "ncount" => Some(Box::new(counts::NCountPostProcessor::new(interval))),
+        "lastSample" => Some(Box::new(last_sample::LastSamplePostProcessor::new(interval))),
         _ => None,
     }
 }

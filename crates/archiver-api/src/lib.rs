@@ -10,7 +10,7 @@ mod state;
 pub mod ui;
 pub mod usecases;
 
-pub use state::AppState;
+pub use state::{AppState, FailoverState};
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Method};

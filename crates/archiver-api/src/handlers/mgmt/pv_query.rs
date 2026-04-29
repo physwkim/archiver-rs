@@ -131,9 +131,13 @@ pub async fn get_pv_type_info(
     State(state): State<AppState>,
     Query(params): Query<PvNameParam>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let canonical = state
+        .pv_query
+        .canonical_name(&params.pv)
+        .unwrap_or_else(|_| params.pv.clone());
     match state
         .pv_query
-        .get_pv(&params.pv)
+        .get_pv(&canonical)
         .map_err(ApiError::internal)?
     {
         Some(record) => Ok(axum::Json(record_to_type_info(&record))),

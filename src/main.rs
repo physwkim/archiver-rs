@@ -216,6 +216,12 @@ async fn main() -> anyhow::Result<()> {
     let repo = Arc::new(RegistryRepository::new(registry.clone()));
     let archiver_impl = Arc::new(ChannelArchiverControl::new(channel_mgr.clone()));
     let cluster_api_key = config.cluster.as_ref().and_then(|cc| cc.api_key.clone());
+    let failover_state = config.failover.as_ref().map(|f| {
+        Arc::new(archiver_api::FailoverState {
+            peers: f.peers.clone(),
+            timeout: std::time::Duration::from_secs(f.timeout_secs),
+        })
+    });
 
     let app_state = AppState {
         storage: storage.clone(),
@@ -229,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
         metrics_handle,
         rate_limiter,
         trust_proxy_headers: config.security.trust_proxy_headers,
+        failover: failover_state,
     };
     let app = archiver_api::build_router(app_state, &config.security);
 

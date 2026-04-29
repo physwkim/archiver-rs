@@ -105,6 +105,7 @@ dependencies = [
  "archiver-api",
  "archiver-core",
  "archiver-engine",
+ "archiver-proto",
  "axum",
  "axum-server",
  "chrono",
@@ -112,6 +113,7 @@ dependencies = [
  "futures",
  "hyper",
  "metrics-exporter-prometheus",
+ "prost",
  "reqwest",
  "rustls",
  "serde",
@@ -122,6 +124,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
 ]
 
 [[package]]

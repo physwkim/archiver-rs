@@ -39,6 +39,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         metrics_handle: None,
         rate_limiter: None,
         trust_proxy_headers: false,
+        failover: None,
     };
     (build_router(state, &SecurityConfig::default()), dir)
 }
@@ -81,6 +82,7 @@ async fn build_test_app_with_pvs() -> (axum::Router, Arc<PvRegistry>, tempfile::
         metrics_handle: None,
         rate_limiter: None,
         trust_proxy_headers: false,
+        failover: None,
     };
     (build_router(state, &SecurityConfig::default()), registry, dir)
 }
@@ -481,6 +483,7 @@ async fn test_export_import_preserves_status() {
         metrics_handle: None,
         rate_limiter: None,
         trust_proxy_headers: false,
+        failover: None,
     };
     let app2 = build_router(state2, &SecurityConfig::default());
 
@@ -552,6 +555,7 @@ async fn build_test_app_with_auth() -> (axum::Router, tempfile::TempDir) {
         metrics_handle: None,
         rate_limiter: None,
         trust_proxy_headers: false,
+        failover: None,
     };
     (build_router(state, &SecurityConfig::default()), dir)
 }
@@ -686,6 +690,7 @@ async fn test_rate_limiter_blocks_excess_requests() {
         metrics_handle: None,
         rate_limiter: Some(limiter),
         trust_proxy_headers: true,
+        failover: None,
     };
     let app = build_router(state, &SecurityConfig::default());
 
@@ -745,6 +750,7 @@ async fn test_rate_limiter_isolates_by_ip() {
         metrics_handle: None,
         rate_limiter: Some(limiter),
         trust_proxy_headers: true,
+        failover: None,
     };
     let app = build_router(state, &SecurityConfig::default());
 
@@ -863,4 +869,256 @@ async fn test_archive_pv_rejects_alias_name() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn test_get_pv_type_info_keys_includes_aliases() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Foo");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = get_request("/mgmt/bpl/getPVTypeInfoKeys");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let names: Vec<String> = serde_json::from_value(body_to_json(resp.into_body()).await).unwrap();
+    assert!(names.contains(&"SIM:Sine".to_string()));
+    assert!(names.contains(&"DEV:Foo".to_string()));
+}
+
+#[tokio::test]
+async fn test_put_pv_type_info_creates_and_overrides() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+
+    // Create new PV via PUT.
+    let body = serde_json::json!({
+        "pvName": "NEW:PV",
+        "DBRType": 6,
+        "samplingMethod": "Scan",
+        "samplingPeriod": 2.0,
+        "elementCount": 1,
+        "PREC": "4",
+        "EGU": "V",
+        "archiveFields": ["HIHI", "LOLO"],
+        "policyName": "ring",
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/putPVTypeInfo?pv=NEW:PV&createnew=true")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let typeinfo = body_to_json(resp.into_body()).await;
+    assert_eq!(typeinfo["pvName"], "NEW:PV");
+    assert_eq!(typeinfo["samplingMethod"], "Scan");
+    assert_eq!(typeinfo["samplingPeriod"], 2.0);
+    assert_eq!(typeinfo["archiveFields"][0], "HIHI");
+    assert_eq!(typeinfo["policyName"], "ring");
+
+    // Without override: re-PUT should 409.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/putPVTypeInfo?pv=NEW:PV&createnew=true")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"PREC":"5"}).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // With override: PREC updates.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/putPVTypeInfo?pv=NEW:PV&override=true")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"PREC":"5"}).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let typeinfo = body_to_json(resp.into_body()).await;
+    assert_eq!(typeinfo["PREC"], "5");
+    // archiveFields preserved across override.
+    assert_eq!(typeinfo["archiveFields"][0], "HIHI");
+}
+
+#[tokio::test]
+async fn test_put_pv_type_info_requires_flag() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let body = serde_json::json!({"DBRType": 6, "samplingMethod": "Monitor"});
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/putPVTypeInfo?pv=SIM:Sine")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_get_stores_for_pv() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/getStoresForPV?pv=SIM:Sine");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    // The test app uses a single tier (sts).
+    assert!(body["sts"].as_str().unwrap().starts_with("pb://localhost"));
+    assert_eq!(body["sts_files"].as_u64().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_get_stores_for_pv_resolves_alias() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Foo");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = get_request("/mgmt/bpl/getStoresForPV?pv=DEV:Foo");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert!(body.is_object());
+}
+
+#[tokio::test]
+async fn test_rename_pv_requires_paused_source() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    // Active PV -> rename should be Conflict
+    let req = get_request("/mgmt/bpl/renamePV?pv=SIM:Sine&newname=SIM:Sine2");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn test_rename_pv_after_pause_creates_destination() {
+    let (app, registry, _dir) = build_test_app_with_pvs().await;
+
+    // Pause source.
+    let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=SIM:Cosine");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = get_request("/mgmt/bpl/renamePV?pv=SIM:Cosine&newname=SIM:CosineRenamed");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["from"], "SIM:Cosine");
+    assert_eq!(body["to"], "SIM:CosineRenamed");
+
+    // Both should exist and be paused.
+    let src = registry.get_pv("SIM:Cosine").unwrap().unwrap();
+    assert_eq!(src.status, archiver_core::registry::PvStatus::Paused);
+    let dst = registry.get_pv("SIM:CosineRenamed").unwrap().unwrap();
+    assert_eq!(dst.status, archiver_core::registry::PvStatus::Paused);
+    assert_eq!(dst.dbr_type, src.dbr_type);
+}
+
+#[tokio::test]
+async fn test_modify_meta_fields_requires_pause() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    // Active PV → 409
+    let req = get_request("/mgmt/bpl/modifyMetaFields?pv=SIM:Sine&command=add,HIHI");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn test_modify_meta_fields_add_remove_clear() {
+    let (app, registry, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=SIM:Sine");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Add HIHI, LOLO.
+    let req = get_request("/mgmt/bpl/modifyMetaFields?pv=SIM:Sine&command=add,HIHI,LOLO");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    let fields: Vec<String> = serde_json::from_value(body["archiveFields"].clone()).unwrap();
+    assert!(fields.contains(&"HIHI".to_string()));
+    assert!(fields.contains(&"LOLO".to_string()));
+    assert_eq!(
+        registry.get_pv("SIM:Sine").unwrap().unwrap().archive_fields,
+        fields,
+    );
+
+    // Remove LOLO, add EGU in one call (multiple `command=`).
+    let req = get_request(
+        "/mgmt/bpl/modifyMetaFields?pv=SIM:Sine&command=remove,LOLO&command=add,EGU",
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    let fields: Vec<String> = serde_json::from_value(body["archiveFields"].clone()).unwrap();
+    assert!(fields.contains(&"HIHI".to_string()));
+    assert!(!fields.contains(&"LOLO".to_string()));
+    assert!(fields.contains(&"EGU".to_string()));
+
+    // Clear.
+    let req = get_request("/mgmt/bpl/modifyMetaFields?pv=SIM:Sine&command=clear");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    let fields: Vec<String> = serde_json::from_value(body["archiveFields"].clone()).unwrap();
+    assert!(fields.is_empty());
+}
+
+#[tokio::test]
+async fn test_modify_meta_fields_invalid_verb() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=SIM:Sine");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = get_request("/mgmt/bpl/modifyMetaFields?pv=SIM:Sine&command=xyz,HIHI");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_get_appliance_metrics_shape() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/getApplianceMetrics");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["pvCount"]["total"], 3);
+    assert_eq!(body["pvCount"]["active"], 3);
+    assert_eq!(body["pvCount"]["paused"], 0);
+    assert!(body["stores"].as_array().unwrap().len() >= 1);
+    let store = &body["stores"][0];
+    assert!(store["name"].is_string());
+    assert!(store["totalFiles"].is_number());
+    assert!(store["totalSizeBytes"].is_number());
+}
+
+#[tokio::test]
+async fn test_consolidate_data_for_pv() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/consolidateDataForPV?pv=SIM:Sine&storage=sts");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["pv"], "SIM:Sine");
+    assert!(body["tiers"].is_array());
+}
+
+#[tokio::test]
+async fn test_get_storage_usage_for_pv() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/getStorageUsageForPV?pv=SIM:Sine");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    // Test app uses single-tier storage named "sts", and we haven't written any
+    // events, so file count is 0.
+    assert_eq!(body["sts"], 0);
+}
+
+#[tokio::test]
+async fn test_reset_failover_caches_stub() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/resetFailoverCaches");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["status"], "ok");
 }

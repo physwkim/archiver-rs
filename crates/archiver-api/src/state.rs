@@ -13,6 +13,13 @@ use crate::services::traits::{
     ArchiverCommand, ArchiverQuery, ClusterRouter, PvCommandRepository, PvQueryRepository,
 };
 
+/// Failover retrieval configuration surfaced to handlers.
+#[derive(Clone)]
+pub struct FailoverState {
+    pub peers: Vec<String>,
+    pub timeout: std::time::Duration,
+}
+
 /// Shared application state for API handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -30,6 +37,8 @@ pub struct AppState {
     pub metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub trust_proxy_headers: bool,
+    /// External archivers consulted for failover-merged retrieval.
+    pub failover: Option<Arc<FailoverState>>,
 }
 
 /// Middleware that records HTTP request metrics.
@@ -83,8 +92,14 @@ pub(crate) async fn api_key_auth(
         "/mgmt/bpl/getAppliancesInCluster",
         "/mgmt/bpl/getApplianceInfo",
         "/mgmt/bpl/getPVTypeInfo",
+        "/mgmt/bpl/getPVTypeInfoKeys",
+        "/mgmt/bpl/getStoresForPV",
         "/mgmt/bpl/getPVDetails",
         "/mgmt/bpl/exportConfig",
+        "/mgmt/bpl/getAllAliases",
+        "/mgmt/bpl/getAllExpandedPVNames",
+        "/mgmt/bpl/getApplianceMetrics",
+        "/mgmt/bpl/getStorageUsageForPV",
     ];
     let is_read_only_mgmt = request.method() == axum::http::Method::GET
         && READ_ONLY_MGMT_PATHS.contains(&path);

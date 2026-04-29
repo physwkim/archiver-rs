@@ -56,4 +56,8 @@ impl ArchiverCommand for ChannelArchiverControl {
     fn destroy_pv(&self, pv: &str) -> anyhow::Result<()> {
         self.inner.destroy_pv(pv)
     }
+
+    async fn update_archive_fields(&self, pv: &str, fields: &[String]) -> anyhow::Result<()> {
+        self.inner.update_archive_fields(pv, fields).await
+    }
 }

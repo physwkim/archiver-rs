@@ -1,9 +1,29 @@
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 
 use crate::storage::partition::PartitionGranularity;
 use crate::types::{ArchDbType, ArchiverSample, EventStreamDesc};
+
+/// Per-tier description of a storage stage. Surfaced through the
+/// `getStoresForPV` and `getApplianceMetrics` BPL endpoints so operators
+/// can see tier layout and per-PV file counts without poking the disk.
+#[derive(Debug, Clone)]
+pub struct StoreSummary {
+    pub name: String,
+    pub root_folder: PathBuf,
+    pub granularity: PartitionGranularity,
+    /// Number of `.pb` partition files this tier holds for the given PV.
+    /// `None` when the summary was requested without a PV scope.
+    pub pv_file_count: Option<u64>,
+    /// Total size on disk of all `.pb` files in this tier (bytes), summed across PVs.
+    /// `None` when the summary is PV-scoped.
+    pub total_size_bytes: Option<u64>,
+    /// Total number of `.pb` files in this tier across all PVs.
+    /// `None` when the summary is PV-scoped.
+    pub total_files: Option<u64>,
+}
 
 /// A stream of archived events (read side).
 pub trait EventStream: Send {
@@ -68,6 +88,24 @@ pub trait StoragePlugin: Send + Sync {
     /// Flush any buffered writes to disk. Default is no-op.
     async fn flush_writes(&self) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Per-tier summary scoped to a single PV: name, root folder, granularity,
+    /// and how many `.pb` files this tier holds for that PV. Total size /
+    /// total files are left None.
+    fn stores_for_pv(&self, pv: &str) -> anyhow::Result<Vec<StoreSummary>>;
+
+    /// Per-tier summary aggregated across all PVs: total size on disk and
+    /// total file count. `pv_file_count` is left None.
+    fn appliance_metrics(&self) -> anyhow::Result<Vec<StoreSummary>>;
+
+    /// Rename `from` → `to` in this storage backend. Implementations may copy
+    /// or rename underlying files; the contract is that after a successful
+    /// return, reads for `to` see all data previously stored under `from` and
+    /// reads for `from` see none. Defaults to error so missing implementations
+    /// surface explicitly.
+    async fn rename_pv(&self, _from: &str, _to: &str) -> anyhow::Result<u64> {
+        anyhow::bail!("rename_pv not implemented for this storage plugin")
     }
 }
 
