@@ -240,11 +240,17 @@ const MIGRATION_BODY_LIMIT: usize = 128 * 1024 * 1024;
 
 /// Resolve a possibly-alias PV name to its canonical form. Falls back to
 /// the input on lookup error.
+///
+/// First strips `ca://`/`pva://` protocol prefixes and the `.VAL` suffix
+/// (Java archiver parity — the registry only stores bare channel names).
+/// Then resolves alias mapping. Without the normalize step, `pv://X` and
+/// `X` would be treated as different PVs.
 pub(super) fn resolve_canonical(state: &AppState, pv: &str) -> String {
+    let normalized = archiver_core::registry::normalize_pv_name(pv);
     state
         .pv_query
-        .canonical_name(pv)
-        .unwrap_or_else(|_| pv.to_string())
+        .canonical_name(normalized)
+        .unwrap_or_else(|_| normalized.to_string())
 }
 
 /// Try to forward a management GET request to the peer that owns the PV.

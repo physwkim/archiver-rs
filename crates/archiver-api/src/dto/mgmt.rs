@@ -30,6 +30,12 @@ pub struct MatchingPvsParams {
     pub pv: String,
     #[serde(default)]
     pub cluster: Option<bool>,
+    /// Cap on the number of names returned. Java archiver convention:
+    /// `-1` (or omitted) means unlimited; positive means top-N after
+    /// sort. Default is `DEFAULT_MATCHING_PVS_LIMIT` so a `*` query
+    /// can't dump the entire registry to the client.
+    #[serde(default)]
+    pub limit: Option<i32>,
 }
 
 #[derive(Deserialize)]

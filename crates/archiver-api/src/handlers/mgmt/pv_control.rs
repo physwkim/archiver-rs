@@ -28,13 +28,23 @@ pub async fn archive_pv(
     // Try parsing as single PV request first.
     if let Ok(req) = serde_json::from_str::<ArchivePvRequest>(&body_str)
         && let Some(pv) = req.pv {
+            let pv = archiver_core::registry::normalize_pv_name(&pv).to_string();
             let sample_mode = parse_sample_mode(req.sampling_method.as_deref(), req.sampling_period);
             return archive_single_pv(&state, &pv, &sample_mode, req.appliance.as_deref(), &headers).await;
         }
 
     // Try as JSON array of ArchivePvRequest objects (with per-PV appliance + sampling).
     if let Ok(reqs) = serde_json::from_str::<Vec<ArchivePvRequest>>(&body_str) {
-        let reqs: Vec<_> = reqs.into_iter().filter(|r| r.pv.is_some()).collect();
+        // Normalize each entry's pv field so the per-request channel name
+        // matches what the registry stores.
+        let reqs: Vec<_> = reqs
+            .into_iter()
+            .filter_map(|mut r| {
+                let pv = r.pv?;
+                r.pv = Some(archiver_core::registry::normalize_pv_name(&pv).to_string());
+                Some(r)
+            })
+            .collect();
         if !reqs.is_empty() {
             return bulk_archive_requests(&state, &reqs, &headers).await;
         }

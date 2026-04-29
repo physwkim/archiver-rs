@@ -24,6 +24,12 @@ pub async fn get_all_pvs(
     Ok(axum::Json(pvs))
 }
 
+/// Default cap for getMatchingPVs when the caller doesn't pass `limit`.
+/// Mirrors Java archiver's behavior of always sending a limit so a `*`
+/// query against a cluster of 100k PVs doesn't try to JSON-encode every
+/// name. Callers that genuinely want everything pass `limit=-1`.
+const DEFAULT_MATCHING_PVS_LIMIT: usize = 500;
+
 pub async fn get_matching_pvs(
     State(state): State<AppState>,
     Query(params): Query<MatchingPvsParams>,
@@ -40,6 +46,19 @@ pub async fn get_matching_pvs(
             all.extend(remote);
             pvs = all.into_iter().collect();
         }
+
+    // Apply limit. Java's bug 22c9b7fc was a `subList(0, limit)` call that
+    // panicked when the result was shorter than limit; guard against the
+    // same here even though Vec::truncate is forgiving.
+    let limit = match params.limit {
+        Some(n) if n < 0 => None,                     // -1 = unlimited
+        Some(n) => Some(n as usize),
+        None => Some(DEFAULT_MATCHING_PVS_LIMIT),
+    };
+    if let Some(n) = limit {
+        pvs.sort();
+        pvs.truncate(n);
+    }
 
     Ok(axum::Json(pvs))
 }

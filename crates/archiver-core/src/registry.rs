@@ -13,6 +13,22 @@ use tracing::info;
 
 use crate::types::ArchDbType;
 
+/// Canonicalize a user-supplied PV name to the form the registry stores.
+///
+/// Java archiver's `PVNames.normalizeChannelName` + `stripPrefixFromName`:
+/// - `pva://X` and `ca://X` are protocol hints, not part of the channel name
+/// - `X.VAL` and `X` refer to the same EPICS record (`.VAL` is the default field)
+///
+/// Without this, `archivePV?pv=PV1.VAL` and `archivePV?pv=PV1` would create
+/// two separate registry rows that subscribe to the same IOC channel.
+pub fn normalize_pv_name(name: &str) -> &str {
+    let name = name
+        .strip_prefix("pva://")
+        .or_else(|| name.strip_prefix("ca://"))
+        .unwrap_or(name);
+    name.strip_suffix(".VAL").unwrap_or(name)
+}
+
 /// PV archiving status.
 ///
 /// `Alias` is a sentinel applied to alias rows so they don't appear in

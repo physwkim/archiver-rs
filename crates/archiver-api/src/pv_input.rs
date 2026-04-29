@@ -14,7 +14,10 @@ use crate::errors::ApiError;
 /// Parse a PV list from a string body.
 ///
 /// Tries JSON array first (`["PV:A", "PV:B"]`), falls back to newline-delimited.
-/// Trims whitespace, removes empty lines, and deduplicates (preserving order).
+/// Trims whitespace, removes empty lines, normalizes each name (strips
+/// `ca://`/`pva://` prefixes and trailing `.VAL` per Java archiver
+/// convention), and deduplicates (preserving order). Normalizing before
+/// dedup means `PV:A` and `PV:A.VAL` collapse to one entry.
 pub fn parse_pv_list(body: &str) -> Vec<String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -29,10 +32,10 @@ pub fn parse_pv_list(body: &str) -> Vec<String> {
         trimmed.lines().map(|l| l.trim().to_string()).collect()
     };
 
-    // Deduplicate while preserving order.
+    // Normalize + deduplicate while preserving order.
     let mut seen = HashSet::new();
     raw.into_iter()
-        .map(|s| s.trim().to_string())
+        .map(|s| archiver_core::registry::normalize_pv_name(s.trim()).to_string())
         .filter(|s| !s.is_empty() && seen.insert(s.clone()))
         .collect()
 }
@@ -65,8 +68,15 @@ where
             .map_err(|_| ApiError::BadRequest("Invalid UTF-8 body".to_string()))?;
 
         let pvs = if content_type.contains("application/json") {
-            serde_json::from_str::<Vec<String>>(&body)
-                .map_err(|e| ApiError::BadRequest(format!("Invalid JSON array: {e}")))?
+            let raw: Vec<String> = serde_json::from_str(&body)
+                .map_err(|e| ApiError::BadRequest(format!("Invalid JSON array: {e}")))?;
+            // Same normalize+dedup as the newline-delimited path so the
+            // wire format the caller picks doesn't change behavior.
+            let mut seen = HashSet::new();
+            raw.into_iter()
+                .map(|s| archiver_core::registry::normalize_pv_name(s.trim()).to_string())
+                .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+                .collect()
         } else {
             parse_pv_list(&body)
         };

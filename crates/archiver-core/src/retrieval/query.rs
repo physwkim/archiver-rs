@@ -35,12 +35,21 @@ pub async fn query_data(
 }
 
 /// Parse a post-processor spec like "mean_600" or "firstSample_3600".
+///
+/// Java's `SummaryStatsPostProcessor` enforces `intervalSecs >= 1`
+/// (CSSTUDIO-2134) — without that floor, `mean_0` makes every sample its
+/// own bin (`elapsed >= 0` always true) which both misuses the operator
+/// and risks divide-by-zero in any future `epoch_secs / interval_secs`
+/// path. Reject `_0` here so the API surface is consistent.
 pub fn parse_post_processor(spec: &str) -> Option<Box<dyn PostProcessor>> {
     let parts: Vec<&str> = spec.splitn(2, '_').collect();
     if parts.len() != 2 {
         return None;
     }
     let interval: u64 = parts[1].parse().ok()?;
+    if interval == 0 {
+        return None;
+    }
     use crate::retrieval::postprocessors::{counts, last_sample, statistics};
     match parts[0] {
         "mean" => Some(Box::new(crate::etl::decimation::MeanDecimation::new(interval))),
