@@ -219,6 +219,10 @@ pub fn routes() -> Router<AppState> {
             get(engine::get_latest_meta_data),
         )
         .route("/mgmt/bpl/pvStatusAction", get(engine::pv_status_action))
+        .route(
+            "/mgmt/bpl/receivePVMigration",
+            post(p2::receive_pv_migration),
+        )
 }
 
 /// Resolve a possibly-alias PV name to its canonical form. Falls back to

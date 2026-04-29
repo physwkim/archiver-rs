@@ -62,7 +62,7 @@ impl ArchiverQuery for ChannelArchiverControl {
         pv: &str,
         timeout_secs: u64,
     ) -> Option<Result<serde_json::Value, String>> {
-        let timeout = std::time::Duration::from_secs(timeout_secs.max(1).min(60));
+        let timeout = std::time::Duration::from_secs(timeout_secs.clamp(1, 60));
         match self.inner.live_value(pv, timeout).await {
             Some(Ok(v)) => Some(Ok(archiver_value_to_json(&v))),
             Some(Err(e)) => Some(Err(format!("{e}"))),

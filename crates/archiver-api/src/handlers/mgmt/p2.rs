@@ -86,29 +86,33 @@ pub async fn append_and_alias_pv(
     .into_response()
 }
 
-// ─── ChangeStore (no-op) ──────────────────────────────────────────────
+// ─── ChangeStore — 501 with operator guidance ────────────────────────
+//
+// Java archiver implements per-PV `dataStores` lists in PVTypeInfo, so
+// `ChangeStore` rewrites that list and the engine starts routing the
+// PV's writes to the new URL. archiver-rs uses a single shared
+// 3-tier layout that all PVs share, configured at startup via
+// `[storage.sts/mts/lts]`. There's no per-PV routing knob to flip.
+//
+// Returning 501 Not Implemented (with a runbook reason) is the honest
+// answer — operators expecting a runtime URL swap should reconfigure
+// archiver.toml and restart instead.
 
-pub async fn change_store(
-    State(state): State<AppState>,
-    Query(p): Query<PvNameParam>,
-) -> Response {
-    if p.pv.is_empty() {
-        return ApiError::BadRequest("pv is required".to_string()).into_response();
-    }
-    let summaries = match state.storage.stores_for_pv(&p.pv) {
-        Ok(s) => s,
-        Err(e) => return ApiError::internal(e).into_response(),
-    };
-    axum::Json(serde_json::json!({
-        "status": "noop",
-        "reason": "archiver-rs storage tiers are fixed at startup",
-        "pv": p.pv,
-        "stores": summaries
-            .into_iter()
-            .map(|s| serde_json::json!({"name": s.name, "files": s.pv_file_count}))
-            .collect::<Vec<_>>(),
-    }))
-    .into_response()
+pub async fn change_store(Query(p): Query<PvNameParam>) -> Response {
+    let _ = p; // pv echoed in body below for clarity.
+    (
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        axum::Json(serde_json::json!({
+            "status": "not_implemented",
+            "pv": p.pv,
+            "reason": "archiver-rs uses a single shared 3-tier storage layout \
+                       configured at startup; per-PV store routing is not \
+                       supported. To migrate storage, update archiver.toml's \
+                       [storage.<tier>] root_folder and restart the archiver, \
+                       or use renamePV / reassignAppliance to relocate data.",
+        })),
+    )
+        .into_response()
 }
 
 // ─── ChangeTypeForPV ──────────────────────────────────────────────────
@@ -212,23 +216,343 @@ pub async fn reassign_appliance(
         }))
         .into_response();
     }
-    if cluster.find_peer_by_name(&q.appliance).is_none() {
+    let peer = match cluster.find_peer_by_name(&q.appliance) {
+        Some(p) => p,
+        None => {
+            return ApiError::BadRequest(format!(
+                "appliance '{}' is not a configured peer",
+                q.appliance,
+            ))
+            .into_response();
+        }
+    };
+
+    // Live migration: pause local → gather samples → POST bundle to peer
+    // → on success, delete local data + registry. Bounded at
+    // MAX_MIGRATION_SAMPLES so the request body stays sane; PVs with
+    // longer histories must be migrated in time-windowed chunks.
+    let canonical = super::resolve_canonical(&state, &q.pv);
+    let record = match state.pv_query.get_pv(&canonical) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return ApiError::NotFound(format!("PV '{}' not found", q.pv)).into_response();
+        }
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
+    if record.alias_for.is_some() {
         return ApiError::BadRequest(format!(
-            "appliance '{}' is not a configured peer",
-            q.appliance,
+            "'{}' is an alias; reassign the canonical PV instead",
+            q.pv
         ))
         .into_response();
     }
-    // Real reassignment requires moving files + registry entries to the
-    // peer, which is a multi-step cluster operation. Surface the
-    // limitation explicitly rather than silently accepting.
-    ApiError::Conflict(
-        "live PV reassignment between appliances is not yet implemented; \
-         pause the PV here, copy data via consolidate, and re-archive on the \
-         destination appliance"
-            .to_string(),
-    )
+
+    if let Err(e) = state.archiver_cmd.pause_pv(&canonical) {
+        return ApiError::internal(e).into_response();
+    }
+    if let Err(e) = state.storage.flush_writes().await {
+        return ApiError::internal(e).into_response();
+    }
+
+    let start = std::time::SystemTime::UNIX_EPOCH;
+    let end = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
+    let streams = match state.storage.get_data(&canonical, start, end).await {
+        Ok(s) => s,
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
+
+    let mut samples_json: Vec<serde_json::Value> = Vec::new();
+    for mut s in streams {
+        loop {
+            match s.next_event() {
+                Ok(Some(sample)) => {
+                    if samples_json.len() >= MAX_MIGRATION_SAMPLES {
+                        return ApiError::BadRequest(format!(
+                            "PV '{}' has more than {} samples; split the migration \
+                             by time window before retrying",
+                            canonical, MAX_MIGRATION_SAMPLES,
+                        ))
+                        .into_response();
+                    }
+                    let secs = sample
+                        .timestamp
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let nanos = sample
+                        .timestamp
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos())
+                        .unwrap_or(0);
+                    samples_json.push(serde_json::json!({
+                        "secs": secs,
+                        "nanos": nanos,
+                        "value": archiver_value_to_json(&sample.value),
+                        "severity": sample.severity,
+                        "status": sample.status,
+                    }));
+                }
+                Ok(None) => break,
+                Err(e) => return ApiError::internal(e).into_response(),
+            }
+        }
+    }
+
+    let bundle = serde_json::json!({
+        "pvName": canonical,
+        "dbrType": record.dbr_type as i32,
+        "samplingMethod": match &record.sample_mode {
+            archiver_core::registry::SampleMode::Monitor => "Monitor",
+            archiver_core::registry::SampleMode::Scan { .. } => "Scan",
+        },
+        "samplingPeriod": match &record.sample_mode {
+            archiver_core::registry::SampleMode::Scan { period_secs } => *period_secs,
+            _ => 0.0,
+        },
+        "elementCount": record.element_count,
+        "prec": record.prec,
+        "egu": record.egu,
+        "archiveFields": record.archive_fields,
+        "samples": samples_json,
+    });
+    let body = axum::body::Bytes::from(bundle.to_string());
+
+    let resp = match cluster
+        .proxy_mgmt_post(&peer.mgmt_url, "receivePVMigration", body)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ApiError::bad_gateway(e).into_response(),
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap_or_default();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        return ApiError::bad_gateway(anyhow::anyhow!(
+            "peer rejected migration ({status}): {body_str}"
+        ))
+        .into_response();
+    }
+
+    let count = samples_json.len();
+    if let Err(e) = state.storage.delete_pv_data(&canonical).await {
+        tracing::warn!(pv = canonical, "failed to delete migrated source data: {e}");
+    }
+    if let Err(e) = state.archiver_cmd.destroy_pv(&canonical) {
+        tracing::warn!(pv = canonical, "failed to destroy source channel: {e}");
+    }
+
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "pv": canonical,
+        "from": identity,
+        "to": q.appliance,
+        "samplesMigrated": count,
+    }))
     .into_response()
+}
+
+const MAX_MIGRATION_SAMPLES: usize = 500_000;
+
+// ─── receivePVMigration (peer-side) ───────────────────────────────────
+
+pub async fn receive_pv_migration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if headers.get("X-Archiver-Proxied").is_none() {
+        return ApiError::BadRequest(
+            "receivePVMigration is cluster-internal; missing X-Archiver-Proxied"
+                .to_string(),
+        )
+        .into_response();
+    }
+
+    let bundle: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return ApiError::BadRequest(format!("invalid JSON: {e}")).into_response(),
+    };
+    let pv_name = match bundle["pvName"].as_str() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return ApiError::BadRequest("pvName missing".to_string()).into_response(),
+    };
+    let dbr_type_i = bundle["dbrType"].as_i64().unwrap_or(6) as i32;
+    let dbr_type = match archiver_core::types::ArchDbType::from_i32(dbr_type_i) {
+        Some(t) => t,
+        None => {
+            return ApiError::BadRequest(format!("invalid dbrType: {dbr_type_i}")).into_response();
+        }
+    };
+    let sample_mode = crate::dto::mgmt::parse_sample_mode(
+        bundle["samplingMethod"].as_str(),
+        bundle["samplingPeriod"].as_f64(),
+    );
+    let element_count = bundle["elementCount"].as_i64().unwrap_or(1) as i32;
+    let prec = bundle["prec"].as_str().map(|s| s.to_string());
+    let egu = bundle["egu"].as_str().map(|s| s.to_string());
+    let archive_fields: Vec<String> = bundle["archiveFields"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let samples = match bundle["samples"].as_array() {
+        Some(s) => s,
+        None => return ApiError::BadRequest("samples missing".to_string()).into_response(),
+    };
+
+    if let Ok(Some(_)) = state.pv_query.get_pv(&pv_name) {
+        return ApiError::Conflict(format!("'{pv_name}' already exists on this appliance"))
+            .into_response();
+    }
+
+    if let Err(e) = state.pv_cmd.import_pv(
+        &pv_name,
+        dbr_type,
+        &sample_mode,
+        element_count,
+        archiver_core::registry::PvStatus::Paused,
+        None,
+        prec.as_deref(),
+        egu.as_deref(),
+        None,
+        &archive_fields,
+        None,
+    ) {
+        return ApiError::internal(e).into_response();
+    }
+
+    let mut written = 0usize;
+    for s in samples {
+        let secs = s["secs"].as_i64().unwrap_or(0).max(0) as u64;
+        let nanos = s["nanos"].as_i64().unwrap_or(0) as u32;
+        let ts = std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+        let value = match json_to_archiver_value(&s["value"], dbr_type) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(pv = pv_name, "skipping sample with bad value");
+                continue;
+            }
+        };
+        let mut sample = archiver_core::types::ArchiverSample::new(ts, value);
+        sample.severity = s["severity"].as_i64().unwrap_or(0) as i32;
+        sample.status = s["status"].as_i64().unwrap_or(0) as i32;
+        let meta = archiver_core::storage::traits::AppendMeta {
+            element_count: Some(element_count),
+            ..Default::default()
+        };
+        if let Err(e) = state
+            .storage
+            .append_event_with_meta(&pv_name, dbr_type, &sample, &meta)
+            .await
+        {
+            tracing::error!(pv = pv_name, "failed to append migrated sample: {e}");
+            return ApiError::internal(e).into_response();
+        }
+        written += 1;
+    }
+    if let Err(e) = state.storage.flush_writes().await {
+        tracing::warn!(pv = pv_name, "flush after migration failed: {e}");
+    }
+
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "pv": pv_name,
+        "samplesReceived": written,
+    }))
+    .into_response()
+}
+
+/// Source-side: ArchiverValue → JSON. Mirrors the converter the
+/// retrieval handlers use; kept local to keep this module self-
+/// contained.
+fn archiver_value_to_json(v: &archiver_core::types::ArchiverValue) -> serde_json::Value {
+    use archiver_core::types::ArchiverValue;
+    use serde_json::Value;
+    match v {
+        ArchiverValue::ScalarString(s) => Value::String(s.clone()),
+        ArchiverValue::ScalarShort(n) => (*n).into(),
+        ArchiverValue::ScalarInt(n) => (*n).into(),
+        ArchiverValue::ScalarEnum(n) => (*n).into(),
+        ArchiverValue::ScalarFloat(f) => (*f as f64).into(),
+        ArchiverValue::ScalarDouble(f) => (*f).into(),
+        ArchiverValue::ScalarByte(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorString(arr) => {
+            Value::Array(arr.iter().map(|s| Value::String(s.clone())).collect())
+        }
+        ArchiverValue::VectorChar(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorShort(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorInt(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorEnum(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorFloat(arr) => {
+            Value::Array(arr.iter().map(|x| (*x as f64).into()).collect())
+        }
+        ArchiverValue::VectorDouble(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::V4GenericBytes(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
+    }
+}
+
+/// Dest-side: JSON → ArchiverValue. Uses `dbr_type` to choose the
+/// right variant, since the JSON shape (number / string / array)
+/// alone can't distinguish e.g. `ScalarFloat` from `ScalarDouble`.
+fn json_to_archiver_value(
+    v: &serde_json::Value,
+    dbr_type: archiver_core::types::ArchDbType,
+) -> Option<archiver_core::types::ArchiverValue> {
+    use archiver_core::types::{ArchDbType, ArchiverValue};
+    Some(match dbr_type {
+        ArchDbType::ScalarString => ArchiverValue::ScalarString(v.as_str()?.to_string()),
+        ArchDbType::ScalarShort => ArchiverValue::ScalarShort(v.as_i64()? as i32),
+        ArchDbType::ScalarInt => ArchiverValue::ScalarInt(v.as_i64()? as i32),
+        ArchDbType::ScalarEnum => ArchiverValue::ScalarEnum(v.as_i64()? as i32),
+        ArchDbType::ScalarFloat => ArchiverValue::ScalarFloat(v.as_f64()? as f32),
+        ArchDbType::ScalarDouble => ArchiverValue::ScalarDouble(v.as_f64()?),
+        ArchDbType::ScalarByte => {
+            let arr = v.as_array()?;
+            ArchiverValue::ScalarByte(arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
+        }
+        ArchDbType::WaveformString => {
+            let arr = v.as_array()?;
+            ArchiverValue::VectorString(
+                arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
+            )
+        }
+        ArchDbType::WaveformByte => {
+            let arr = v.as_array()?;
+            ArchiverValue::VectorChar(arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
+        }
+        ArchDbType::WaveformShort => {
+            let arr = v.as_array()?;
+            ArchiverValue::VectorShort(arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect())
+        }
+        ArchDbType::WaveformInt => {
+            let arr = v.as_array()?;
+            ArchiverValue::VectorInt(arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect())
+        }
+        ArchDbType::WaveformEnum => {
+            let arr = v.as_array()?;
+            ArchiverValue::VectorEnum(arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect())
+        }
+        ArchDbType::WaveformFloat => {
+            let arr = v.as_array()?;
+            ArchiverValue::VectorFloat(arr.iter().filter_map(|x| x.as_f64().map(|n| n as f32)).collect())
+        }
+        ArchDbType::WaveformDouble => {
+            let arr = v.as_array()?;
+            ArchiverValue::VectorDouble(arr.iter().filter_map(|x| x.as_f64()).collect())
+        }
+        ArchDbType::V4GenericBytes => {
+            let arr = v.as_array()?;
+            ArchiverValue::V4GenericBytes(
+                arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect(),
+            )
+        }
+    })
 }
 
 // ─── CleanUpAnyImmortalChannels ───────────────────────────────────────

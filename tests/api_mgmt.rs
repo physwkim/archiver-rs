@@ -1700,3 +1700,77 @@ async fn test_engine_data_action_returns_per_pv_entries() {
         "not archived on this appliance"
     );
 }
+
+#[tokio::test]
+async fn test_reassign_appliance_validates_target() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    // No cluster configured → 400.
+    let req = get_request("/mgmt/bpl/reassignAppliance?pv=SIM:Sine&appliance=other");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_change_store_returns_501() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/changeStore?pv=SIM:Sine");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["status"], "not_implemented");
+    assert!(body["reason"].as_str().unwrap().contains("archiver.toml"));
+}
+
+#[tokio::test]
+async fn test_receive_pv_migration_requires_proxied_header() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let body = serde_json::json!({
+        "pvName": "MIGRATED:PV",
+        "dbrType": 6,
+        "samplingMethod": "Monitor",
+        "samplingPeriod": 0.0,
+        "elementCount": 1,
+        "samples": [],
+    })
+    .to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/receivePVMigration")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_receive_pv_migration_imports_with_proxied_header() {
+    let (app, registry, _dir) = build_test_app_with_pvs().await;
+    let body = serde_json::json!({
+        "pvName": "MIGRATED:PV",
+        "dbrType": 6,
+        "samplingMethod": "Monitor",
+        "samplingPeriod": 0.0,
+        "elementCount": 1,
+        "archiveFields": ["HIHI"],
+        "samples": [
+            {"secs": 1700000000, "nanos": 0, "value": 1.5, "severity": 0, "status": 0},
+            {"secs": 1700000010, "nanos": 0, "value": 2.5, "severity": 0, "status": 0},
+        ],
+    })
+    .to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/receivePVMigration")
+        .header("content-type", "application/json")
+        .header("X-Archiver-Proxied", "1")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["samplesReceived"], 2);
+    let r = registry.get_pv("MIGRATED:PV").unwrap().unwrap();
+    assert_eq!(r.archive_fields, vec!["HIHI".to_string()]);
+    assert_eq!(r.status, archiver_core::registry::PvStatus::Paused);
+}

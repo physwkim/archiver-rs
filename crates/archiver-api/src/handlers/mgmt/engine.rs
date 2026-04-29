@@ -171,7 +171,6 @@ pub async fn pv_status_action(
         .all_pv_counters()
         .into_iter()
         .filter(|(name, _)| name == &canonical)
-        .map(|(name, c)| (name, c))
         .collect();
     let counter_json = counters.get(&canonical).map(|c| {
         serde_json::json!({
