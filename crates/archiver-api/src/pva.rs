@@ -182,6 +182,13 @@ fn run_get_data_rpc(
 
 /// `archappl/getDataAtTime` handler. Returns one row containing the last
 /// sample whose timestamp is <= `at`, or an empty table if none exists.
+///
+/// Two-stage strategy keeps the call O(1) on the common path:
+/// 1. Query `storage.get_last_known_event(pv)`. If it predates `at`, that
+///    is the answer.
+/// 2. Otherwise scan backwards in widening windows starting from `at`,
+///    capped at the current LTS partition granularity × a few partitions.
+///    This avoids the 720-iteration worst case the previous impl had.
 fn run_get_data_at_time_rpc(
     storage: &Arc<dyn StoragePlugin>,
     pv_query: &dyn PvQueryRepository,
@@ -198,15 +205,23 @@ fn run_get_data_at_time_rpc(
     let storage = storage.clone();
     let sample_opt = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async move {
-            // Walk back from the queried instant by 1h windows up to 30d
-            // until we find a sample. Works against the same get_data the
-            // REST surface uses.
+            // Stage 1: cheap path — last known event for the PV across all
+            // tiers. If its timestamp is at-or-before target, return it.
+            if let Some(latest) = storage.get_last_known_event(&canonical).await?
+                && latest.timestamp <= target
+            {
+                return anyhow::Ok(Some(latest));
+            }
+
+            // Stage 2: target is in the past and the last sample is newer.
+            // Scan a window ending at `target`, doubling on miss, capped at
+            // 30 days. Most queries land in the first iteration.
             let mut window = Duration::from_secs(3_600);
-            let mut earliest = target;
-            for _ in 0..720 {
-                let lower = earliest.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH);
+            let max_window = Duration::from_secs(30 * 86_400);
+            let mut last = None;
+            loop {
+                let lower = target.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH);
                 let streams = storage.get_data(&canonical, lower, target).await?;
-                let mut last = None;
                 for mut s in streams {
                     while let Some(sample) = s.next_event()? {
                         if sample.timestamp <= target {
@@ -214,16 +229,12 @@ fn run_get_data_at_time_rpc(
                         }
                     }
                 }
-                if last.is_some() {
-                    return anyhow::Ok(last);
-                }
-                earliest = lower;
-                if earliest == SystemTime::UNIX_EPOCH {
+                if last.is_some() || window >= max_window || lower == SystemTime::UNIX_EPOCH {
                     break;
                 }
-                window = window.saturating_mul(2).min(Duration::from_secs(86_400));
+                window = window.saturating_mul(2).min(max_window);
             }
-            anyhow::Ok(None)
+            anyhow::Ok(last)
         })
     })
     .map_err(|e| format!("{e}"))?;

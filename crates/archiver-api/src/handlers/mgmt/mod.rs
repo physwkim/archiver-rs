@@ -72,8 +72,21 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
+/// Resolve a possibly-alias PV name to its canonical form. Falls back to
+/// the input on lookup error.
+pub(super) fn resolve_canonical(state: &AppState, pv: &str) -> String {
+    state
+        .pv_query
+        .canonical_name(pv)
+        .unwrap_or_else(|_| pv.to_string())
+}
+
 /// Try to forward a management GET request to the peer that owns the PV.
 /// Returns Some(Response) if proxied, None if should handle locally.
+///
+/// Resolves aliases first so a local alias row is treated as a local hit
+/// when its target is local, and routed by canonical name when the
+/// target lives on a peer.
 async fn try_mgmt_dispatch(
     state: &AppState,
     pv: &str,
@@ -85,10 +98,14 @@ async fn try_mgmt_dispatch(
         return None;
     }
     let cluster = state.cluster.as_ref()?;
-    if state.pv_query.get_pv(pv).ok().flatten().is_some() {
+    let canonical = state.pv_query.canonical_name(pv).ok()?;
+    // Real PV exists locally → handle locally.
+    if let Ok(Some(rec)) = state.pv_query.get_pv(&canonical)
+        && rec.alias_for.is_none()
+    {
         return None;
     }
-    let resolved = cluster.resolve_peer(pv).await?;
+    let resolved = cluster.resolve_peer(&canonical).await?;
     cluster
         .proxy_mgmt_get(&resolved.mgmt_url, endpoint, qs)
         .await
@@ -115,7 +132,10 @@ async fn route_pvs(
         None => return (pvs.to_vec(), remote),
     };
 
-    // Pre-fetch all local PV names in a single query to avoid N+1 lookups.
+    // Pre-fetch all real local PV names (alias_for IS NULL) in a single
+    // query to avoid N+1 lookups. Alias rows are resolved per-PV via
+    // canonical_name below; an alias whose target is local counts as
+    // local for routing.
     let local_set: std::collections::HashSet<String> = state
         .pv_query
         .all_pv_names()
@@ -124,9 +144,13 @@ async fn route_pvs(
         .collect();
 
     for pv in pvs {
-        if local_set.contains(pv) {
+        let canonical = state
+            .pv_query
+            .canonical_name(pv)
+            .unwrap_or_else(|_| pv.clone());
+        if local_set.contains(&canonical) {
             local.push(pv.clone());
-        } else if let Some(resolved) = cluster.resolve_peer(pv).await {
+        } else if let Some(resolved) = cluster.resolve_peer(&canonical).await {
             remote
                 .entry(resolved.mgmt_url)
                 .or_default()

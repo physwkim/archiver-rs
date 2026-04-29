@@ -270,15 +270,16 @@ pub async fn pause_archiving_pv(
     headers: HeaderMap,
     Query(params): Query<PausePvParams>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let qs = format!("pv={}", urlencoding::encode(&params.pv));
-    if let Some(resp) = try_mgmt_dispatch(&state, &params.pv, "pauseArchivingPV", &qs, &headers).await {
+    let canonical = super::resolve_canonical(&state, &params.pv);
+    let qs = format!("pv={}", urlencoding::encode(&canonical));
+    if let Some(resp) = try_mgmt_dispatch(&state, &canonical, "pauseArchivingPV", &qs, &headers).await {
         return Ok(resp);
     }
     state
         .archiver_cmd
-        .pause_pv(&params.pv)
-        .map_err(|e| ApiError::Internal(format!("Failed to pause PV {}: {e}", params.pv)))?;
-    Ok(format!("Successfully paused PV {}", params.pv).into_response())
+        .pause_pv(&canonical)
+        .map_err(|e| ApiError::Internal(format!("Failed to pause PV {canonical}: {e}")))?;
+    Ok(format!("Successfully paused PV {canonical}").into_response())
 }
 
 pub async fn resume_archiving_pv(
@@ -286,16 +287,17 @@ pub async fn resume_archiving_pv(
     headers: HeaderMap,
     Query(params): Query<PausePvParams>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let qs = format!("pv={}", urlencoding::encode(&params.pv));
-    if let Some(resp) = try_mgmt_dispatch(&state, &params.pv, "resumeArchivingPV", &qs, &headers).await {
+    let canonical = super::resolve_canonical(&state, &params.pv);
+    let qs = format!("pv={}", urlencoding::encode(&canonical));
+    if let Some(resp) = try_mgmt_dispatch(&state, &canonical, "resumeArchivingPV", &qs, &headers).await {
         return Ok(resp);
     }
     state
         .archiver_cmd
-        .resume_pv(&params.pv)
+        .resume_pv(&canonical)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to resume PV {}: {e}", params.pv)))?;
-    Ok(format!("Successfully resumed PV {}", params.pv).into_response())
+        .map_err(|e| ApiError::Internal(format!("Failed to resume PV {canonical}: {e}")))?;
+    Ok(format!("Successfully resumed PV {canonical}").into_response())
 }
 
 // --- Bulk pause/resume (POST with body) ---
@@ -373,17 +375,18 @@ pub async fn delete_pv(
     headers: HeaderMap,
     Query(params): Query<DeletePvParams>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mut qs = format!("pv={}", urlencoding::encode(&params.pv));
+    let canonical = super::resolve_canonical(&state, &params.pv);
+    let mut qs = format!("pv={}", urlencoding::encode(&canonical));
     if params.delete_data.unwrap_or(false) {
         qs.push_str("&deleteData=true");
     }
-    if let Some(resp) = try_mgmt_dispatch(&state, &params.pv, "deletePV", &qs, &headers).await {
+    if let Some(resp) = try_mgmt_dispatch(&state, &canonical, "deletePV", &qs, &headers).await {
         return Ok(resp);
     }
     let result = crate::usecases::delete_pv::delete_pv(
         state.archiver_cmd.as_ref(),
         state.storage.as_ref(),
-        &params.pv,
+        &canonical,
         params.delete_data.unwrap_or(false),
     )
     .await?;
@@ -402,14 +405,15 @@ pub async fn change_archival_parameters(
     headers: HeaderMap,
     Query(params): Query<ChangeParamsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mut qs = format!("pv={}", urlencoding::encode(&params.pv));
+    let canonical = super::resolve_canonical(&state, &params.pv);
+    let mut qs = format!("pv={}", urlencoding::encode(&canonical));
     if let Some(period) = params.samplingperiod {
         qs.push_str(&format!("&samplingperiod={period}"));
     }
     if let Some(ref method) = params.samplingmethod {
         qs.push_str(&format!("&samplingmethod={method}"));
     }
-    if let Some(resp) = try_mgmt_dispatch(&state, &params.pv, "changeArchivalParameters", &qs, &headers).await {
+    if let Some(resp) = try_mgmt_dispatch(&state, &canonical, "changeArchivalParameters", &qs, &headers).await {
         return Ok(resp);
     }
     let new_mode = parse_sample_mode(
@@ -421,7 +425,7 @@ pub async fn change_archival_parameters(
         state.pv_query.as_ref(),
         state.pv_cmd.as_ref(),
         state.archiver_cmd.as_ref(),
-        &params.pv,
+        &canonical,
         &new_mode,
     )
     .await?;
@@ -436,15 +440,16 @@ pub async fn abort_archiving_pv(
     headers: HeaderMap,
     Query(params): Query<PvNameParam>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let qs = format!("pv={}", urlencoding::encode(&params.pv));
-    if let Some(resp) = try_mgmt_dispatch(&state, &params.pv, "abortArchivingPV", &qs, &headers).await {
+    let canonical = super::resolve_canonical(&state, &params.pv);
+    let qs = format!("pv={}", urlencoding::encode(&canonical));
+    if let Some(resp) = try_mgmt_dispatch(&state, &canonical, "abortArchivingPV", &qs, &headers).await {
         return Ok(resp);
     }
 
     let msg = crate::usecases::abort_archiving::abort_archiving(
         state.pv_query.as_ref(),
         state.archiver_cmd.as_ref(),
-        &params.pv,
+        &canonical,
     )?;
 
     Ok(msg.into_response())

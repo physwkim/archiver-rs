@@ -119,25 +119,28 @@ async fn main() -> anyhow::Result<()> {
     let mts_period_secs = config.storage.mts.hold as u64
         * config.storage.mts.partition_granularity.approx_seconds();
 
-    let etl_sts_mts = EtlExecutor::new(
+    let etl_sts_mts = Arc::new(EtlExecutor::new(
         tiered.sts.clone(),
         tiered.mts.clone(),
         sts_period_secs,
         config.storage.sts.hold,
         config.storage.sts.gather,
-    );
-    let etl_mts_lts = EtlExecutor::new(
+    ));
+    let etl_mts_lts = Arc::new(EtlExecutor::new(
         tiered.mts.clone(),
         tiered.lts.clone(),
         mts_period_secs,
         config.storage.mts.hold,
         config.storage.mts.gather,
-    );
+    ));
+    let etl_chain: Vec<Arc<EtlExecutor>> = vec![etl_sts_mts.clone(), etl_mts_lts.clone()];
 
     let etl1_shutdown = supervisor.shutdown_rx();
-    supervisor.spawn("etl_sts_mts", async move { etl_sts_mts.run(etl1_shutdown).await });
+    let etl_sts_mts_run = etl_sts_mts.clone();
+    supervisor.spawn("etl_sts_mts", async move { etl_sts_mts_run.run(etl1_shutdown).await });
     let etl2_shutdown = supervisor.shutdown_rx();
-    supervisor.spawn("etl_mts_lts", async move { etl_mts_lts.run(etl2_shutdown).await });
+    let etl_mts_lts_run = etl_mts_lts.clone();
+    supervisor.spawn("etl_mts_lts", async move { etl_mts_lts_run.run(etl2_shutdown).await });
 
     // Initialize cluster client if configured.
     let cluster: Option<Arc<dyn ClusterRouter>> = config.cluster.as_ref().map(|cc| {
@@ -236,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter,
         trust_proxy_headers: config.security.trust_proxy_headers,
         failover: failover_state,
+        etl_chain,
     };
     // Optional PVA retrieval RPC server. Starts before the HTTP listener
     // so a startup failure surfaces while logs are still attached. The

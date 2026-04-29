@@ -38,6 +38,7 @@ async fn start_mock_peer(
         rate_limiter: None,
         trust_proxy_headers: false,
         failover: None,
+        etl_chain: Vec::new(),
     };
     let app = build_router(state, &SecurityConfig::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -93,6 +94,7 @@ async fn build_cluster_test_app(
         rate_limiter: None,
         trust_proxy_headers: false,
         failover: None,
+        etl_chain: Vec::new(),
     };
     build_router(state, &SecurityConfig::default())
 }
@@ -564,6 +566,7 @@ async fn build_cluster_test_app_with_auth(
         rate_limiter: None,
         trust_proxy_headers: false,
         failover: None,
+        etl_chain: Vec::new(),
     };
     build_router(state, &SecurityConfig::default())
 }
@@ -593,6 +596,7 @@ async fn start_mock_peer_with_auth(
         rate_limiter: None,
         trust_proxy_headers: false,
         failover: None,
+        etl_chain: Vec::new(),
     };
     let app = build_router(state, &SecurityConfig::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -745,6 +749,7 @@ async fn start_mock_peer_with_own_key(
         rate_limiter: None,
         trust_proxy_headers: false,
         failover: None,
+        etl_chain: Vec::new(),
     };
     let app = build_router(state, &SecurityConfig::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -805,6 +810,7 @@ async fn test_cluster_proxy_authenticates_with_per_peer_key() {
         rate_limiter: None,
         trust_proxy_headers: false,
         failover: None,
+        etl_chain: Vec::new(),
     };
     let app = build_router(state, &SecurityConfig::default());
 
@@ -892,6 +898,7 @@ async fn test_different_peers_get_different_keys() {
         rate_limiter: None,
         trust_proxy_headers: false,
         failover: None,
+        etl_chain: Vec::new(),
     };
     let app = build_router(state, &SecurityConfig::default());
 

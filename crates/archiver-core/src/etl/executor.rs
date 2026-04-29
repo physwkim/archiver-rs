@@ -105,6 +105,43 @@ impl EtlExecutor {
         Ok(())
     }
 
+    pub fn source_name(&self) -> &str {
+        self.source.name()
+    }
+
+    pub fn dest_name(&self) -> &str {
+        self.dest.name()
+    }
+
+    /// Force-move every PB file the source tier currently holds for `pv`
+    /// to the destination tier, ignoring `hold` / `gather` constraints.
+    /// Drives the `consolidateDataForPV` BPL endpoint.
+    ///
+    /// The same crash-safe move_file is reused, so partial failures leave
+    /// the source either fully migrated or untouched.
+    pub async fn consolidate_pv(&self, pv: &str) -> anyhow::Result<u64> {
+        // Flush any buffered writes for the source tier so we move
+        // everything that's been written so far.
+        self.source.flush_writes().await?;
+
+        let pv_files = crate::storage::plainpb::list_pv_pb_files_pub(self.source.root_folder(), pv)?;
+        let total = pv_files.len() as u64;
+        info!(
+            pv,
+            total,
+            source = self.source.name(),
+            dest = self.dest.name(),
+            "Consolidating PV files",
+        );
+        for file in &pv_files {
+            if let Err(e) = self.move_file(file).await {
+                warn!(?file, "consolidate_pv: failed to move file: {e}");
+                return Err(e);
+            }
+        }
+        Ok(total)
+    }
+
     /// Move a single PB file from source to destination tier.
     /// Uses copy → verify → marker → delete for crash-safe idempotency.
     async fn move_file(&self, source_path: &Path) -> anyhow::Result<()> {

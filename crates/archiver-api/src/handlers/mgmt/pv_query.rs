@@ -60,6 +60,11 @@ pub async fn get_pv_status(
                 PvStatus::Paused => "Paused",
                 PvStatus::Error => "Error",
                 PvStatus::Inactive => "Inactive",
+                // Alias rows resolve to their target above, so we only land
+                // here for a real PV. Reaching this arm means a directly
+                // queried alias somehow slipped past resolution; surface it
+                // explicitly rather than misreporting.
+                PvStatus::Alias => "Alias",
             };
             let sample_mode_str = match &record.sample_mode {
                 SampleMode::Monitor => "Monitor".to_string(),
@@ -79,10 +84,11 @@ pub async fn get_pv_status(
             Ok(axum::Json(resp).into_response())
         }
         None => {
-            // PV not local — try cluster if requested.
+            // PV not local — try cluster if requested. Forward the canonical
+            // name so peers that don't carry our alias map can still answer.
             if params.cluster.unwrap_or(false)
                 && let Some(ref cluster) = state.cluster
-                    && let Some(remote_status) = cluster.remote_pv_status(&params.pv).await {
+                    && let Some(remote_status) = cluster.remote_pv_status(&canonical).await {
                         return Ok(axum::Json(remote_status).into_response());
                     }
             let resp = PvStatusResponse {

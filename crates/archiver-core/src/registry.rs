@@ -14,12 +14,17 @@ use tracing::info;
 use crate::types::ArchDbType;
 
 /// PV archiving status.
+///
+/// `Alias` is a sentinel applied to alias rows so they don't appear in
+/// status-filtered queries (`pvs_by_status(Active)`, getPVCount, restore
+/// loops). Aliases are routing entries, not archive subjects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PvStatus {
     Active,
     Paused,
     Error,
     Inactive,
+    Alias,
 }
 
 impl PvStatus {
@@ -29,6 +34,7 @@ impl PvStatus {
             Self::Paused => "paused",
             Self::Error => "error",
             Self::Inactive => "inactive",
+            Self::Alias => "alias",
         }
     }
 }
@@ -42,6 +48,7 @@ impl std::str::FromStr for PvStatus {
             "paused" => Self::Paused,
             "error" => Self::Error,
             "inactive" => Self::Inactive,
+            "alias" => Self::Alias,
             _ => Self::Active,
         })
     }
@@ -244,17 +251,21 @@ impl PvRegistry {
         .map_err(Into::into)
     }
 
-    /// List all PV names.
+    /// List all real PV names (alias rows excluded). Use
+    /// [`Self::expanded_pv_names`] to include aliases.
     pub fn all_pv_names(&self) -> anyhow::Result<Vec<String>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare("SELECT pv_name FROM pv_info ORDER BY pv_name")?;
+        let mut stmt = conn.prepare(
+            "SELECT pv_name FROM pv_info WHERE alias_for IS NULL ORDER BY pv_name",
+        )?;
         let names = stmt
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(names)
     }
 
-    /// List all PVs with a given status.
+    /// List all real PVs with a given status. Alias rows have
+    /// `status='alias'` and are excluded from every other-status query.
     pub fn pvs_by_status(&self, status: PvStatus) -> anyhow::Result<Vec<PvRecord>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
@@ -269,28 +280,35 @@ impl PvRegistry {
         Ok(records)
     }
 
-    /// Match PV names by glob pattern (SQL GLOB).
-    /// Supports `*` and `?` wildcards.
+    /// Match real PV names by glob pattern (SQL GLOB). Excludes aliases.
     pub fn matching_pvs(&self, pattern: &str) -> anyhow::Result<Vec<String>> {
         let conn = self.lock_conn()?;
-        let mut stmt =
-            conn.prepare("SELECT pv_name FROM pv_info WHERE pv_name GLOB ?1 ORDER BY pv_name")?;
+        let mut stmt = conn.prepare(
+            "SELECT pv_name FROM pv_info
+             WHERE pv_name GLOB ?1 AND alias_for IS NULL
+             ORDER BY pv_name",
+        )?;
         let names = stmt
             .query_map(params![pattern], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(names)
     }
 
-    /// Count total PVs, optionally filtered by status.
+    /// Count real PVs, optionally filtered by status. Excludes aliases.
     pub fn count(&self, status: Option<PvStatus>) -> anyhow::Result<u64> {
         let conn = self.lock_conn()?;
         let count: u64 = match status {
             Some(s) => conn.query_row(
-                "SELECT COUNT(*) FROM pv_info WHERE status = ?1",
+                "SELECT COUNT(*) FROM pv_info
+                 WHERE status = ?1 AND alias_for IS NULL",
                 params![s.as_str()],
                 |row| row.get(0),
             )?,
-            None => conn.query_row("SELECT COUNT(*) FROM pv_info", [], |row| row.get(0))?,
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM pv_info WHERE alias_for IS NULL",
+                [],
+                |row| row.get(0),
+            )?,
         };
         Ok(count)
     }
@@ -316,7 +334,7 @@ impl PvRegistry {
         Ok(())
     }
 
-    /// Get PVs added since a given time.
+    /// Get real PVs added since a given time (aliases excluded).
     pub fn recently_added_pvs(&self, since: SystemTime) -> anyhow::Result<Vec<PvRecord>> {
         let conn = self.lock_conn()?;
         let since_str = DateTime::<Utc>::from(since).to_rfc3339();
@@ -324,7 +342,8 @@ impl PvRegistry {
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
                     last_timestamp, created_at, updated_at, prec, egu,
                     alias_for, archive_fields, policy_name
-             FROM pv_info WHERE created_at >= ?1 ORDER BY created_at DESC",
+             FROM pv_info WHERE created_at >= ?1 AND alias_for IS NULL
+             ORDER BY created_at DESC",
         )?;
         let records = stmt
             .query_map(params![since_str], row_to_record)?
@@ -332,7 +351,7 @@ impl PvRegistry {
         Ok(records)
     }
 
-    /// Get PVs modified since a given time.
+    /// Get real PVs modified since a given time (aliases excluded).
     pub fn recently_modified_pvs(&self, since: SystemTime) -> anyhow::Result<Vec<PvRecord>> {
         let conn = self.lock_conn()?;
         let since_str = DateTime::<Utc>::from(since).to_rfc3339();
@@ -340,7 +359,8 @@ impl PvRegistry {
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
                     last_timestamp, created_at, updated_at, prec, egu,
                     alias_for, archive_fields, policy_name
-             FROM pv_info WHERE updated_at >= ?1 ORDER BY updated_at DESC",
+             FROM pv_info WHERE updated_at >= ?1 AND alias_for IS NULL
+             ORDER BY updated_at DESC",
         )?;
         let records = stmt
             .query_map(params![since_str], row_to_record)?
@@ -504,7 +524,7 @@ impl PvRegistry {
             "INSERT INTO pv_info
              (pv_name, dbr_type, sample_mode, sample_period, status, element_count,
               created_at, updated_at, alias_for)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, 'alias', ?5, ?6, ?6, ?7)",
             params![alias, dbr_type, mode, period, ec, now, target],
         )?;
         Ok(())
@@ -591,8 +611,9 @@ impl PvRegistry {
         Ok(records)
     }
 
-    /// Get PVs that have not received events for longer than the threshold duration.
-    /// Only returns PVs that have a last_timestamp (have received at least one event).
+    /// Get real PVs that have not received events for longer than the
+    /// threshold duration. Only returns PVs that have a last_timestamp.
+    /// Aliases are excluded — they don't carry event timestamps.
     pub fn silent_pvs(&self, threshold: Duration) -> anyhow::Result<Vec<PvRecord>> {
         let conn = self.lock_conn()?;
         let cutoff = SystemTime::now()
@@ -604,6 +625,7 @@ impl PvRegistry {
                     last_timestamp, created_at, updated_at, prec, egu,
                     alias_for, archive_fields, policy_name
              FROM pv_info WHERE last_timestamp IS NOT NULL AND last_timestamp < ?1
+                            AND alias_for IS NULL
              ORDER BY last_timestamp ASC",
         )?;
         let records = stmt

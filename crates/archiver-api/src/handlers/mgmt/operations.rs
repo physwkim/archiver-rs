@@ -63,18 +63,20 @@ pub async fn get_appliance_metrics(
     })))
 }
 
-/// `GET /mgmt/bpl/consolidateDataForPV?pv=<name>&storage=<tier>`
+/// `GET /mgmt/bpl/consolidateDataForPV?pv=<name>&storage=<TIER>`
 ///
-/// Forces a flush of any buffered writes for `pv`. With `storage=` set, the
-/// caller intends a manual ETL of the PV's files from STS into MTS / LTS.
-/// Our pipeline runs ETL automatically based on partition age, so the
-/// safe operation here is: flush the cache (so reads see fresh data) and
-/// report the per-tier file counts so operators can confirm migration.
+/// Force-moves all of `pv`'s files toward the requested tier, bypassing the
+/// hold/gather rules the periodic ETL respects. `storage=MTS` runs only the
+/// STS→MTS executor; `storage=LTS` runs STS→MTS then MTS→LTS so files end
+/// up in long-term storage.
+///
+/// Returns the number of files moved per executor and the resulting
+/// per-tier file counts so the caller can verify the migration landed.
 #[derive(Deserialize)]
 pub struct ConsolidateQuery {
     pub pv: String,
-    /// Optional store name; ignored other than for echo, since the flush
-    /// applies to all tiers atomically.
+    /// Destination tier name. Case-insensitive. Accepts "MTS" or "LTS".
+    /// Empty / missing defaults to "LTS" (the most common operator intent).
     #[serde(default)]
     pub storage: Option<String>,
 }
@@ -91,11 +93,48 @@ pub async fn consolidate_data_for_pv(
         .canonical_name(&q.pv)
         .map_err(ApiError::internal)?;
 
-    state
+    // Resolve the requested target tier. Default to the deepest tier (LTS)
+    // since that's the typical "consolidate everything" intent.
+    let target = q
         .storage
-        .flush_writes()
-        .await
-        .map_err(ApiError::internal)?;
+        .as_deref()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "LTS".to_string());
+
+    // Walk the etl_chain in order, running each executor up to (and including)
+    // the one whose dest matches the requested tier. The chain is
+    // [STS→MTS, MTS→LTS]; consolidating to MTS runs only the first, to LTS
+    // runs both.
+    let mut moved: Vec<serde_json::Value> = Vec::new();
+    let mut found_target = false;
+    for executor in &state.etl_chain {
+        let dest_name = executor.dest_name().to_ascii_uppercase();
+        let count = executor
+            .consolidate_pv(&canonical)
+            .await
+            .map_err(ApiError::internal)?;
+        moved.push(serde_json::json!({
+            "source": executor.source_name(),
+            "dest": executor.dest_name(),
+            "files_moved": count,
+        }));
+        if dest_name == target {
+            found_target = true;
+            break;
+        }
+    }
+    if !found_target && !state.etl_chain.is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "unknown target tier '{target}'; expected one of: {}",
+            state
+                .etl_chain
+                .iter()
+                .map(|e| e.dest_name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
 
     let stores = state
         .storage
@@ -114,7 +153,8 @@ pub async fn consolidate_data_for_pv(
     Ok(axum::Json(serde_json::json!({
         "status": "ok",
         "pv": canonical,
-        "storage": q.storage,
+        "storage": target,
+        "moved": moved,
         "tiers": tiers,
     })))
 }

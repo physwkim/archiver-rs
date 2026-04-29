@@ -256,6 +256,13 @@ fn pv_file_parts(pv: &str) -> (PathBuf, String) {
 }
 
 /// List PB files for a PV in a directory, matching the PV file prefix.
+/// Crate-public re-export of [`list_pv_pb_files`] — used by the ETL
+/// executor to consolidate one PV's files without duplicating the
+/// directory-walking logic.
+pub fn list_pv_pb_files_pub(root: &Path, pv: &str) -> anyhow::Result<Vec<PathBuf>> {
+    list_pv_pb_files(root, pv)
+}
+
 fn list_pv_pb_files(root: &Path, pv: &str) -> anyhow::Result<Vec<PathBuf>> {
     let (dir_part, file_prefix) = pv_file_parts(pv);
     let pv_dir = root.join(&dir_part);

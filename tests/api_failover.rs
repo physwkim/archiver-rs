@@ -169,6 +169,7 @@ async fn failover_merges_and_dedupes_peer_samples() {
             peers: vec![peer_url],
             timeout: Duration::from_secs(5),
         })),
+        etl_chain: Vec::new(),
     };
 
     let app = build_router(state, &SecurityConfig::default());
@@ -243,6 +244,7 @@ async fn failover_tolerates_unreachable_peer() {
             peers: vec!["http://127.0.0.1:1/retrieval".to_string()], // dead port
             timeout: Duration::from_secs(1),
         })),
+        etl_chain: Vec::new(),
     };
 
     let app = build_router(state, &SecurityConfig::default());

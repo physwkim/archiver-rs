@@ -179,6 +179,7 @@ pub fn record_to_report_entry(r: PvRecord) -> ReportEntry {
         PvStatus::Paused => "Paused",
         PvStatus::Error => "Error",
         PvStatus::Inactive => "Inactive",
+        PvStatus::Alias => "Alias",
     };
     ReportEntry {
         pv_name: r.pv_name,
@@ -199,6 +200,7 @@ pub fn record_to_type_info(r: &PvRecord) -> PvTypeInfoResponse {
         PvStatus::Paused => "Paused",
         PvStatus::Error => "Error",
         PvStatus::Inactive => "Inactive",
+        PvStatus::Alias => "Alias",
     };
     PvTypeInfoResponse {
         pv_name: r.pv_name.clone(),

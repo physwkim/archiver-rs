@@ -40,8 +40,16 @@ struct PvHandle {
     conn_info: Arc<Mutex<ConnectionInfo>>,
     /// Latest values of metadata fields (.HIHI, .LOLO, .EGU, ...) attached to
     /// every sample emitted for this PV. Populated by per-field monitor tasks
-    /// owned by the same `cancel_token`, so stopping the PV stops all of them.
+    /// owned by `cancel_token` (and per-field child tokens in `field_tokens`),
+    /// so stopping the PV stops all of them.
     extras: Arc<ExtraFieldsCache>,
+    /// Per-field cancellation tokens — child tokens of `cancel_token`. Keyed
+    /// by field name (e.g. "HIHI"). Lets `update_archive_fields` cancel one
+    /// field's task without disturbing the others or the main PV.
+    field_tokens: Arc<DashMap<String, CancellationToken>>,
+    /// Serialises concurrent `update_archive_fields` calls for this PV so
+    /// add/remove/respawn never race with itself.
+    update_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Thread-safe cache of latest extra-field values for one PV.
@@ -117,6 +125,11 @@ impl ChannelManager {
     }
 
     /// Restore all active PVs from the registry (called on startup).
+    ///
+    /// `pvs_by_status(Active)` already filters out alias rows (they carry
+    /// `status='alias'`), but we re-check `alias_for.is_some()` here so a
+    /// future schema change can't silently re-introduce double-archiving
+    /// of the underlying IOC PV.
     pub async fn restore_from_registry(&self) -> anyhow::Result<u64> {
         let active_pvs = self.registry.pvs_by_status(PvStatus::Active)?;
         let total = active_pvs.len() as u64;
@@ -124,6 +137,14 @@ impl ChannelManager {
 
         let mut restored = 0u64;
         for record in active_pvs {
+            if record.alias_for.is_some() {
+                warn!(
+                    pv = record.pv_name,
+                    target = record.alias_for.as_deref(),
+                    "Skipping alias row in restore; aliases are routed, not archived"
+                );
+                continue;
+            }
             if let Err(e) = self.start_archiving_internal(&record).await {
                 warn!(pv = record.pv_name, "Failed to restore PV: {e}");
                 self.registry.set_status(&record.pv_name, PvStatus::Error)?;
@@ -219,6 +240,7 @@ impl ChannelManager {
         let cancel_token = CancellationToken::new();
         let conn_info = Arc::new(Mutex::new(ConnectionInfo::default()));
         let extras: Arc<ExtraFieldsCache> = Arc::new(DashMap::new());
+        let field_tokens: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
 
         self.channels.insert(
             pv_name.clone(),
@@ -228,18 +250,22 @@ impl ChannelManager {
                 dbr_type,
                 conn_info: conn_info.clone(),
                 extras: extras.clone(),
+                field_tokens: field_tokens.clone(),
+                update_lock: Arc::new(tokio::sync::Mutex::new(())),
             },
         );
 
-        // Start one monitor task per archive_field. They share the parent
-        // cancel_token so pause/destroy stops them along with the main PV.
+        // Start one monitor task per archive_field with a child cancel token,
+        // tracked so update_archive_fields can stop individual fields.
         for field in &record.archive_fields {
+            let child = cancel_token.child_token();
+            field_tokens.insert(field.clone(), child.clone());
             spawn_extra_field_monitor(
                 &self.ca_client,
                 &pv_name,
                 field,
                 extras.clone(),
-                cancel_token.clone(),
+                child,
             );
         }
 
@@ -286,50 +312,67 @@ impl ChannelManager {
         Ok(())
     }
 
-    /// Replace the archive_fields list for a running PV. Stops any orphaned
-    /// field tasks and starts new ones to match the requested set. The PV
-    /// itself keeps running; only the auxiliary metadata-field monitors change.
+    /// Replace the archive_fields list for a running PV. Cancels per-field
+    /// monitor tasks for fields that left the set, spawns fresh ones for
+    /// fields that joined, and leaves unchanged fields running. Serialised
+    /// per-PV by an async mutex so concurrent callers can't double-spawn.
+    /// The main PV keeps running.
     pub async fn update_archive_fields(
         &self,
         pv_name: &str,
         fields: &[String],
     ) -> anyhow::Result<()> {
-        // Persist first so a restart sees the new set.
+        // Persist first so a restart sees the new set even if the engine
+        // half of the update fails partway through.
         self.registry.update_archive_fields(pv_name, fields)?;
 
         // If the PV isn't currently active there's nothing more to do —
         // start_archiving_internal will pick up the new fields on resume.
-        let Some(handle_ref) = self.channels.get(pv_name) else {
-            return Ok(());
+        let (parent_token, extras, field_tokens, update_lock) = {
+            let Some(handle) = self.channels.get(pv_name) else {
+                return Ok(());
+            };
+            (
+                handle.cancel_token.clone(),
+                handle.extras.clone(),
+                handle.field_tokens.clone(),
+                handle.update_lock.clone(),
+            )
         };
-        let parent_token = handle_ref.cancel_token.clone();
-        let extras = handle_ref.extras.clone();
-        drop(handle_ref);
 
-        // Drop fields no longer requested. We don't have per-field cancel
-        // tokens (the parent token cancels everything together), so the
-        // simplest correct behaviour is: cancel the whole group and respawn
-        // exactly the requested set under fresh per-field tasks. Cancelling
-        // would also kill the main PV, which is wrong. Instead we just clear
-        // values whose key is no longer wanted; the orphan task will keep
-        // updating its key in the cache, but the cache snapshot at sample
-        // emission filters by `fields`. To avoid the orphan-update overhead
-        // we instead spawn each task with its own field-scoped child token
-        // that we track separately.
-        //
-        // For this first pass, mutate the cache in-place to reflect the
-        // requested set: drop unwanted keys, spawn missing ones. Newly added
-        // tasks come up with their own connection lifecycle.
+        // Serialise so two concurrent updates can't both decide the same
+        // field is missing and spawn it twice.
+        let _guard = update_lock.lock().await;
+
         let wanted: std::collections::HashSet<&str> = fields.iter().map(|s| s.as_str()).collect();
-        extras.retain(|k, _| wanted.contains(k.as_str()));
+
+        // Cancel + drop tasks for fields that left the set. Removing the
+        // entry from `field_tokens` also drops our handle on the child
+        // token; the spawned task observes `cancelled()` and exits.
+        let to_remove: Vec<String> = field_tokens
+            .iter()
+            .filter(|e| !wanted.contains(e.key().as_str()))
+            .map(|e| e.key().clone())
+            .collect();
+        for key in to_remove {
+            if let Some((_, token)) = field_tokens.remove(&key) {
+                token.cancel();
+            }
+            extras.remove(&key);
+        }
+
+        // Spawn tasks for fields newly added. Existing fields keep their
+        // task and their last cached value.
         for f in fields {
-            if !extras.contains_key(f) {
+            if !field_tokens.contains_key(f) {
+                let child = parent_token.child_token();
+                field_tokens.insert(f.clone(), child.clone());
                 spawn_extra_field_monitor(
                     &self.ca_client,
                     pv_name,
                     f,
                     extras.clone(),
-                    parent_token.clone(),
+                    child,
                 );
             }
         }

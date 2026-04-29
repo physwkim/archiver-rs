@@ -6,6 +6,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
 
+use archiver_core::etl::executor::EtlExecutor;
 use archiver_core::storage::traits::StoragePlugin;
 
 use crate::security::RateLimiter;
@@ -39,6 +40,10 @@ pub struct AppState {
     pub trust_proxy_headers: bool,
     /// External archivers consulted for failover-merged retrieval.
     pub failover: Option<Arc<FailoverState>>,
+    /// ETL executors keyed by destination tier name (e.g. "MTS", "LTS").
+    /// `consolidateDataForPV` chains them to force-move a PV's data toward
+    /// the requested tier.
+    pub etl_chain: Vec<Arc<EtlExecutor>>,
 }
 
 /// Middleware that records HTTP request metrics.

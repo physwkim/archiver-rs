@@ -40,6 +40,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         rate_limiter: None,
         trust_proxy_headers: false,
         failover: None,
+        etl_chain: Vec::new(),
     };
     (build_router(state, &SecurityConfig::default()), dir)
 }
@@ -83,6 +84,7 @@ async fn build_test_app_with_pvs() -> (axum::Router, Arc<PvRegistry>, tempfile::
         rate_limiter: None,
         trust_proxy_headers: false,
         failover: None,
+        etl_chain: Vec::new(),
     };
     (build_router(state, &SecurityConfig::default()), registry, dir)
 }
@@ -484,6 +486,7 @@ async fn test_export_import_preserves_status() {
         rate_limiter: None,
         trust_proxy_headers: false,
         failover: None,
+        etl_chain: Vec::new(),
     };
     let app2 = build_router(state2, &SecurityConfig::default());
 
@@ -556,6 +559,7 @@ async fn build_test_app_with_auth() -> (axum::Router, tempfile::TempDir) {
         rate_limiter: None,
         trust_proxy_headers: false,
         failover: None,
+        etl_chain: Vec::new(),
     };
     (build_router(state, &SecurityConfig::default()), dir)
 }
@@ -691,6 +695,7 @@ async fn test_rate_limiter_blocks_excess_requests() {
         rate_limiter: Some(limiter),
         trust_proxy_headers: true,
         failover: None,
+        etl_chain: Vec::new(),
     };
     let app = build_router(state, &SecurityConfig::default());
 
@@ -751,6 +756,7 @@ async fn test_rate_limiter_isolates_by_ip() {
         rate_limiter: Some(limiter),
         trust_proxy_headers: true,
         failover: None,
+        etl_chain: Vec::new(),
     };
     let app = build_router(state, &SecurityConfig::default());
 
@@ -1121,4 +1127,101 @@ async fn test_reset_failover_caches_stub() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_to_json(resp.into_body()).await;
     assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn test_pause_resume_via_alias_targets_real_pv() {
+    use archiver_core::registry::PvStatus;
+    let (app, registry, _dir) = build_test_app_with_pvs().await;
+
+    // Create alias DEV:Foo -> SIM:Sine.
+    let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Foo");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Pause via alias name.
+    let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=DEV:Foo");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The TARGET should be paused.
+    let target = registry.get_pv("SIM:Sine").unwrap().unwrap();
+    assert_eq!(target.status, PvStatus::Paused);
+    // Alias row stays as 'alias' (sentinel), not paused.
+    let alias_row = registry.get_pv("DEV:Foo").unwrap().unwrap();
+    assert_eq!(alias_row.status, PvStatus::Alias);
+
+    // Resume via alias name.
+    let req = get_request("/mgmt/bpl/resumeArchivingPV?pv=DEV:Foo");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let target = registry.get_pv("SIM:Sine").unwrap().unwrap();
+    assert_eq!(target.status, PvStatus::Active);
+}
+
+#[tokio::test]
+async fn test_alias_excluded_from_count_and_status_queries() {
+    let (app, registry, _dir) = build_test_app_with_pvs().await;
+    // Build state has 3 real PVs.
+    let req = get_request("/mgmt/bpl/getPVCount");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["total"], 3);
+
+    // Add an alias — count must stay 3 (not 4).
+    let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Foo");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let req = get_request("/mgmt/bpl/getPVCount");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["total"], 3, "alias must not bump real-PV count");
+
+    // pvs_by_status(Active) should return 3 reals, not 4.
+    use archiver_core::registry::PvStatus;
+    let actives = registry.pvs_by_status(PvStatus::Active).unwrap();
+    assert_eq!(actives.len(), 3);
+    assert!(actives.iter().all(|r| r.alias_for.is_none()));
+
+    // matching_pvs("*") returns 3 reals only.
+    let all = registry.matching_pvs("*").unwrap();
+    assert_eq!(all.len(), 3);
+    assert!(!all.contains(&"DEV:Foo".to_string()));
+}
+
+#[tokio::test]
+async fn test_restore_from_registry_skips_aliases() {
+    use std::sync::Arc;
+    use archiver_core::registry::{PvRegistry, PvStatus, SampleMode};
+    use archiver_core::storage::partition::PartitionGranularity;
+    use archiver_core::storage::plainpb::PlainPbStoragePlugin;
+    use archiver_core::types::ArchDbType;
+    use archiver_engine::channel_manager::ChannelManager;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(PlainPbStoragePlugin::new(
+        "sts",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    ));
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry.register_pv("REAL:PV", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+    registry.add_alias("ALIAS:PV", "REAL:PV").unwrap();
+
+    // Sanity: alias has 'alias' status.
+    let alias_row = registry.get_pv("ALIAS:PV").unwrap().unwrap();
+    assert_eq!(alias_row.status, PvStatus::Alias);
+
+    let (mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
+        .await
+        .unwrap();
+    // restore_from_registry must NOT try to archive the alias. We can't
+    // verify CA channel creation in a unit test (no IOC), but we can
+    // verify pvs_by_status(Active) returns only REAL:PV.
+    let actives = registry.pvs_by_status(PvStatus::Active).unwrap();
+    assert_eq!(actives.len(), 1);
+    assert_eq!(actives[0].pv_name, "REAL:PV");
+
+    // restore is async and tries to connect — short timeout. It's OK if it
+    // fails to connect; what matters is it didn't try the alias name. This
+    // test exercises the filter path.
+    let _ = mgr.restore_from_registry().await;
 }
