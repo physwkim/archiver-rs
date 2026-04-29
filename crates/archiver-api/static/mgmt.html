@@ -10,7 +10,7 @@
   .header { background: #1a237e; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
   .header h1 { font-size: 20px; font-weight: 500; }
   .header .version { font-size: 12px; opacity: 0.7; }
-  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  .container { max-width: min(1800px, 98vw); margin: 0 auto; padding: 24px; }
   .tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
   .tab { padding: 8px 16px; border: 1px solid #ddd; background: white; cursor: pointer; border-radius: 4px 4px 0 0; font-size: 14px; }
   .tab.active { background: #1a237e; color: white; border-color: #1a237e; }
@@ -31,7 +31,10 @@
   table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
   th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; }
   th { background: #fafafa; font-weight: 600; position: sticky; top: 0; }
-  .table-wrap { max-height: 500px; overflow-y: auto; }
+  /* Use most of the viewport height so long PV lists are visible
+     without scrolling the entire page. ~300px reserves room for the
+     header, stat cards, tabs row, and the toolbar above each table. */
+  .table-wrap { max-height: calc(100vh - 300px); min-height: 320px; overflow-y: auto; resize: vertical; }
   .status-badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 500; }
   .status-active { background: #e8f5e9; color: #2e7d32; }
   .status-paused { background: #fff3e0; color: #e65100; }
