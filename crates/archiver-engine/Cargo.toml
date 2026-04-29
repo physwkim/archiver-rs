@@ -17,3 +17,4 @@ chrono = { workspace = true }
 epics-rs = { workspace = true }
 tokio-util = { workspace = true }
 metrics = { workspace = true }
+futures = { workspace = true }

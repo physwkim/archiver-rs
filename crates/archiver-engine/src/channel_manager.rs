@@ -158,6 +158,10 @@ pub struct ChannelManager {
     /// PVs currently being archived (in-progress CA connect). Prevents TOCTOU races
     /// where two concurrent `archive_pv` calls could double-subscribe the same PV.
     pending_archives: DashMap<String, ()>,
+    /// Per-PV mutex serialising archive/pause/resume/stop/destroy on a single
+    /// PV. Without this, e.g. `pause_pv` racing with `resume_pv` can leave
+    /// the registry status and the channel map disagreeing.
+    op_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Storage backend.
     #[allow(dead_code)]
     storage: Arc<dyn StoragePlugin>,
@@ -194,6 +198,7 @@ impl ChannelManager {
             ca_client,
             channels: DashMap::new(),
             pending_archives: DashMap::new(),
+            op_locks: DashMap::new(),
             storage,
             registry,
             sample_tx: tx,
@@ -201,6 +206,20 @@ impl ChannelManager {
         };
 
         Ok((mgr, rx))
+    }
+
+    /// Get-or-insert the per-PV operation mutex. The returned `Arc<Mutex>`
+    /// is what callers should `.lock().await` on; holding the entry guard
+    /// (via `entry().or_insert_with`) across the await would deadlock the
+    /// DashMap shard.
+    fn op_lock(&self, pv_name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        if let Some(existing) = self.op_locks.get(pv_name) {
+            return existing.clone();
+        }
+        self.op_locks
+            .entry(pv_name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Restore all active PVs from the registry (called on startup).
@@ -245,6 +264,10 @@ impl ChannelManager {
         pv_name: &str,
         sample_mode: &SampleMode,
     ) -> anyhow::Result<()> {
+        // Serialise with pause/resume/stop/destroy on the same PV.
+        let lock = self.op_lock(pv_name);
+        let _g = lock.lock().await;
+
         if self.channels.contains_key(pv_name) {
             anyhow::bail!("PV {pv_name} is already being archived");
         }
@@ -481,7 +504,9 @@ impl ChannelManager {
     }
 
     /// Pause archiving for a PV.
-    pub fn pause_pv(&self, pv_name: &str) -> anyhow::Result<()> {
+    pub async fn pause_pv(&self, pv_name: &str) -> anyhow::Result<()> {
+        let lock = self.op_lock(pv_name);
+        let _g = lock.lock().await;
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
             let extra_count = handle.field_tokens.len() as f64;
             handle.cancel_token.cancel();
@@ -498,6 +523,9 @@ impl ChannelManager {
     /// Resume a paused PV. Only paused or error PVs can be resumed;
     /// calling resume on an already-active PV is a no-op (returns Ok).
     pub async fn resume_pv(&self, pv_name: &str) -> anyhow::Result<()> {
+        let lock = self.op_lock(pv_name);
+        let _g = lock.lock().await;
+
         let record = self
             .registry
             .get_pv(pv_name)?
@@ -528,7 +556,9 @@ impl ChannelManager {
 
     /// Stop archiving a PV without removing it from the registry.
     /// Sets the PV status to Inactive (data retained, monitoring stopped).
-    pub fn stop_pv(&self, pv_name: &str) -> anyhow::Result<()> {
+    pub async fn stop_pv(&self, pv_name: &str) -> anyhow::Result<()> {
+        let lock = self.op_lock(pv_name);
+        let _g = lock.lock().await;
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
             let extra_count = handle.field_tokens.len() as f64;
             handle.cancel_token.cancel();
@@ -543,7 +573,9 @@ impl ChannelManager {
     }
 
     /// Remove a PV from archiving entirely.
-    pub fn destroy_pv(&self, pv_name: &str) -> anyhow::Result<()> {
+    pub async fn destroy_pv(&self, pv_name: &str) -> anyhow::Result<()> {
+        let lock = self.op_lock(pv_name);
+        let _g = lock.lock().await;
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
             let extra_count = handle.field_tokens.len() as f64;
             handle.cancel_token.cancel();
@@ -553,6 +585,11 @@ impl ChannelManager {
             }
         }
         self.registry.remove_pv(pv_name)?;
+        // Don't remove the op_locks entry here: a concurrent caller may have
+        // already taken a clone of this Arc and be queued on it; removing
+        // would let a fresh caller obtain a new mutex and the queued one
+        // would race them. The map is bounded by the lifetime universe of
+        // PV names, which is acceptable.
         info!(pv = pv_name, "Destroyed archiving channel");
         Ok(())
     }
@@ -978,86 +1015,131 @@ fn spawn_extra_field_monitor(
     let field_owned = field.to_string();
     let pv_owned = pv_name.to_string();
 
+    // Catch-unwind boundary: a panic from the CA client (e.g. malformed
+    // wire frame, allocation failure inside epics_rs) would propagate to
+    // the runtime and abort sibling tasks of this worker thread. Trap it
+    // here, log with PV+field context, and return normally so the runtime
+    // remains healthy.
+    let panic_pv = pv_owned.clone();
+    let panic_field = field_owned.clone();
     tokio::spawn(async move {
-        // Initial connect attempt — failure here is non-fatal (the field may
-        // not exist on every IOC; we just leave the cache empty).
-        if channel.wait_connected(CA_CONNECT_TIMEOUT).await.is_err() {
-            debug!(
-                pv = pv_owned,
-                field = field_owned,
-                "Extra-field channel did not connect within timeout (will keep retrying via subscribe)"
+        let body = std::panic::AssertUnwindSafe(extra_field_monitor_body(
+            channel,
+            pv_owned,
+            field_owned,
+            extras,
+            parent_token,
+        ));
+        if let Err(payload) = futures::FutureExt::catch_unwind(body).await {
+            let msg = panic_payload_msg(&payload);
+            error!(
+                pv = panic_pv,
+                field = panic_field,
+                "Extra-field monitor panicked: {msg}"
             );
         }
+    });
+}
 
-        // Exponential backoff for misconfigured fields (e.g. operator
-        // listed `.HIHI` on a PV that doesn't expose it). Without this
-        // we'd retry every 5s forever, churning CA search packets and
-        // file descriptors. The cap is 60s; one warn at the cap so
-        // ops know to fix archive_fields.
-        let mut backoff = CA_RETRY_DELAY;
-        let max_backoff = Duration::from_secs(60);
-        let mut warned_at_cap = false;
+/// Body of the spawned extra-field monitor. Split out so the spawn site
+/// can wrap it in `catch_unwind`.
+async fn extra_field_monitor_body(
+    channel: CaChannel,
+    pv_owned: String,
+    field_owned: String,
+    extras: Arc<ExtraFieldsCache>,
+    parent_token: CancellationToken,
+) {
+    // Initial connect attempt — failure here is non-fatal (the field may
+    // not exist on every IOC; we just leave the cache empty).
+    if channel.wait_connected(CA_CONNECT_TIMEOUT).await.is_err() {
+        debug!(
+            pv = pv_owned,
+            field = field_owned,
+            "Extra-field channel did not connect within timeout (will keep retrying via subscribe)"
+        );
+    }
 
-        loop {
-            // Cancel-aware subscribe attempt.
-            tokio::select! {
-                _ = parent_token.cancelled() => return,
-                sub = channel.subscribe() => {
-                    let mut monitor = match sub {
-                        Ok(m) => m,
-                        Err(e) => {
-                            debug!(
+    // Exponential backoff for misconfigured fields (e.g. operator
+    // listed `.HIHI` on a PV that doesn't expose it). Without this
+    // we'd retry every 5s forever, churning CA search packets and
+    // file descriptors. The cap is 60s; one warn at the cap so
+    // ops know to fix archive_fields.
+    let mut backoff = CA_RETRY_DELAY;
+    let max_backoff = Duration::from_secs(60);
+    let mut warned_at_cap = false;
+
+    loop {
+        // Cancel-aware subscribe attempt.
+        tokio::select! {
+            _ = parent_token.cancelled() => return,
+            sub = channel.subscribe() => {
+                let mut monitor = match sub {
+                    Ok(m) => m,
+                    Err(e) => {
+                        debug!(
+                            pv = pv_owned,
+                            field = field_owned,
+                            ?backoff,
+                            "Extra-field subscribe failed: {e}; retrying"
+                        );
+                        if backoff >= max_backoff && !warned_at_cap {
+                            warn!(
                                 pv = pv_owned,
                                 field = field_owned,
-                                ?backoff,
-                                "Extra-field subscribe failed: {e}; retrying"
+                                "Extra-field repeatedly fails to subscribe; \
+                                 check archive_fields config (now retrying every 60s)"
                             );
-                            if backoff >= max_backoff && !warned_at_cap {
-                                warn!(
-                                    pv = pv_owned,
-                                    field = field_owned,
-                                    "Extra-field repeatedly fails to subscribe; \
-                                     check archive_fields config (now retrying every 60s)"
-                                );
-                                warned_at_cap = true;
-                            }
-                            let sleep_for = backoff;
-                            backoff = (backoff * 2).min(max_backoff);
-                            tokio::select! {
-                                _ = parent_token.cancelled() => return,
-                                _ = tokio::time::sleep(sleep_for) => continue,
-                            }
+                            warned_at_cap = true;
                         }
-                    };
-                    // Subscribe succeeded — reset backoff so the next
-                    // failure starts at the short delay again.
-                    backoff = CA_RETRY_DELAY;
-                    warned_at_cap = false;
-                    loop {
+                        let sleep_for = backoff;
+                        backoff = (backoff * 2).min(max_backoff);
                         tokio::select! {
                             _ = parent_token.cancelled() => return,
-                            ev = monitor.recv() => match ev {
-                                Some(Ok(snapshot)) => {
-                                    extras.insert(
-                                        field_owned.clone(),
-                                        epics_value_to_field_string(&snapshot.value),
-                                    );
-                                }
-                                Some(Err(e)) => {
-                                    debug!(
-                                        pv = pv_owned,
-                                        field = field_owned,
-                                        "Extra-field monitor error: {e}"
-                                    );
-                                }
-                                None => break, // resubscribe
+                            _ = tokio::time::sleep(sleep_for) => continue,
+                        }
+                    }
+                };
+                // Subscribe succeeded — reset backoff so the next
+                // failure starts at the short delay again.
+                backoff = CA_RETRY_DELAY;
+                warned_at_cap = false;
+                loop {
+                    tokio::select! {
+                        _ = parent_token.cancelled() => return,
+                        ev = monitor.recv() => match ev {
+                            Some(Ok(snapshot)) => {
+                                extras.insert(
+                                    field_owned.clone(),
+                                    epics_value_to_field_string(&snapshot.value),
+                                );
                             }
+                            Some(Err(e)) => {
+                                debug!(
+                                    pv = pv_owned,
+                                    field = field_owned,
+                                    "Extra-field monitor error: {e}"
+                                );
+                            }
+                            None => break, // resubscribe
                         }
                     }
                 }
             }
         }
-    });
+    }
+}
+
+/// Format a panic payload (Box<dyn Any>) as a printable string. Mirrors
+/// what `std::panicking::default_hook` extracts for the message.
+fn panic_payload_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 /// Convert epics-base-rs DbFieldType to archiver ArchDbType.

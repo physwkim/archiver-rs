@@ -161,7 +161,7 @@ pub async fn get_pvs_by_storage_consumed(
     // store summary. This is O(pv_count) directory scans — acceptable for
     // an admin query but not something to expose without a sane default
     // limit.
-    let mut entries: Vec<(String, u64)> = Vec::with_capacity(pvs.len());
+    let mut entries: Vec<(String, u64, u64)> = Vec::with_capacity(pvs.len());
     for pv in pvs {
         let summaries = match state.storage.stores_for_pv(&pv) {
             Ok(s) => s,
@@ -170,26 +170,20 @@ pub async fn get_pvs_by_storage_consumed(
                 continue;
             }
         };
-        let total: u64 = summaries
-            .iter()
-            .filter_map(|s| {
-                // pv_file_count is set; size on disk requires another
-                // scan. Approximate with file count for now — a precise
-                // size would require an extra method on the trait.
-                s.pv_file_count
-            })
-            .sum();
-        entries.push((pv, total));
+        let bytes: u64 = summaries.iter().filter_map(|s| s.pv_size_bytes).sum();
+        let files: u64 = summaries.iter().filter_map(|s| s.pv_file_count).sum();
+        entries.push((pv, bytes, files));
     }
     entries.sort_by(|a, b| b.1.cmp(&a.1));
     entries.truncate(limit);
 
     let json: Vec<serde_json::Value> = entries
         .into_iter()
-        .map(|(pv, files)| {
+        .map(|(pv, bytes, files)| {
             serde_json::json!({
                 "pvName": pv,
-                "files": files,
+                "storageConsumedBytes": bytes,
+                "fileCount": files,
             })
         })
         .collect();

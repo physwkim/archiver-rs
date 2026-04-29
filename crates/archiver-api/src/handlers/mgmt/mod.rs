@@ -137,7 +137,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/mgmt/bpl/namedFlagsAll", get(p2::named_flags_all))
         .route("/mgmt/bpl/namedFlagsGet", get(p2::named_flags_get))
-        .route("/mgmt/bpl/namedFlagsSet", get(p2::named_flags_set))
+        // POST: this endpoint mutates the global flag store. A GET would be
+        // a REST contract violation and would be triggerable cross-origin
+        // via prefetch / link previews even with auth.
+        .route("/mgmt/bpl/namedFlagsSet", post(p2::named_flags_set))
         .route(
             "/mgmt/bpl/getApplianceMetricsDetails",
             get(p2::appliance_metrics_details),
@@ -365,7 +368,26 @@ async fn forward_pv_batch_to_peer(
     endpoint: &str,
     pv_names: &[String],
 ) -> Vec<BulkResult> {
-    let body = serde_json::to_string(pv_names).unwrap_or_default();
+    // Serializing a Vec<String> can't really fail, but if it ever does we
+    // must NOT POST an empty body to the peer (it would either NOOP or 400
+    // and we'd report success). Surface the error per-PV instead.
+    let body = match serde_json::to_string(pv_names) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                endpoint,
+                mgmt_url,
+                "Failed to serialize PV batch for peer forward: {e}"
+            );
+            return pv_names
+                .iter()
+                .map(|pv| BulkResult {
+                    pv_name: pv.clone(),
+                    status: format!("forward serialization failed: {e}"),
+                })
+                .collect();
+        }
+    };
     match cluster
         .proxy_mgmt_post(mgmt_url, endpoint, body.into())
         .await

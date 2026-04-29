@@ -99,7 +99,10 @@ pub async fn get_data_at_time_engine(
             None => (None, Some("not archived on this appliance".to_string())),
         };
         let mut entry = serde_json::Map::new();
-        entry.insert("lastEvent".into(), serde_json::to_value(last_event).unwrap());
+        entry.insert(
+            "lastEvent".into(),
+            serde_json::to_value(last_event).unwrap_or(serde_json::Value::Null),
+        );
         if let Some(v) = value {
             entry.insert("value".into(), v);
         }

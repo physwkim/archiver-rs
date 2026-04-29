@@ -111,7 +111,7 @@ impl ArchiverCommand for FakeArchiverControl {
         Ok(())
     }
 
-    fn pause_pv(&self, pv: &str) -> anyhow::Result<()> {
+    async fn pause_pv(&self, pv: &str) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
         state.paused.insert(pv.to_string());
         Ok(())
@@ -123,14 +123,14 @@ impl ArchiverCommand for FakeArchiverControl {
         Ok(())
     }
 
-    fn stop_pv(&self, pv: &str) -> anyhow::Result<()> {
+    async fn stop_pv(&self, pv: &str) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
         state.stopped.insert(pv.to_string());
         state.archived.remove(pv);
         Ok(())
     }
 
-    fn destroy_pv(&self, pv: &str) -> anyhow::Result<()> {
+    async fn destroy_pv(&self, pv: &str) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
         state.archived.remove(pv);
         state.paused.remove(pv);

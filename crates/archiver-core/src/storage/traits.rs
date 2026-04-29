@@ -17,6 +17,9 @@ pub struct StoreSummary {
     /// Number of `.pb` partition files this tier holds for the given PV.
     /// `None` when the summary was requested without a PV scope.
     pub pv_file_count: Option<u64>,
+    /// Sum of `.pb` file sizes (bytes) for the given PV in this tier.
+    /// `None` when the summary was requested without a PV scope.
+    pub pv_size_bytes: Option<u64>,
     /// Total size on disk of all `.pb` files in this tier (bytes), summed across PVs.
     /// `None` when the summary is PV-scoped.
     pub total_size_bytes: Option<u64>,

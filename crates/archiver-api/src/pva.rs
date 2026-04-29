@@ -179,9 +179,22 @@ fn run_get_data_rpc(
     }
     let canonical = pv_query.canonical_name(&pv_in).unwrap_or(pv_in.clone());
 
-    let start = parse_iso8601(&from)
-        .unwrap_or_else(|| SystemTime::now() - Duration::from_secs(3600));
-    let end = parse_iso8601(&to).unwrap_or_else(SystemTime::now);
+    // Empty `from`/`to` fall back to defaults; non-empty unparseable strings
+    // are an error so client bugs surface instead of silently being mapped
+    // to "last hour". Cap echoed user input so a malicious 1MB payload
+    // doesn't translate into a 1MB error response.
+    let start = if from.is_empty() {
+        SystemTime::now() - Duration::from_secs(3600)
+    } else {
+        parse_iso8601(&from)
+            .ok_or_else(|| format!("invalid 'from' timestamp: {}", truncate_for_error(&from)))?
+    };
+    let end = if to.is_empty() {
+        SystemTime::now()
+    } else {
+        parse_iso8601(&to)
+            .ok_or_else(|| format!("invalid 'to' timestamp: {}", truncate_for_error(&to)))?
+    };
 
     let post = processing.as_deref().and_then(parse_post_processor);
 
@@ -210,7 +223,12 @@ fn run_get_data_at_time_rpc(
         return Err("pv field is required".to_string());
     }
     let canonical = pv_query.canonical_name(&pv_in).unwrap_or(pv_in.clone());
-    let target = parse_iso8601(&at).unwrap_or_else(SystemTime::now);
+    let target = if at.is_empty() {
+        SystemTime::now()
+    } else {
+        parse_iso8601(&at)
+            .ok_or_else(|| format!("invalid 'at' timestamp: {}", truncate_for_error(&at)))?
+    };
 
     let storage = storage.clone();
     let sample_opt = tokio::task::block_in_place(|| {
@@ -350,6 +368,21 @@ fn sample_to_double(v: &ArchiverValue) -> f64 {
         ArchiverValue::ScalarEnum(i) => *i as f64,
         _ => f64::NAN,
     }
+}
+
+/// Truncate a user-provided string for inclusion in an error response. ISO
+/// 8601 is at most ~30 chars; 64 leaves headroom while bounding response
+/// size when the client sends garbage.
+fn truncate_for_error(s: &str) -> String {
+    const MAX: usize = 64;
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let mut end = MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 fn parse_iso8601(s: &str) -> Option<SystemTime> {

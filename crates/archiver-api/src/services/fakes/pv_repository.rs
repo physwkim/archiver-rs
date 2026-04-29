@@ -31,16 +31,27 @@ impl PvQueryRepository for InMemoryPvRepository {
     }
 
     fn all_pv_names(&self) -> anyhow::Result<Vec<String>> {
-        let mut names: Vec<String> = self.pvs.lock().unwrap().keys().cloned().collect();
+        // Mirror real registry's `WHERE alias_for IS NULL`: this returns
+        // *real* PVs only, not aliases. expanded_pv_names is the
+        // alias-inclusive variant.
+        let lock = self.pvs.lock().unwrap();
+        let mut names: Vec<String> = lock
+            .values()
+            .filter(|r| r.alias_for.is_none())
+            .map(|r| r.pv_name.clone())
+            .collect();
         names.sort();
         Ok(names)
     }
 
     fn matching_pvs(&self, pattern: &str) -> anyhow::Result<Vec<String>> {
+        // Real registry filters aliases out of glob matches.
         let lock = self.pvs.lock().unwrap();
         let glob = pattern.replace('*', "");
         let mut names: Vec<String> = lock
-            .keys()
+            .values()
+            .filter(|r| r.alias_for.is_none())
+            .map(|r| r.pv_name.clone())
             .filter(|k| {
                 if pattern.ends_with('*') {
                     k.starts_with(&glob)
@@ -50,17 +61,22 @@ impl PvQueryRepository for InMemoryPvRepository {
                     k.contains(&glob)
                 }
             })
-            .cloned()
             .collect();
         names.sort();
         Ok(names)
     }
 
     fn count(&self, status: Option<PvStatus>) -> anyhow::Result<u64> {
+        // Real registry's count() excludes aliases. Aliases have
+        // `status='alias'` and would otherwise inflate Active counts when
+        // a caller queries with status=None.
         let lock = self.pvs.lock().unwrap();
         let count = match status {
-            Some(s) => lock.values().filter(|r| r.status == s).count(),
-            None => lock.len(),
+            Some(s) => lock
+                .values()
+                .filter(|r| r.alias_for.is_none() && r.status == s)
+                .count(),
+            None => lock.values().filter(|r| r.alias_for.is_none()).count(),
         };
         Ok(count as u64)
     }
@@ -82,38 +98,43 @@ impl PvQueryRepository for InMemoryPvRepository {
     }
 
     fn recently_added_pvs(&self, since: SystemTime) -> anyhow::Result<Vec<PvRecord>> {
+        // Real registry filters aliases out (`WHERE created_at >= ? AND alias_for IS NULL`).
+        let since_dt = chrono::DateTime::<chrono::Utc>::from(since);
         let lock = self.pvs.lock().unwrap();
         let records: Vec<PvRecord> = lock
             .values()
-            .filter(|r| r.created_at >= chrono::DateTime::<chrono::Utc>::from(since))
+            .filter(|r| r.alias_for.is_none() && r.created_at >= since_dt)
             .cloned()
             .collect();
         Ok(records)
     }
 
     fn recently_modified_pvs(&self, since: SystemTime) -> anyhow::Result<Vec<PvRecord>> {
+        // Mirror the real registry: filter on updated_at (any schema-affecting
+        // change), not last_timestamp (sample arrival). Aliases excluded for
+        // parity with `WHERE alias_for IS NULL`.
+        let since_dt = chrono::DateTime::<chrono::Utc>::from(since);
         let lock = self.pvs.lock().unwrap();
         let records: Vec<PvRecord> = lock
             .values()
-            .filter(|r| {
-                r.last_timestamp
-                    .map(|ts| ts >= since)
-                    .unwrap_or(false)
-            })
+            .filter(|r| r.alias_for.is_none() && r.updated_at >= since_dt)
             .cloned()
             .collect();
         Ok(records)
     }
 
     fn silent_pvs(&self, threshold: Duration) -> anyhow::Result<Vec<PvRecord>> {
+        // Real registry filters aliases out (aliases never carry samples,
+        // so they'd otherwise pollute the silent-PV report).
         let cutoff = SystemTime::now() - threshold;
         let lock = self.pvs.lock().unwrap();
         let records: Vec<PvRecord> = lock
             .values()
             .filter(|r| {
-                r.last_timestamp
-                    .map(|ts| ts < cutoff)
-                    .unwrap_or(false)
+                r.alias_for.is_none()
+                    && r.last_timestamp
+                        .map(|ts| ts < cutoff)
+                        .unwrap_or(false)
             })
             .cloned()
             .collect();
@@ -150,7 +171,12 @@ impl PvQueryRepository for InMemoryPvRepository {
     }
 
     fn expanded_pv_names(&self) -> anyhow::Result<Vec<String>> {
-        self.all_pv_names()
+        // Real registry returns ALL names including aliases (no filter on
+        // alias_for). Don't delegate to all_pv_names — that one filters
+        // aliases out.
+        let mut names: Vec<String> = self.pvs.lock().unwrap().keys().cloned().collect();
+        names.sort();
+        Ok(names)
     }
 }
 
@@ -189,6 +215,7 @@ impl PvCommandRepository for InMemoryPvRepository {
     fn set_status(&self, pv: &str, status: PvStatus) -> anyhow::Result<bool> {
         if let Some(record) = self.pvs.lock().unwrap().get_mut(pv) {
             record.status = status;
+            record.updated_at = chrono::Utc::now();
             Ok(true)
         } else {
             Ok(false)
@@ -198,6 +225,7 @@ impl PvCommandRepository for InMemoryPvRepository {
     fn update_sample_mode(&self, pv: &str, mode: &SampleMode) -> anyhow::Result<bool> {
         if let Some(record) = self.pvs.lock().unwrap().get_mut(pv) {
             record.sample_mode = mode.clone();
+            record.updated_at = chrono::Utc::now();
             Ok(true)
         } else {
             Ok(false)
@@ -217,6 +245,7 @@ impl PvCommandRepository for InMemoryPvRepository {
             if let Some(e) = egu {
                 record.egu = Some(e.to_string());
             }
+            record.updated_at = chrono::Utc::now();
             Ok(true)
         } else {
             Ok(false)
@@ -265,6 +294,7 @@ impl PvCommandRepository for InMemoryPvRepository {
     fn update_archive_fields(&self, pv: &str, fields: &[String]) -> anyhow::Result<bool> {
         if let Some(record) = self.pvs.lock().unwrap().get_mut(pv) {
             record.archive_fields = fields.to_vec();
+            record.updated_at = chrono::Utc::now();
             Ok(true)
         } else {
             Ok(false)
@@ -274,6 +304,7 @@ impl PvCommandRepository for InMemoryPvRepository {
     fn update_policy_name(&self, pv: &str, policy_name: Option<&str>) -> anyhow::Result<bool> {
         if let Some(record) = self.pvs.lock().unwrap().get_mut(pv) {
             record.policy_name = policy_name.map(|s| s.to_string());
+            record.updated_at = chrono::Utc::now();
             Ok(true)
         } else {
             Ok(false)
@@ -304,7 +335,7 @@ impl PvCommandRepository for InMemoryPvRepository {
             dbr_type: target_record.dbr_type,
             sample_mode: target_record.sample_mode.clone(),
             element_count: target_record.element_count,
-            status: PvStatus::Active,
+            status: PvStatus::Alias,
             created_at: now,
             updated_at: now,
             last_timestamp: None,

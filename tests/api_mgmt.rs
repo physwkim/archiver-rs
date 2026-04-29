@@ -1407,7 +1407,11 @@ async fn test_p1_mgmt_metrics_exposes_counts() {
 async fn test_p2_named_flags_roundtrip() {
     let (app, _reg, _dir) = build_test_app_with_pvs().await;
 
-    let req = get_request("/mgmt/bpl/namedFlagsSet?name=alpha&value=true");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/namedFlagsSet?name=alpha&value=true")
+        .body(Body::empty())
+        .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 

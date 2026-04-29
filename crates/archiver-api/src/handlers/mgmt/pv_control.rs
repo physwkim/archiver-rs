@@ -278,6 +278,7 @@ pub async fn pause_archiving_pv(
     state
         .archiver_cmd
         .pause_pv(&canonical)
+        .await
         .map_err(|e| ApiError::Internal(format!("Failed to pause PV {canonical}: {e}")))?;
     Ok(format!("Successfully paused PV {canonical}").into_response())
 }
@@ -319,7 +320,7 @@ pub async fn bulk_pause_archiving_pv(
     }
 
     for pv in &local_pvs {
-        let status = match state.archiver_cmd.pause_pv(pv) {
+        let status = match state.archiver_cmd.pause_pv(pv).await {
             Ok(()) => "Successfully paused".to_string(),
             Err(e) => {
                 tracing::warn!(pv, "Failed to pause: {e}");
@@ -450,7 +451,8 @@ pub async fn abort_archiving_pv(
         state.pv_query.as_ref(),
         state.archiver_cmd.as_ref(),
         &canonical,
-    )?;
+    )
+    .await?;
 
     Ok(msg.into_response())
 }

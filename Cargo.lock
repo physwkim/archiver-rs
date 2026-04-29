@@ -187,6 +187,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "epics-rs",
+ "futures",
  "metrics 0.24.3",
  "serde",
  "thiserror 2.0.18",

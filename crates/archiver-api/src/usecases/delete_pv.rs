@@ -16,6 +16,7 @@ pub async fn delete_pv(
 ) -> Result<DeletePvResult, ApiError> {
     archiver_cmd
         .destroy_pv(pv)
+        .await
         .map_err(|e| ApiError::Internal(format!("Failed to delete PV {pv}: {e}")))?;
 
     let files_deleted = if delete_data {

@@ -161,7 +161,8 @@ impl PvRegistry {
         )?;
         // Step 2: migrations for tables created with older schemas. Each statement
         // runs independently because SQLite stops on the first duplicate-column
-        // error when batched.
+        // error when batched. Only "duplicate column" errors are silently
+        // accepted; disk-full / lock / corruption errors must surface.
         for stmt in [
             "ALTER TABLE pv_info ADD COLUMN prec TEXT",
             "ALTER TABLE pv_info ADD COLUMN egu TEXT",
@@ -169,7 +170,11 @@ impl PvRegistry {
             "ALTER TABLE pv_info ADD COLUMN archive_fields TEXT",
             "ALTER TABLE pv_info ADD COLUMN policy_name TEXT",
         ] {
-            let _ = conn.execute(stmt, []);
+            match conn.execute(stmt, []) {
+                Ok(_) => {}
+                Err(e) if is_duplicate_column_error(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         // Step 3: indexes that reference newly-added columns. Done after ALTER
         // so an upgraded database has the columns to index.
@@ -681,6 +686,17 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<PvRecord> {
         archive_fields,
         policy_name,
     })
+}
+
+/// SQLite returns generic `Error` for ALTER TABLE failures. Match on the
+/// message because rusqlite doesn't expose a structured "duplicate column"
+/// extended-code; the SQLite error string is `duplicate column name: <name>`.
+fn is_duplicate_column_error(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(_, Some(msg))
+            if msg.starts_with("duplicate column name")
+    )
 }
 
 #[cfg(test)]

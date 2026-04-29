@@ -3,7 +3,7 @@ use archiver_core::registry::PvStatus;
 use crate::errors::ApiError;
 use crate::services::traits::{ArchiverCommand, PvQueryRepository};
 
-pub fn abort_archiving(
+pub async fn abort_archiving(
     pv_query: &dyn PvQueryRepository,
     archiver_cmd: &dyn ArchiverCommand,
     pv: &str,
@@ -21,6 +21,7 @@ pub fn abort_archiving(
 
     archiver_cmd
         .stop_pv(pv)
+        .await
         .map_err(|e| ApiError::Internal(format!("Failed to abort archiving PV {pv}: {e}")))?;
 
     Ok(format!(

@@ -37,6 +37,10 @@ pub async fn add_alias(
 }
 
 /// `GET /mgmt/bpl/removeAlias?pv=<target>&aliasname=<alias>`
+///
+/// Verifies that `aliasname` actually points at `pv` before deleting, so a
+/// caller passing the wrong target gets a 400 instead of silently removing
+/// an unrelated alias and getting back a misleading "ok" response.
 pub async fn remove_alias(
     State(state): State<AppState>,
     Query(params): Query<AliasParams>,
@@ -45,6 +49,32 @@ pub async fn remove_alias(
         return Err(ApiError::BadRequest(
             "pv and aliasname are required".to_string(),
         ));
+    }
+    // Validate the alias actually targets `pv` BEFORE deleting. If the row
+    // doesn't exist at all, fall through to the existing idempotent
+    // "not_found" response — repeated deletes are valid. But if it does
+    // exist and targets a different PV (or isn't an alias), reject so the
+    // caller doesn't silently destroy unrelated routing.
+    if let Some(row) = state
+        .pv_query
+        .get_pv(&params.aliasname)
+        .map_err(ApiError::internal)?
+    {
+        match row.alias_for.as_deref() {
+            None => {
+                return Err(ApiError::BadRequest(format!(
+                    "'{}' is a real PV, not an alias",
+                    params.aliasname
+                )));
+            }
+            Some(target) if target != params.pv => {
+                return Err(ApiError::BadRequest(format!(
+                    "alias '{}' targets '{}', not '{}'",
+                    params.aliasname, target, params.pv
+                )));
+            }
+            Some(_) => {}
+        }
     }
     let removed = state
         .pv_cmd

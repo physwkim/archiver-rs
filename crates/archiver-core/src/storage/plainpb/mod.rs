@@ -407,14 +407,19 @@ impl StoragePlugin for PlainPbStoragePlugin {
     }
 
     fn stores_for_pv(&self, pv: &str) -> anyhow::Result<Vec<StoreSummary>> {
-        let count = list_pv_pb_files(&self.root_folder, pv)
-            .map(|f| f.len() as u64)
-            .unwrap_or(0);
+        let files = list_pv_pb_files(&self.root_folder, pv).unwrap_or_default();
+        let count = files.len() as u64;
+        let bytes: u64 = files
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
         Ok(vec![StoreSummary {
             name: self.plugin_name.clone(),
             root_folder: self.root_folder.clone(),
             granularity: self.granularity,
             pv_file_count: Some(count),
+            pv_size_bytes: Some(bytes),
             total_size_bytes: None,
             total_files: None,
         }])
@@ -427,6 +432,7 @@ impl StoragePlugin for PlainPbStoragePlugin {
             root_folder: self.root_folder.clone(),
             granularity: self.granularity,
             pv_file_count: None,
+            pv_size_bytes: None,
             total_size_bytes: Some(total_size),
             total_files: Some(total_files),
         }])

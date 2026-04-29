@@ -81,15 +81,29 @@ pub async fn append_and_alias_pv(
         // not "archive without alias". destroy_pv tears down the
         // monitor task and removes the registry row.
         let alias_err = format!("{e}");
-        if let Err(cleanup_err) = state.archiver_cmd.destroy_pv(&q.pv) {
+        if let Err(cleanup_err) = state.archiver_cmd.destroy_pv(&q.pv).await {
+            // Counter so ops dashboards can trip an alert: this is the
+            // "archive started, alias failed, rollback also failed" state
+            // that needs a human to either delete the channel or manually
+            // add the alias.
+            metrics::counter!("archiver_dangling_archive_after_alias_failure")
+                .increment(1);
+            let appliance = state
+                .cluster
+                .as_ref()
+                .map(|c| c.identity().name)
+                .unwrap_or_else(|| "<standalone>".to_string());
             tracing::error!(
                 pv = q.pv,
-                "appendAndAliasPV: alias add failed AND archive rollback failed: \
+                appliance = appliance,
+                "appendAndAliasPV: alias add failed AND archive rollback failed; \
+                 PV is now archived without an alias and needs manual cleanup. \
                  alias error: {alias_err}; cleanup error: {cleanup_err}"
             );
             return ApiError::Internal(format!(
                 "alias add failed ({alias_err}) and archive rollback also failed \
-                 ({cleanup_err}); manual cleanup needed"
+                 ({cleanup_err}); manual cleanup needed for PV '{}' on {}",
+                q.pv, appliance
             ))
             .into_response();
         }
@@ -277,6 +291,8 @@ pub async fn reassign_appliance(
         Ok(s) => s,
         Err(e) => return ApiError::internal(e).into_response(),
     };
+    // Wall-clock cap: a stuck/slow LTS shouldn't pin the request indefinitely.
+    let preflight_deadline = std::time::Instant::now() + PREFLIGHT_MAX_DURATION;
     let mut preflight_count = 0usize;
     for mut s in preflight_streams {
         while let Ok(Some(_)) = s.next_event() {
@@ -289,10 +305,19 @@ pub async fn reassign_appliance(
                 ))
                 .into_response();
             }
+            if std::time::Instant::now() > preflight_deadline {
+                return ApiError::Internal(format!(
+                    "preflight scan for '{}' exceeded {}s; try a narrower \
+                     time window or check storage health",
+                    canonical,
+                    PREFLIGHT_MAX_DURATION.as_secs(),
+                ))
+                .into_response();
+            }
         }
     }
 
-    if let Err(e) = state.archiver_cmd.pause_pv(&canonical) {
+    if let Err(e) = state.archiver_cmd.pause_pv(&canonical).await {
         return ApiError::internal(e).into_response();
     }
     if let Err(e) = state.storage.flush_writes().await {
@@ -382,7 +407,7 @@ pub async fn reassign_appliance(
     if let Err(e) = state.storage.delete_pv_data(&canonical).await {
         tracing::warn!(pv = canonical, "failed to delete migrated source data: {e}");
     }
-    if let Err(e) = state.archiver_cmd.destroy_pv(&canonical) {
+    if let Err(e) = state.archiver_cmd.destroy_pv(&canonical).await {
         tracing::warn!(pv = canonical, "failed to destroy source channel: {e}");
     }
 
@@ -397,6 +422,9 @@ pub async fn reassign_appliance(
 }
 
 const MAX_MIGRATION_SAMPLES: usize = 500_000;
+/// Wall-clock cap for the reassign preflight scan. The sample-count
+/// cap above bounds memory; this bounds the time spent on a slow tier.
+const PREFLIGHT_MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ─── receivePVMigration (peer-side) ───────────────────────────────────
 
@@ -421,7 +449,12 @@ pub async fn receive_pv_migration(
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return ApiError::BadRequest("pvName missing".to_string()).into_response(),
     };
-    let dbr_type_i = bundle["dbrType"].as_i64().unwrap_or(6) as i32;
+    let dbr_type_i = match bundle["dbrType"].as_i64() {
+        Some(v) => v as i32,
+        None => {
+            return ApiError::BadRequest("dbrType missing".to_string()).into_response();
+        }
+    };
     let dbr_type = match archiver_core::types::ArchDbType::from_i32(dbr_type_i) {
         Some(t) => t,
         None => {
@@ -432,7 +465,15 @@ pub async fn receive_pv_migration(
         bundle["samplingMethod"].as_str(),
         bundle["samplingPeriod"].as_f64(),
     );
-    let element_count = bundle["elementCount"].as_i64().unwrap_or(1) as i32;
+    let element_count = match bundle["elementCount"].as_i64() {
+        Some(v) if v > 0 && v <= i32::MAX as i64 => v as i32,
+        Some(v) => {
+            return ApiError::BadRequest(format!("invalid elementCount: {v}")).into_response();
+        }
+        None => {
+            return ApiError::BadRequest("elementCount missing".to_string()).into_response();
+        }
+    };
     let prec = bundle["prec"].as_str().map(|s| s.to_string());
     let egu = bundle["egu"].as_str().map(|s| s.to_string());
     let archive_fields: Vec<String> = bundle["archiveFields"]
@@ -471,8 +512,22 @@ pub async fn receive_pv_migration(
 
     let mut written = 0usize;
     for s in samples {
-        let secs = s["secs"].as_i64().unwrap_or(0).max(0) as u64;
-        let nanos = s["nanos"].as_i64().unwrap_or(0) as u32;
+        let secs_i = s["secs"].as_i64().unwrap_or(0);
+        if secs_i < 0 {
+            return ApiError::BadRequest(format!(
+                "sample has negative secs: {secs_i}"
+            ))
+            .into_response();
+        }
+        let nanos_i = s["nanos"].as_i64().unwrap_or(0);
+        if !(0..1_000_000_000).contains(&nanos_i) {
+            return ApiError::BadRequest(format!(
+                "sample nanos out of range [0, 1e9): {nanos_i}"
+            ))
+            .into_response();
+        }
+        let secs = secs_i as u64;
+        let nanos = nanos_i as u32;
         let ts = std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
         let value = match json_to_archiver_value(&s["value"], dbr_type) {
             Some(v) => v,

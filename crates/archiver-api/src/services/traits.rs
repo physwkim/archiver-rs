@@ -97,10 +97,10 @@ pub struct PvCountersDto {
 #[async_trait]
 pub trait ArchiverCommand: Send + Sync {
     async fn archive_pv(&self, pv: &str, mode: &SampleMode) -> anyhow::Result<()>;
-    fn pause_pv(&self, pv: &str) -> anyhow::Result<()>;
+    async fn pause_pv(&self, pv: &str) -> anyhow::Result<()>;
     async fn resume_pv(&self, pv: &str) -> anyhow::Result<()>;
-    fn stop_pv(&self, pv: &str) -> anyhow::Result<()>;
-    fn destroy_pv(&self, pv: &str) -> anyhow::Result<()>;
+    async fn stop_pv(&self, pv: &str) -> anyhow::Result<()>;
+    async fn destroy_pv(&self, pv: &str) -> anyhow::Result<()>;
     /// Replace the set of EPICS metadata fields (.HIHI, .LOLO, .EGU, ...)
     /// that the engine samples alongside the main value for `pv`. Persists
     /// to the registry and (re)spawns per-field monitor tasks if the PV

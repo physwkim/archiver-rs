@@ -107,20 +107,20 @@ impl ArchiverCommand for ChannelArchiverControl {
         self.inner.archive_pv(pv, mode).await
     }
 
-    fn pause_pv(&self, pv: &str) -> anyhow::Result<()> {
-        self.inner.pause_pv(pv)
+    async fn pause_pv(&self, pv: &str) -> anyhow::Result<()> {
+        self.inner.pause_pv(pv).await
     }
 
     async fn resume_pv(&self, pv: &str) -> anyhow::Result<()> {
         self.inner.resume_pv(pv).await
     }
 
-    fn stop_pv(&self, pv: &str) -> anyhow::Result<()> {
-        self.inner.stop_pv(pv)
+    async fn stop_pv(&self, pv: &str) -> anyhow::Result<()> {
+        self.inner.stop_pv(pv).await
     }
 
-    fn destroy_pv(&self, pv: &str) -> anyhow::Result<()> {
-        self.inner.destroy_pv(pv)
+    async fn destroy_pv(&self, pv: &str) -> anyhow::Result<()> {
+        self.inner.destroy_pv(pv).await
     }
 
     async fn update_archive_fields(&self, pv: &str, fields: &[String]) -> anyhow::Result<()> {
