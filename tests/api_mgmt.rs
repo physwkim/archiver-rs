@@ -1225,3 +1225,89 @@ async fn test_restore_from_registry_skips_aliases() {
     // test exercises the filter path.
     let _ = mgr.restore_from_registry().await;
 }
+
+#[tokio::test]
+async fn test_consolidate_forwards_to_peer_for_remote_pv() {
+    use archiver_api::services::fakes::FakeClusterRouter;
+    use archiver_api::services::traits::{ApplianceIdentityDto, PeerDto, ResolvedPeerDto};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(archiver_core::storage::plainpb::PlainPbStoragePlugin::new(
+        "sts",
+        dir.path().to_path_buf(),
+        archiver_core::storage::partition::PartitionGranularity::Hour,
+    ));
+    let registry = Arc::new(archiver_core::registry::PvRegistry::in_memory().unwrap());
+    // Local has nothing — REMOTE:PV is owned by a peer.
+    let (channel_mgr, _rx) = archiver_engine::channel_manager::ChannelManager::new(
+        storage.clone(),
+        registry.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let channel_mgr = Arc::new(channel_mgr);
+    let repo = Arc::new(RegistryRepository::new(registry.clone()));
+    let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
+
+    let identity = ApplianceIdentityDto {
+        name: "appliance0".to_string(),
+        mgmt_url: "http://app0/mgmt/bpl".to_string(),
+        retrieval_url: "http://app0/retrieval".to_string(),
+        engine_url: "http://app0".to_string(),
+        etl_url: "http://app0".to_string(),
+    };
+    let peers = vec![PeerDto {
+        name: "appliance1".to_string(),
+        mgmt_url: "http://app1/mgmt/bpl".to_string(),
+        retrieval_url: "http://app1/retrieval".to_string(),
+    }];
+    let cluster = Arc::new(
+        FakeClusterRouter::new(identity, peers).with_pv_routing(
+            "REMOTE:PV",
+            ResolvedPeerDto {
+                mgmt_url: "http://app1/mgmt/bpl".to_string(),
+                retrieval_url: "http://app1/retrieval".to_string(),
+            },
+        ),
+    );
+
+    let state = archiver_api::AppState {
+        storage,
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
+        cluster: Some(cluster),
+        api_keys: None,
+        cluster_api_key: None,
+        metrics_handle: None,
+        rate_limiter: None,
+        trust_proxy_headers: false,
+        failover: None,
+        etl_chain: Vec::new(),
+    };
+    let app = archiver_api::build_router(state, &archiver_core::config::SecurityConfig::default());
+
+    let req = get_request("/mgmt/bpl/consolidateDataForPV?pv=REMOTE:PV&storage=LTS");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    // FakeClusterRouter::proxy_mgmt_get returns {"status": "proxied"}.
+    assert_eq!(body["status"], "proxied");
+
+    // Same forward for getStoresForPV / getStorageUsageForPV / renamePV / modifyMetaFields.
+    for endpoint in [
+        "/mgmt/bpl/getStoresForPV?pv=REMOTE:PV",
+        "/mgmt/bpl/getStorageUsageForPV?pv=REMOTE:PV",
+        "/mgmt/bpl/modifyMetaFields?pv=REMOTE:PV&command=add,HIHI",
+        "/mgmt/bpl/renamePV?pv=REMOTE:PV&newname=REMOTE:PV2",
+    ] {
+        let req = get_request(endpoint);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "endpoint: {endpoint}");
+        let body = body_to_json(resp.into_body()).await;
+        assert_eq!(body["status"], "proxied", "endpoint: {endpoint}");
+    }
+}

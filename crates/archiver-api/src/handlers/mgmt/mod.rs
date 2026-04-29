@@ -87,7 +87,7 @@ pub(super) fn resolve_canonical(state: &AppState, pv: &str) -> String {
 /// Resolves aliases first so a local alias row is treated as a local hit
 /// when its target is local, and routed by canonical name when the
 /// target lives on a peer.
-async fn try_mgmt_dispatch(
+pub(super) async fn try_mgmt_dispatch(
     state: &AppState,
     pv: &str,
     endpoint: &str,
@@ -132,22 +132,24 @@ async fn route_pvs(
         None => return (pvs.to_vec(), remote),
     };
 
-    // Pre-fetch all real local PV names (alias_for IS NULL) in a single
-    // query to avoid N+1 lookups. Alias rows are resolved per-PV via
-    // canonical_name below; an alias whose target is local counts as
-    // local for routing.
+    // Pre-fetch all real local PV names and the alias map in two single
+    // queries so the per-PV decision below is O(1) lookups instead of
+    // N round-trips to SQLite.
     let local_set: std::collections::HashSet<String> = state
         .pv_query
         .all_pv_names()
         .unwrap_or_default()
         .into_iter()
         .collect();
+    let alias_map: std::collections::HashMap<String, String> = state
+        .pv_query
+        .all_aliases()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
 
     for pv in pvs {
-        let canonical = state
-            .pv_query
-            .canonical_name(pv)
-            .unwrap_or_else(|_| pv.clone());
+        let canonical = alias_map.get(pv).cloned().unwrap_or_else(|| pv.clone());
         if local_set.contains(&canonical) {
             local.push(pv.clone());
         } else if let Some(resolved) = cluster.resolve_peer(&canonical).await {

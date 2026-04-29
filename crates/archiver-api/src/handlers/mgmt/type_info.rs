@@ -1,4 +1,5 @@
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 
@@ -16,8 +17,9 @@ use crate::AppState;
 /// `Query<T>` does not collect repeated keys into `Vec<String>`.
 pub async fn modify_meta_fields(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
-) -> Result<impl IntoResponse, ApiError> {
+) -> axum::response::Response {
     let raw = uri.query().unwrap_or("");
     let mut pv = String::new();
     let mut commands: Vec<String> = Vec::new();
@@ -34,38 +36,57 @@ pub async fn modify_meta_fields(
         }
     }
     if pv.is_empty() {
-        return Err(ApiError::BadRequest("pv is required".to_string()));
+        return ApiError::BadRequest("pv is required".to_string()).into_response();
     }
     if commands.is_empty() {
-        return Err(ApiError::BadRequest(
+        return ApiError::BadRequest(
             "at least one command parameter is required".to_string(),
-        ));
+        )
+        .into_response();
     }
 
-    let canonical = state
-        .pv_query
-        .canonical_name(&pv)
-        .map_err(ApiError::internal)?;
-    let record = state
-        .pv_query
-        .get_pv(&canonical)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::NotFound(format!("PV '{pv}' not found")))?;
+    let canonical = match state.pv_query.canonical_name(&pv) {
+        Ok(c) => c,
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
+
+    // Forward to peer when the canonical PV isn't local. modifyMetaFields
+    // mutates engine state (per-field CA monitor tasks), which only the
+    // owning appliance can do.
+    let mut qs = format!("pv={}", urlencoding::encode(&canonical));
+    for cmd in &commands {
+        qs.push_str(&format!("&command={}", urlencoding::encode(cmd)));
+    }
+    if let Some(resp) =
+        super::try_mgmt_dispatch(&state, &canonical, "modifyMetaFields", &qs, &headers).await
+    {
+        return resp;
+    }
+
+    let record = match state.pv_query.get_pv(&canonical) {
+        Ok(Some(r)) => r,
+        Ok(None) => return ApiError::NotFound(format!("PV '{pv}' not found")).into_response(),
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
     if record.status != PvStatus::Paused {
-        return Err(ApiError::Conflict(format!(
+        return ApiError::Conflict(format!(
             "PV '{pv}' must be paused before modifying meta-fields",
-        )));
+        ))
+        .into_response();
     }
 
     let mut fields: std::collections::BTreeSet<String> =
         record.archive_fields.iter().cloned().collect();
     for cmd in &commands {
         let mut parts = cmd.split(',');
-        let verb = parts
-            .next()
-            .ok_or_else(|| ApiError::BadRequest("empty command".to_string()))?
-            .trim();
-        let args: Vec<String> = parts.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let verb = match parts.next() {
+            Some(v) => v.trim(),
+            None => return ApiError::BadRequest("empty command".to_string()).into_response(),
+        };
+        let args: Vec<String> = parts
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         match verb {
             "add" => {
                 for f in args {
@@ -79,26 +100,29 @@ pub async fn modify_meta_fields(
             }
             "clear" => fields.clear(),
             other => {
-                return Err(ApiError::BadRequest(format!(
+                return ApiError::BadRequest(format!(
                     "unknown verb '{other}' (expected add/remove/clear)"
-                )));
+                ))
+                .into_response();
             }
         }
     }
 
     let new_fields: Vec<String> = fields.into_iter().collect();
-    state
+    if let Err(e) = state
         .archiver_cmd
         .update_archive_fields(&canonical, &new_fields)
         .await
-        .map_err(ApiError::internal)?;
+    {
+        return ApiError::internal(e).into_response();
+    }
 
-    let resp = serde_json::json!({
+    axum::Json(serde_json::json!({
         "status": "ok",
         "pv": canonical,
         "archiveFields": new_fields,
-    });
-    Ok(axum::Json(resp))
+    }))
+    .into_response()
 }
 
 /// `POST /mgmt/bpl/putPVTypeInfo?pv=<name>&override=<bool>&createnew=<bool>`
@@ -320,21 +344,30 @@ pub async fn get_pv_type_info_keys(
 /// we add file counts because they're cheap and operationally useful.
 pub async fn get_stores_for_pv(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<PvNameParam>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> axum::response::Response {
     if params.pv.is_empty() {
-        return Err(ApiError::BadRequest("pv parameter is required".to_string()));
+        return ApiError::BadRequest("pv parameter is required".to_string()).into_response();
     }
     // Aliases resolve to the canonical PV.
-    let canonical = state
-        .pv_query
-        .canonical_name(&params.pv)
-        .map_err(ApiError::internal)?;
+    let canonical = match state.pv_query.canonical_name(&params.pv) {
+        Ok(c) => c,
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
 
-    let summaries = state
-        .storage
-        .stores_for_pv(&canonical)
-        .map_err(ApiError::internal)?;
+    // File layout is per-appliance — forward to the peer that owns the PV.
+    let qs = format!("pv={}", urlencoding::encode(&canonical));
+    if let Some(resp) =
+        super::try_mgmt_dispatch(&state, &canonical, "getStoresForPV", &qs, &headers).await
+    {
+        return resp;
+    }
+
+    let summaries = match state.storage.stores_for_pv(&canonical) {
+        Ok(s) => s,
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
 
     let mut obj = serde_json::Map::new();
     for s in summaries {
@@ -352,7 +385,7 @@ pub async fn get_stores_for_pv(
             );
         }
     }
-    Ok(axum::Json(serde_json::Value::Object(obj)))
+    axum::Json(serde_json::Value::Object(obj)).into_response()
 }
 
 /// `GET /mgmt/bpl/renamePV?pv=<old>&newname=<new>`
@@ -368,87 +401,96 @@ pub struct RenameQuery {
 
 pub async fn rename_pv(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<RenameQuery>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> axum::response::Response {
     if q.pv.is_empty() || q.newname.is_empty() {
-        return Err(ApiError::BadRequest(
-            "pv and newname are required".to_string(),
-        ));
+        return ApiError::BadRequest("pv and newname are required".to_string()).into_response();
     }
     if q.pv == q.newname {
-        return Err(ApiError::BadRequest(
-            "pv and newname must differ".to_string(),
-        ));
+        return ApiError::BadRequest("pv and newname must differ".to_string()).into_response();
     }
 
-    let source = state
-        .pv_query
-        .get_pv(&q.pv)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::NotFound(format!("PV '{}' not found", q.pv)))?;
+    // Rename moves files on disk — only the appliance that owns the source
+    // PV can do it. Forward to the peer when the source is remote.
+    let qs = format!(
+        "pv={}&newname={}",
+        urlencoding::encode(&q.pv),
+        urlencoding::encode(&q.newname),
+    );
+    if let Some(resp) =
+        super::try_mgmt_dispatch(&state, &q.pv, "renamePV", &qs, &headers).await
+    {
+        return resp;
+    }
+
+    let source = match state.pv_query.get_pv(&q.pv) {
+        Ok(Some(r)) => r,
+        Ok(None) => return ApiError::NotFound(format!("PV '{}' not found", q.pv)).into_response(),
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
     if source.alias_for.is_some() {
-        return Err(ApiError::BadRequest(format!(
+        return ApiError::BadRequest(format!(
             "'{}' is an alias; rename the canonical PV instead",
             q.pv
-        )));
+        ))
+        .into_response();
     }
     if source.status != PvStatus::Paused {
-        return Err(ApiError::Conflict(format!(
+        return ApiError::Conflict(format!(
             "source PV '{}' must be paused before renaming (current: {:?})",
             q.pv, source.status,
-        )));
+        ))
+        .into_response();
     }
-    if state
-        .pv_query
-        .get_pv(&q.newname)
-        .map_err(ApiError::internal)?
-        .is_some()
-    {
-        return Err(ApiError::Conflict(format!(
-            "destination '{}' already exists",
-            q.newname
-        )));
+    match state.pv_query.get_pv(&q.newname) {
+        Ok(Some(_)) => {
+            return ApiError::Conflict(format!(
+                "destination '{}' already exists",
+                q.newname
+            ))
+            .into_response();
+        }
+        Ok(None) => {}
+        Err(e) => return ApiError::internal(e).into_response(),
     }
 
     // Copy the data files first; if that fails, the registry change is not
     // applied so the source remains the source of truth.
-    let copied = state
-        .storage
-        .rename_pv(&q.pv, &q.newname)
-        .await
-        .map_err(ApiError::internal)?;
+    let copied = match state.storage.rename_pv(&q.pv, &q.newname).await {
+        Ok(c) => c,
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
 
     // Insert the destination row mirroring source. Both sides remain paused
     // until the caller resumes / deletes.
-    state
-        .pv_cmd
-        .import_pv(
-            &q.newname,
-            source.dbr_type,
-            &source.sample_mode,
-            source.element_count,
-            PvStatus::Paused,
-            None,
-            source.prec.as_deref(),
-            source.egu.as_deref(),
-            None, // not an alias
-            &source.archive_fields,
-            source.policy_name.as_deref(),
-        )
-        .map_err(ApiError::internal)?;
+    if let Err(e) = state.pv_cmd.import_pv(
+        &q.newname,
+        source.dbr_type,
+        &source.sample_mode,
+        source.element_count,
+        PvStatus::Paused,
+        None,
+        source.prec.as_deref(),
+        source.egu.as_deref(),
+        None, // not an alias
+        &source.archive_fields,
+        source.policy_name.as_deref(),
+    ) {
+        return ApiError::internal(e).into_response();
+    }
 
-    let _ = state
-        .pv_cmd
-        .set_status(&q.pv, PvStatus::Paused)
-        .map_err(ApiError::internal)?;
+    if let Err(e) = state.pv_cmd.set_status(&q.pv, PvStatus::Paused) {
+        return ApiError::internal(e).into_response();
+    }
 
-    let resp = serde_json::json!({
+    axum::Json(serde_json::json!({
         "status": "ok",
         "from": q.pv,
         "to": q.newname,
         "files_moved": copied,
-    });
-    Ok(axum::Json(resp))
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

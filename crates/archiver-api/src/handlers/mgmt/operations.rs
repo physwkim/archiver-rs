@@ -2,7 +2,8 @@
 //! failover-cache reset stub.
 
 use axum::extract::{Query, State};
-use axum::response::IntoResponse;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::dto::mgmt::PvNameParam;
@@ -83,15 +84,16 @@ pub struct ConsolidateQuery {
 
 pub async fn consolidate_data_for_pv(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<ConsolidateQuery>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Response {
     if q.pv.is_empty() {
-        return Err(ApiError::BadRequest("pv is required".to_string()));
+        return ApiError::BadRequest("pv is required".to_string()).into_response();
     }
-    let canonical = state
-        .pv_query
-        .canonical_name(&q.pv)
-        .map_err(ApiError::internal)?;
+    let canonical = match state.pv_query.canonical_name(&q.pv) {
+        Ok(c) => c,
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
 
     // Resolve the requested target tier. Default to the deepest tier (LTS)
     // since that's the typical "consolidate everything" intent.
@@ -102,6 +104,20 @@ pub async fn consolidate_data_for_pv(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "LTS".to_string());
 
+    // Forward to the peer that owns the PV when in cluster mode. ETL is a
+    // local-disk operation; consolidating remotely owned data only works on
+    // the appliance that holds the files.
+    let qs = format!(
+        "pv={}&storage={}",
+        urlencoding::encode(&canonical),
+        urlencoding::encode(&target),
+    );
+    if let Some(resp) =
+        super::try_mgmt_dispatch(&state, &canonical, "consolidateDataForPV", &qs, &headers).await
+    {
+        return resp;
+    }
+
     // Walk the etl_chain in order, running each executor up to (and including)
     // the one whose dest matches the requested tier. The chain is
     // [STS→MTS, MTS→LTS]; consolidating to MTS runs only the first, to LTS
@@ -110,10 +126,10 @@ pub async fn consolidate_data_for_pv(
     let mut found_target = false;
     for executor in &state.etl_chain {
         let dest_name = executor.dest_name().to_ascii_uppercase();
-        let count = executor
-            .consolidate_pv(&canonical)
-            .await
-            .map_err(ApiError::internal)?;
+        let count = match executor.consolidate_pv(&canonical).await {
+            Ok(c) => c,
+            Err(e) => return ApiError::internal(e).into_response(),
+        };
         moved.push(serde_json::json!({
             "source": executor.source_name(),
             "dest": executor.dest_name(),
@@ -125,7 +141,7 @@ pub async fn consolidate_data_for_pv(
         }
     }
     if !found_target && !state.etl_chain.is_empty() {
-        return Err(ApiError::BadRequest(format!(
+        return ApiError::BadRequest(format!(
             "unknown target tier '{target}'; expected one of: {}",
             state
                 .etl_chain
@@ -133,13 +149,14 @@ pub async fn consolidate_data_for_pv(
                 .map(|e| e.dest_name())
                 .collect::<Vec<_>>()
                 .join(", ")
-        )));
+        ))
+        .into_response();
     }
 
-    let stores = state
-        .storage
-        .stores_for_pv(&canonical)
-        .map_err(ApiError::internal)?;
+    let stores = match state.storage.stores_for_pv(&canonical) {
+        Ok(s) => s,
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
     let tiers: Vec<serde_json::Value> = stores
         .into_iter()
         .map(|s| {
@@ -150,32 +167,42 @@ pub async fn consolidate_data_for_pv(
         })
         .collect();
 
-    Ok(axum::Json(serde_json::json!({
+    axum::Json(serde_json::json!({
         "status": "ok",
         "pv": canonical,
         "storage": target,
         "moved": moved,
         "tiers": tiers,
-    })))
+    }))
+    .into_response()
 }
 
 /// `GET /mgmt/bpl/getStorageUsageForPV?pv=<name>`
-/// Returns per-tier file count for one PV.
+/// Returns per-tier file count for one PV. Forwards to the peer that
+/// owns the PV in cluster mode — file counts only mean something on the
+/// appliance that holds the data.
 pub async fn get_storage_usage_for_pv(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(p): Query<PvNameParam>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Response {
     if p.pv.is_empty() {
-        return Err(ApiError::BadRequest("pv is required".to_string()));
+        return ApiError::BadRequest("pv is required".to_string()).into_response();
     }
-    let canonical = state
-        .pv_query
-        .canonical_name(&p.pv)
-        .map_err(ApiError::internal)?;
-    let stores = state
-        .storage
-        .stores_for_pv(&canonical)
-        .map_err(ApiError::internal)?;
+    let canonical = match state.pv_query.canonical_name(&p.pv) {
+        Ok(c) => c,
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
+    let qs = format!("pv={}", urlencoding::encode(&canonical));
+    if let Some(resp) =
+        super::try_mgmt_dispatch(&state, &canonical, "getStorageUsageForPV", &qs, &headers).await
+    {
+        return resp;
+    }
+    let stores = match state.storage.stores_for_pv(&canonical) {
+        Ok(s) => s,
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
     let mut obj = serde_json::Map::new();
     for s in stores {
         obj.insert(
@@ -183,7 +210,7 @@ pub async fn get_storage_usage_for_pv(
             serde_json::Value::Number(s.pv_file_count.unwrap_or(0).into()),
         );
     }
-    Ok(axum::Json(serde_json::Value::Object(obj)))
+    axum::Json(serde_json::Value::Object(obj)).into_response()
 }
 
 /// `GET /mgmt/bpl/resetFailoverCaches`
