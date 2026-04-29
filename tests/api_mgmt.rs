@@ -1311,3 +1311,93 @@ async fn test_consolidate_forwards_to_peer_for_remote_pv() {
         assert_eq!(body["status"], "proxied", "endpoint: {endpoint}");
     }
 }
+
+#[tokio::test]
+async fn test_p1_cluster_scoped_aliases() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+
+    for endpoint in [
+        "/mgmt/bpl/getPVsForThisAppliance",
+        "/mgmt/bpl/getMatchingPVsForAppliance?pv=SIM:*",
+        "/mgmt/bpl/getPausedPVsForThisAppliance",
+        "/mgmt/bpl/getNeverConnectedPVsForThisAppliance",
+    ] {
+        let req = get_request(endpoint);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "endpoint: {endpoint}");
+    }
+}
+
+#[tokio::test]
+async fn test_p1_archived_pvs_action_classifies_input() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let body = serde_json::json!(["SIM:Sine", "NOT:Real"]).to_string();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/archivedPVsAction")
+        .header("content-type", "application/json")
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = body_to_json(resp.into_body()).await;
+    let arr = arr.as_array().unwrap();
+    let sine = arr.iter().find(|e| e["pvName"] == "SIM:Sine").unwrap();
+    assert_eq!(sine["archived"], true);
+    let nope = arr.iter().find(|e| e["pvName"] == "NOT:Real").unwrap();
+    assert_eq!(nope["archived"], false);
+
+    // unarchivedPVsAction → only NOT:Real.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/unarchivedPVsAction")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let arr = body_to_json(resp.into_body()).await;
+    assert_eq!(arr, serde_json::json!(["NOT:Real"]));
+
+    // archivedPVsNotInListAction with input=[SIM:Sine] → returns SIM:Cosine, TEST:Counter.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/archivedPVsNotInListAction")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!(["SIM:Sine"]).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let arr: Vec<String> = serde_json::from_value(body_to_json(resp.into_body()).await).unwrap();
+    assert!(arr.contains(&"SIM:Cosine".to_string()));
+    assert!(arr.contains(&"TEST:Counter".to_string()));
+    assert!(!arr.contains(&"SIM:Sine".to_string()));
+}
+
+#[tokio::test]
+async fn test_p1_get_last_known_event_timestamp() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/getLastKnownEventTimeStamp?pv=SIM:Sine");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["pvName"], "SIM:Sine");
+    // No samples written yet → null.
+    assert!(body["lastEvent"].is_null());
+
+    // Unknown PV → 404.
+    let req = get_request("/mgmt/bpl/getLastKnownEventTimeStamp?pv=NOPE");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_p1_mgmt_metrics_exposes_counts() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/getMgmtMetrics");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["pvCount"]["total"], 3);
+    assert_eq!(body["pvCount"]["active"], 3);
+    assert!(body["version"].as_str().is_some());
+}

@@ -70,6 +70,50 @@ pub fn routes() -> Router<AppState> {
             "/mgmt/bpl/resetFailoverCaches",
             get(operations::reset_failover_caches),
         )
+        // P1 cluster-scoped query aliases ----------------------------------
+        .route(
+            "/mgmt/bpl/getPVsForThisAppliance",
+            get(reports::get_pvs_for_this_appliance),
+        )
+        .route(
+            "/mgmt/bpl/getMatchingPVsForAppliance",
+            get(reports::get_matching_pvs_for_appliance),
+        )
+        .route(
+            "/mgmt/bpl/getPausedPVsForThisAppliance",
+            get(reports::get_paused_pvs_for_this_appliance),
+        )
+        .route(
+            "/mgmt/bpl/getNeverConnectedPVsForThisAppliance",
+            get(reports::get_never_connected_pvs_for_this_appliance),
+        )
+        // P1 reports --------------------------------------------------------
+        .route(
+            "/mgmt/bpl/getPVsByStorageConsumed",
+            get(reports::get_pvs_by_storage_consumed),
+        )
+        .route(
+            "/mgmt/bpl/getEventRateReport",
+            get(reports::get_event_rate_report),
+        )
+        .route(
+            "/mgmt/bpl/getLastKnownEventTimeStamp",
+            get(reports::get_last_known_event_timestamp),
+        )
+        .route("/mgmt/bpl/getMgmtMetrics", get(reports::get_mgmt_metrics))
+        // P1 bulk-archived check (POST list) -------------------------------
+        .route(
+            "/mgmt/bpl/archivedPVsAction",
+            post(reports::archived_pvs_action),
+        )
+        .route(
+            "/mgmt/bpl/unarchivedPVsAction",
+            post(reports::unarchived_pvs_action),
+        )
+        .route(
+            "/mgmt/bpl/archivedPVsNotInListAction",
+            post(reports::archived_pvs_not_in_list_action),
+        )
 }
 
 /// Resolve a possibly-alias PV name to its canonical form. Falls back to

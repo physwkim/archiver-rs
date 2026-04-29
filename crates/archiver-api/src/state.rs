@@ -105,6 +105,14 @@ pub(crate) async fn api_key_auth(
         "/mgmt/bpl/getAllExpandedPVNames",
         "/mgmt/bpl/getApplianceMetrics",
         "/mgmt/bpl/getStorageUsageForPV",
+        "/mgmt/bpl/getPVsForThisAppliance",
+        "/mgmt/bpl/getMatchingPVsForAppliance",
+        "/mgmt/bpl/getPausedPVsForThisAppliance",
+        "/mgmt/bpl/getNeverConnectedPVsForThisAppliance",
+        "/mgmt/bpl/getPVsByStorageConsumed",
+        "/mgmt/bpl/getEventRateReport",
+        "/mgmt/bpl/getLastKnownEventTimeStamp",
+        "/mgmt/bpl/getMgmtMetrics",
     ];
     let is_read_only_mgmt = request.method() == axum::http::Method::GET
         && READ_ONLY_MGMT_PATHS.contains(&path);

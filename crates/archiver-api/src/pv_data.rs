@@ -61,6 +61,125 @@ pub fn routes() -> Router<AppState> {
         .route("/retrieval/data/getData.json", get(get_data_json))
         .route("/retrieval/data/getData.csv", get(get_data_csv))
         .route("/retrieval/data/getData.raw", get(get_data_raw))
+        .route(
+            "/retrieval/data/getDataAtTime",
+            axum::routing::post(get_data_at_time),
+        )
+}
+
+/// `POST /retrieval/data/getDataAtTime?at=<iso8601>`
+/// Body: JSON list of PV names. Returns the most-recent sample at-or-
+/// before `at` for each PV, keyed by canonical name. Pulls from
+/// `storage.get_last_known_event` and falls back to a bounded scan
+/// when the latest is newer than `at`. Mirrors the Java archiver's
+/// `/retrieval/data/getDataAtTime` REST entry that Phoebus uses to
+/// seed gauge values.
+#[derive(Deserialize)]
+struct GetDataAtTimeParams {
+    at: Option<String>,
+}
+
+async fn get_data_at_time(
+    State(state): State<AppState>,
+    axum::extract::Query(p): axum::extract::Query<GetDataAtTimeParams>,
+    crate::pv_input::PvListInput(pvs): crate::pv_input::PvListInput,
+) -> Response {
+    let target = p
+        .at
+        .as_deref()
+        .and_then(parse_iso8601)
+        .unwrap_or_else(SystemTime::now);
+
+    let mut out = serde_json::Map::new();
+    for pv in pvs {
+        let canonical = state
+            .pv_query
+            .canonical_name(&pv)
+            .unwrap_or_else(|_| pv.clone());
+
+        // Stage 1: cheapest path — last known event across tiers.
+        let latest = match state.storage.get_last_known_event(&canonical).await {
+            Ok(opt) => opt,
+            Err(e) => {
+                tracing::warn!(pv, "get_last_known_event failed: {e}");
+                None
+            }
+        };
+        let pick = match latest {
+            Some(l) if l.timestamp <= target => Some(l),
+            _ => {
+                // Stage 2: target is in the past relative to the newest
+                // sample. Scan a 30-day window ending at target.
+                let lower = target
+                    .checked_sub(std::time::Duration::from_secs(30 * 86_400))
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                match state.storage.get_data(&canonical, lower, target).await {
+                    Ok(streams) => {
+                        let mut last = None;
+                        for mut s in streams {
+                            while let Ok(Some(sample)) = s.next_event() {
+                                if sample.timestamp <= target {
+                                    last = Some(sample);
+                                }
+                            }
+                        }
+                        last
+                    }
+                    Err(_) => None,
+                }
+            }
+        };
+
+        let entry = match pick {
+            Some(s) => {
+                let (year, secs, nanos) = s.decompose_timestamp();
+                let val = sample_value_to_json(&s.value);
+                serde_json::json!({
+                    "secs": SystemTime::from(
+                        chrono::DateTime::<chrono::Utc>::from(s.timestamp)
+                    )
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                    "nanos": nanos,
+                    "year": year,
+                    "secondsIntoYear": secs,
+                    "val": val,
+                    "severity": s.severity,
+                    "status": s.status,
+                })
+            }
+            None => serde_json::Value::Null,
+        };
+        out.insert(canonical, entry);
+    }
+
+    axum::Json(serde_json::Value::Object(out)).into_response()
+}
+
+fn sample_value_to_json(v: &ArchiverValue) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        ArchiverValue::ScalarString(s) => Value::String(s.clone()),
+        ArchiverValue::ScalarShort(n) => (*n).into(),
+        ArchiverValue::ScalarInt(n) => (*n).into(),
+        ArchiverValue::ScalarEnum(n) => (*n).into(),
+        ArchiverValue::ScalarFloat(f) => (*f as f64).into(),
+        ArchiverValue::ScalarDouble(f) => (*f).into(),
+        ArchiverValue::ScalarByte(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorString(arr) => {
+            Value::Array(arr.iter().map(|s| Value::String(s.clone())).collect())
+        }
+        ArchiverValue::VectorChar(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorShort(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorInt(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorEnum(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorFloat(arr) => {
+            Value::Array(arr.iter().map(|x| (*x as f64).into()).collect())
+        }
+        ArchiverValue::VectorDouble(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::V4GenericBytes(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
