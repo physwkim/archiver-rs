@@ -29,6 +29,27 @@ pub fn normalize_pv_name(name: &str) -> &str {
     name.strip_suffix(".VAL").unwrap_or(name)
 }
 
+/// Strip a trailing `.<FIELD>` suffix (e.g. `.HIHI`, `.LOLO`, `.DESC`) from
+/// a PV name, returning the bare PV name. Java's
+/// `PVNames.stripFieldNameFromPVName` (c150faad/5b2a7cb4): a query for
+/// `BASE.HIHI` should fall back to typeinfo for `BASE` so handlers can
+/// surface the field-archived metadata. Returns `None` if there is no
+/// field suffix or the suffix contains characters that aren't valid in
+/// EPICS record-field names (uppercase letters / digits / underscores).
+pub fn strip_field_suffix(name: &str) -> Option<&str> {
+    let (base, field) = name.rsplit_once('.')?;
+    if base.is_empty() || field.is_empty() {
+        return None;
+    }
+    if !field
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return None;
+    }
+    Some(base)
+}
+
 /// PV archiving status.
 ///
 /// `Alias` is a sentinel applied to alias rows so they don't appear in
@@ -308,6 +329,22 @@ impl PvRegistry {
             "SELECT pv_name FROM pv_info
              WHERE pv_name GLOB ?1 AND alias_for IS NULL
              ORDER BY pv_name",
+        )?;
+        let names = stmt
+            .query_map(params![pattern], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(names)
+    }
+
+    /// Match PV names by glob pattern, INCLUDING alias rows. Java's
+    /// `getMatchingPVs` returns aliases too (c61f1579) — without this an
+    /// admin walking the inventory by glob silently misses every alias.
+    /// Internal callers that only want real PVs (engine, reports) stay
+    /// on `matching_pvs`.
+    pub fn matching_pvs_expanded(&self, pattern: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT pv_name FROM pv_info WHERE pv_name GLOB ?1 ORDER BY pv_name",
         )?;
         let names = stmt
             .query_map(params![pattern], |row| row.get(0))?

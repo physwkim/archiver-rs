@@ -178,6 +178,27 @@ impl PvQueryRepository for InMemoryPvRepository {
         names.sort();
         Ok(names)
     }
+
+    fn matching_pvs_expanded(&self, pattern: &str) -> anyhow::Result<Vec<String>> {
+        // Glob matches across both real PVs and aliases (Java parity).
+        let lock = self.pvs.lock().unwrap();
+        let glob = pattern.replace('*', "");
+        let mut names: Vec<String> = lock
+            .keys()
+            .filter(|k| {
+                if pattern.ends_with('*') {
+                    k.starts_with(&glob)
+                } else if pattern.starts_with('*') {
+                    k.ends_with(&glob)
+                } else {
+                    k.contains(&glob)
+                }
+            })
+            .cloned()
+            .collect();
+        names.sort();
+        Ok(names)
+    }
 }
 
 impl PvCommandRepository for InMemoryPvRepository {

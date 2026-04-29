@@ -5,6 +5,7 @@ use std::time::SystemTime;
 
 use archiver_proto::epics_event::{self, PayloadInfo};
 use prost::Message;
+use tracing::warn;
 
 use crate::storage::plainpb::codec;
 use crate::storage::plainpb::search::binary_search_pb_file;
@@ -81,9 +82,18 @@ impl EventStream for PbFileReader {
                 return Ok(None);
             }
 
-            // Strip trailing newline.
-            if line_buf.last() == Some(&codec::NEWLINE) {
+            // Java parity: a trailing line without a terminating newline
+            // is a torn write — drop it rather than feeding partial bytes
+            // to `decode_sample` (PVNames.java fix 8a902a80).
+            let had_newline = line_buf.last() == Some(&codec::NEWLINE);
+            if had_newline {
                 line_buf.pop();
+            } else if !line_buf.is_empty() {
+                warn!(
+                    "PB stream: dropping {} truncated trailing bytes (no newline at EOF)",
+                    line_buf.len()
+                );
+                return Ok(None);
             }
 
             if line_buf.is_empty() {
@@ -91,8 +101,19 @@ impl EventStream for PbFileReader {
             }
 
             let raw_bytes = codec::unescape(&line_buf);
-            let sample = decode_sample(self.desc.db_type, self.desc.year, &raw_bytes)?;
-            return Ok(Some(sample));
+            // Java parity (53ebdc99): a single corrupt sample line must
+            // not abort the iterator. Skip + log so the rest of the file
+            // is still readable.
+            match decode_sample(self.desc.db_type, self.desc.year, &raw_bytes) {
+                Ok(sample) => return Ok(Some(sample)),
+                Err(e) => {
+                    warn!(
+                        "PB stream: skipping undecodable sample ({} bytes): {e}",
+                        raw_bytes.len()
+                    );
+                    continue;
+                }
+            }
         }
     }
 }
@@ -135,15 +156,29 @@ impl EventStream for PbBytesReader {
             if bytes_read == 0 {
                 return Ok(None);
             }
-            if line_buf.last() == Some(&codec::NEWLINE) {
+            let had_newline = line_buf.last() == Some(&codec::NEWLINE);
+            if had_newline {
                 line_buf.pop();
+            } else if !line_buf.is_empty() {
+                warn!(
+                    "PB bytes-stream: dropping {} truncated trailing bytes",
+                    line_buf.len()
+                );
+                return Ok(None);
             }
             if line_buf.is_empty() {
                 continue;
             }
             let raw_bytes = codec::unescape(&line_buf);
-            let sample = decode_sample(self.desc.db_type, self.desc.year, &raw_bytes)?;
-            return Ok(Some(sample));
+            match decode_sample(self.desc.db_type, self.desc.year, &raw_bytes) {
+                Ok(sample) => return Ok(Some(sample)),
+                Err(e) => {
+                    warn!(
+                        "PB bytes-stream: skipping undecodable sample: {e}"
+                    );
+                    continue;
+                }
+            }
         }
     }
 }

@@ -23,6 +23,10 @@ pub trait PvQueryRepository: Send + Sync {
     fn aliases_for(&self, target: &str) -> anyhow::Result<Vec<String>>;
     fn all_aliases(&self) -> anyhow::Result<Vec<(String, String)>>;
     fn expanded_pv_names(&self) -> anyhow::Result<Vec<String>>;
+    /// Glob match across both real PVs and aliases (Java's
+    /// `getMatchingPVs` semantic — c61f1579). Internal-only callers that
+    /// shouldn't see aliases stay on `matching_pvs`.
+    fn matching_pvs_expanded(&self, pattern: &str) -> anyhow::Result<Vec<String>>;
 }
 
 // --- PvCommandRepository (sync — write operations) ---

@@ -28,7 +28,10 @@ pub fn routes() -> Router<AppState> {
         .route("/mgmt/bpl/pauseArchivingPV", get(pv_control::pause_archiving_pv).post(pv_control::bulk_pause_archiving_pv))
         .route("/mgmt/bpl/resumeArchivingPV", get(pv_control::resume_archiving_pv).post(pv_control::bulk_resume_archiving_pv))
         .route("/mgmt/bpl/getPVCount", get(pv_query::get_pv_count))
-        .route("/mgmt/bpl/deletePV", get(pv_control::delete_pv))
+        .route(
+            "/mgmt/bpl/deletePV",
+            get(pv_control::delete_pv).post(pv_control::bulk_delete_pv),
+        )
         .route("/mgmt/bpl/changeArchivalParameters", get(pv_control::change_archival_parameters))
         .route("/mgmt/bpl/getPausedPVsReport", get(reports::get_paused_pvs_report))
         .route("/mgmt/bpl/getNeverConnectedPVs", get(reports::get_never_connected_pvs))

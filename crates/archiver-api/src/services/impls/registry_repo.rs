@@ -68,6 +68,10 @@ impl PvQueryRepository for RegistryRepository {
     fn expanded_pv_names(&self) -> anyhow::Result<Vec<String>> {
         self.inner.expanded_pv_names()
     }
+
+    fn matching_pvs_expanded(&self, pattern: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.matching_pvs_expanded(pattern)
+    }
 }
 
 impl PvCommandRepository for RegistryRepository {

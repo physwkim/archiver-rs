@@ -11,7 +11,12 @@ pub async fn get_all_pvs(
     State(state): State<AppState>,
     Query(cp): Query<ClusterParam>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let mut pvs = state.pv_query.all_pv_names().map_err(ApiError::internal)?;
+    // Java parity (cb5e83b0): `getAllPVs` includes alias rows. Internal
+    // engine/report callers stay on `all_pv_names` which filters them out.
+    let mut pvs = state
+        .pv_query
+        .expanded_pv_names()
+        .map_err(ApiError::internal)?;
 
     if cp.cluster.unwrap_or(false)
         && let Some(ref cluster) = state.cluster {
@@ -34,9 +39,10 @@ pub async fn get_matching_pvs(
     State(state): State<AppState>,
     Query(params): Query<MatchingPvsParams>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Java parity (c61f1579): `getMatchingPVs?pv=*` includes aliases.
     let mut pvs = state
         .pv_query
-        .matching_pvs(&params.pv)
+        .matching_pvs_expanded(&params.pv)
         .map_err(ApiError::internal)?;
 
     if params.cluster.unwrap_or(false)
@@ -72,6 +78,14 @@ pub async fn get_pv_status(
         .pv_query
         .canonical_name(&params.pv)
         .unwrap_or_else(|_| params.pv.clone());
+    // Java parity (c150faad): if `BASE.HIHI` isn't itself a typeinfo,
+    // fall back to `BASE` so the response surfaces the real PV's status.
+    let canonical = match state.pv_query.get_pv(&canonical).map_err(ApiError::internal)? {
+        Some(_) => canonical,
+        None => archiver_core::registry::strip_field_suffix(&canonical)
+            .map(|s| s.to_string())
+            .unwrap_or(canonical),
+    };
     match state.pv_query.get_pv(&canonical).map_err(ApiError::internal)? {
         Some(record) => {
             let status_str = match record.status {

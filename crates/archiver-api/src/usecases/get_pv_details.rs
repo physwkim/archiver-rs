@@ -7,10 +7,18 @@ pub fn get_pv_details(
     archiver_query: &dyn ArchiverQuery,
     pv: &str,
 ) -> Result<serde_json::Value, ApiError> {
-    let record = pv_query
-        .get_pv(pv)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::NotFound(format!("PV {pv} not found")))?;
+    // Java parity (c150faad): if `BASE.HIHI` is queried and isn't itself
+    // a typeinfo, fall back to `BASE`.
+    let record = match pv_query.get_pv(pv).map_err(ApiError::internal)? {
+        Some(r) => r,
+        None => match archiver_core::registry::strip_field_suffix(pv) {
+            Some(base) => pv_query
+                .get_pv(base)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::NotFound(format!("PV {pv} not found")))?,
+            None => return Err(ApiError::NotFound(format!("PV {pv} not found"))),
+        },
+    };
 
     let conn_info = archiver_query.get_connection_info(pv);
     let is_connected = conn_info.as_ref().map(|c| c.is_connected).unwrap_or(false);

@@ -109,23 +109,17 @@ async fn get_data_at_time(
             Some(l) if l.timestamp <= target => Some(l),
             _ => {
                 // Stage 2: target is in the past relative to the newest
-                // sample. Scan a 30-day window ending at target.
-                let lower = target
-                    .checked_sub(std::time::Duration::from_secs(30 * 86_400))
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                match state.storage.get_data(&canonical, lower, target).await {
-                    Ok(streams) => {
-                        let mut last = None;
-                        for mut s in streams {
-                            while let Ok(Some(sample)) = s.next_event() {
-                                if sample.timestamp <= target {
-                                    last = Some(sample);
-                                }
-                            }
-                        }
-                        last
+                // sample. The original 30-day scan window failed for
+                // slow PVs whose previous sample-before-target was older
+                // than 30 days (Java fix 7b26bec5 widened to +31d, but
+                // we have a tier-aware backward walk that's unbounded
+                // and cheap enough — STS→MTS→LTS, newest-first).
+                match state.storage.get_last_event_before(&canonical, target).await {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        tracing::warn!(pv, "get_last_event_before failed: {e}");
+                        None
                     }
-                    Err(_) => None,
                 }
             }
         };
@@ -151,7 +145,10 @@ async fn get_data_at_time(
             }
             None => serde_json::Value::Null,
         };
-        out.insert(canonical, entry);
+        // Java parity (6ac139d0): response key is the user-supplied name,
+        // not the alias-resolved canonical, so SVG-viewer / Phoebus /
+        // save-restore clients can match request → response by name.
+        out.insert(pv, entry);
     }
 
     axum::Json(serde_json::Value::Object(out)).into_response()
@@ -242,7 +239,12 @@ fn parse_pv_spec(spec: &str) -> (String, Option<String>) {
 
 /// Parsed retrieval parameters shared across all getData endpoints.
 struct RetrievalParams {
+    /// Canonical (alias-resolved) name used for storage / cluster lookup.
     pv_name: String,
+    /// Original name as the client sent it. Echoed in `meta.name` so
+    /// callers that match request → response by name still succeed
+    /// when querying via an alias (Java parity, d54fbdc6 / 6ac139d0).
+    requested_name: String,
     pp_spec: Option<String>,
     use_reduced: bool,
     start: SystemTime,
@@ -376,6 +378,7 @@ fn parse_retrieval_params(params: &GetDataParams) -> RetrievalParams {
         .as_deref()
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
     RetrievalParams {
+        requested_name: pv_name.clone(),
         pv_name,
         pp_spec,
         use_reduced,
@@ -562,7 +565,9 @@ async fn get_data_json(
         .map(|r| (r.prec, r.egu))
         .unwrap_or((None, None));
 
-    let pv_name = rp.pv_name;
+    // Echo the user's name (preserves alias) so SVG-viewer / Phoebus
+    // can match request → response.
+    let pv_name = rp.requested_name;
 
     tokio::spawn(async move {
         let meta = JsonMeta {

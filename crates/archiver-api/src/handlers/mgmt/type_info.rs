@@ -193,6 +193,20 @@ pub async fn put_pv_type_info(
     let parsed: PutTypeInfoBody = serde_json::from_slice(&body)
         .map_err(|e| ApiError::BadRequest(format!("Invalid JSON: {e}")))?;
 
+    // Java parity (39b4c881): if the body's `pvName` is set, it must
+    // match the query `pv`. A scripted GET-edit-PUT pipeline that
+    // targets the wrong URL would otherwise silently overwrite the
+    // URL's PV with a different PV's metadata.
+    if let Some(ref body_pv) = parsed.pv_name
+        && !body_pv.is_empty()
+        && body_pv != &q.pv
+    {
+        return Err(ApiError::BadRequest(format!(
+            "body pvName '{body_pv}' does not match query pv '{}'",
+            q.pv
+        )));
+    }
+
     let exists = state
         .pv_query
         .get_pv(&q.pv)
@@ -463,14 +477,17 @@ pub async fn rename_pv(
     };
 
     // Insert the destination row mirroring source. Both sides remain paused
-    // until the caller resumes / deletes.
+    // until the caller resumes / deletes. Java parity (9968c378): inherit
+    // the source's `created_at` so age-based reports (silent PVs, recently
+    // added) don't reclassify the renamed PV as brand-new.
+    let created_at_str = source.created_at.to_rfc3339();
     if let Err(e) = state.pv_cmd.import_pv(
         &q.newname,
         source.dbr_type,
         &source.sample_mode,
         source.element_count,
         PvStatus::Paused,
-        None,
+        Some(&created_at_str),
         source.prec.as_deref(),
         source.egu.as_deref(),
         None, // not an alias

@@ -136,14 +136,19 @@ impl PlainPbStoragePlugin {
         }
 
         if !cache.contains_key(pv) {
-            let file_exists = path.exists();
+            // Java parity (651c3a6b): treat a zero-byte file the same as
+            // a missing one. A crash mid-create would otherwise leave us
+            // appending samples to a file with no PayloadInfo header,
+            // producing a permanently undecodable file.
+            let needs_header = !path.exists()
+                || std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false);
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)?;
             let mut bw = BufWriter::with_capacity(64 * 1024, file);
 
-            if !file_exists {
+            if needs_header {
                 let (year, _, _) = sample.decompose_timestamp();
                 let header = writer::build_payload_info(
                     pv, dbr_type, year, meta.element_count, &meta.headers,
@@ -240,7 +245,26 @@ fn read_last_sample_from_file(path: &Path) -> anyhow::Result<Option<ArchiverSamp
     }
 
     let raw = codec::unescape(last_line_data);
-    Ok(Some(reader::decode_sample(dbr_type, year, &raw)?))
+    if let Ok(sample) = reader::decode_sample(dbr_type, year, &raw) {
+        return Ok(Some(sample));
+    }
+
+    // Java parity (20ec1a02): a crash mid-write leaves a torn last line.
+    // Walk forward from the start tracking the last good sample so the
+    // tail-corruption case still surfaces a usable answer instead of an
+    // I/O-style error to the caller. Bounded by the file size (we'll
+    // stop at end-of-stream); the cost only matters for the rare
+    // corrupt-tail case.
+    tracing::warn!(
+        ?path,
+        "PB tail decode failed; falling back to forward scan for last good sample"
+    );
+    let mut reader = PbFileReader::open(path)?;
+    let mut last = None;
+    while let Ok(Some(sample)) = reader.next_event() {
+        last = Some(sample);
+    }
+    Ok(last)
 }
 
 /// Build PV file prefix info for matching files in a directory.

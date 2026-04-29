@@ -242,27 +242,11 @@ fn run_get_data_at_time_rpc(
             }
 
             // Stage 2: target is in the past and the last sample is newer.
-            // Scan a window ending at `target`, doubling on miss, capped at
-            // 30 days. Most queries land in the first iteration.
-            let mut window = Duration::from_secs(3_600);
-            let max_window = Duration::from_secs(30 * 86_400);
-            let mut last = None;
-            loop {
-                let lower = target.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH);
-                let streams = storage.get_data(&canonical, lower, target).await?;
-                for mut s in streams {
-                    while let Some(sample) = s.next_event()? {
-                        if sample.timestamp <= target {
-                            last = Some(sample);
-                        }
-                    }
-                }
-                if last.is_some() || window >= max_window || lower == SystemTime::UNIX_EPOCH {
-                    break;
-                }
-                window = window.saturating_mul(2).min(max_window);
-            }
-            anyhow::Ok(last)
+            // The original doubling-window loop capped at 30 days, which
+            // returned None for any PV whose previous sample-before-target
+            // was older than that. Use the tier-aware backward walk
+            // instead — STS→MTS→LTS, newest-first, no arbitrary window.
+            anyhow::Ok(storage.get_last_event_before(&canonical, target).await?)
         })
     })
     .map_err(|e| format!("{e}"))?;

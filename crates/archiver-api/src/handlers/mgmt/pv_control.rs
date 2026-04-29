@@ -1,6 +1,7 @@
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 
 use archiver_core::registry::SampleMode;
 
@@ -396,6 +397,8 @@ pub async fn delete_pv(
     }
     let result = crate::usecases::delete_pv::delete_pv(
         state.archiver_cmd.as_ref(),
+        state.pv_query.as_ref(),
+        state.pv_cmd.as_ref(),
         state.storage.as_ref(),
         &canonical,
         params.delete_data.unwrap_or(false),
@@ -407,6 +410,58 @@ pub async fn delete_pv(
         result.pv, result.files_deleted
     );
     Ok(msg.into_response())
+}
+
+/// `POST /mgmt/bpl/deletePV` with a JSON list of PV names. Java archiver
+/// fix 9bf93675 added the bulk POST variant alongside the single-PV GET.
+/// Optional `?deleteData=true` query string applies to every PV in the list.
+pub async fn bulk_delete_pv(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<DeletePvOptions>,
+    PvListInput(pvs): PvListInput,
+) -> Response {
+    let is_proxied = headers.get("X-Archiver-Proxied").is_some();
+    let (local_pvs, remote_batches) = route_pvs(&state, &pvs, is_proxied).await;
+
+    let mut results = Vec::with_capacity(pvs.len());
+
+    if let Some(ref cluster) = state.cluster {
+        results.extend(
+            forward_all_peer_batches(cluster.as_ref(), remote_batches, "deletePV").await,
+        );
+    }
+
+    for pv in &local_pvs {
+        let status = match crate::usecases::delete_pv::delete_pv(
+            state.archiver_cmd.as_ref(),
+            state.pv_query.as_ref(),
+            state.pv_cmd.as_ref(),
+            state.storage.as_ref(),
+            pv,
+            params.delete_data.unwrap_or(false),
+        )
+        .await
+        {
+            Ok(r) => format!("Deleted (files: {})", r.files_deleted),
+            Err(e) => {
+                tracing::warn!(pv, "Bulk delete failed: {e}");
+                format!("Failed: {e}")
+            }
+        };
+        results.push(BulkResult {
+            pv_name: pv.clone(),
+            status,
+        });
+    }
+
+    axum::Json(results).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct DeletePvOptions {
+    #[serde(default, rename = "deleteData")]
+    pub delete_data: Option<bool>,
 }
 
 // --- Change archival parameters ---

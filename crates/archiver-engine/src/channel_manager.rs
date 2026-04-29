@@ -22,6 +22,41 @@ const CA_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay before retrying a failed CA subscription.
 const CA_RETRY_DELAY: Duration = Duration::from_secs(5);
 
+/// Maximum allowed drift between the IOC-reported sample timestamp and
+/// the appliance's wall clock, in either direction. Java archiver default
+/// `org.epics.archiverappliance.engine.epics.SERVER_IOC_DRIFT_SECONDS`.
+/// A misconfigured IOC NTP would otherwise backfill years of bogus
+/// samples or stamp them in the future.
+const SERVER_IOC_DRIFT_SECS: u64 = 30 * 60;
+/// Hard floor on accepted timestamps. Mirrors Java's `PAST_CUTOFF_TIMESTAMP`
+/// of 1991-01-01 — earlier than that, the timestamp is almost certainly a
+/// stale uninitialised IOC clock or a sentinel.
+const PAST_CUTOFF_UNIX_SECS: i64 = 662_688_000; // 1991-01-01 00:00:00 UTC
+
+/// Filter a freshly-received sample timestamp against the wall clock and
+/// the floor. Returns `Some(ts)` if accepted, `None` if it should be
+/// dropped (caller bumps `timestamp_drops`).
+///
+/// `now` is the appliance wall-clock at the time the sample arrived;
+/// passed in (rather than calling `SystemTime::now()` here) so the test
+/// suite can pin time deterministically.
+fn ioc_timestamp_in_window(ts: SystemTime, now: SystemTime) -> bool {
+    let unix = ts
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(i64::MIN);
+    if unix < PAST_CUTOFF_UNIX_SECS {
+        return false;
+    }
+    // Within ±SERVER_IOC_DRIFT_SECS of `now`?
+    let now_unix = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let delta = (unix - now_unix).unsigned_abs();
+    delta <= SERVER_IOC_DRIFT_SECS
+}
+
 /// Connection state tracked per PV.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionInfo {
@@ -791,13 +826,36 @@ async fn monitor_loop(
                     match result {
                         Some(Ok(snapshot)) => {
                             let now = SystemTime::now();
-                            {
+                            // Java parity (11e554d0): use the IOC-reported
+                            // timestamp, not receive-time, so latency
+                            // doesn't smear sample times. First sample
+                            // after connect is accepted unconditionally
+                            // — legitimate backfill on reconnect can
+                            // include older timestamps. Subsequent
+                            // samples whose IOC clock is more than
+                            // SERVER_IOC_DRIFT_SECS away from wall clock,
+                            // or earlier than the 1991 floor, are
+                            // dropped + counted.
+                            let first_after_connect = {
                                 let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
+                                let first = ci.last_event_time.is_none();
                                 if ci.connected_since.is_none() {
                                     ci.connected_since = Some(now);
                                 }
                                 ci.is_connected = true;
                                 ci.last_event_time = Some(now);
+                                first
+                            };
+                            if !first_after_connect
+                                && !ioc_timestamp_in_window(snapshot.timestamp, now)
+                            {
+                                counters.timestamp_drops.fetch_add(1, Ordering::Relaxed);
+                                debug!(
+                                    pv = pv_name,
+                                    ?snapshot.timestamp,
+                                    "Dropping sample with out-of-window IOC timestamp"
+                                );
+                                continue;
                             }
                             counters.events_received.fetch_add(1, Ordering::Relaxed);
                             // CAS the first-event timestamp once. 0 sentinel
@@ -810,7 +868,7 @@ async fn monitor_loop(
                                 Ordering::Relaxed,
                             );
                             let archiver_val = epics_value_to_archiver(&snapshot.value);
-                            let mut sample = ArchiverSample::new(now, archiver_val);
+                            let mut sample = ArchiverSample::new(snapshot.timestamp, archiver_val);
                             attach_extras(&extras, &mut sample);
                             let pv_sample = PvSample {
                                 pv_name: pv_name.clone(),
