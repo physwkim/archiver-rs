@@ -113,6 +113,19 @@ pub(crate) async fn api_key_auth(
         "/mgmt/bpl/getEventRateReport",
         "/mgmt/bpl/getLastKnownEventTimeStamp",
         "/mgmt/bpl/getMgmtMetrics",
+        "/mgmt/bpl/aggregatedApplianceInfo",
+        "/mgmt/bpl/metaGetsAction",
+        "/mgmt/bpl/PVsMatchingParameter",
+        "/mgmt/bpl/namedFlagsAll",
+        "/mgmt/bpl/namedFlagsGet",
+        "/mgmt/bpl/getApplianceMetricsDetails",
+        "/mgmt/bpl/getDroppedEventsBufferOverflowReport",
+        "/mgmt/bpl/getDroppedEventsTimestampReport",
+        "/mgmt/bpl/getDroppedEventsTypeChangeReport",
+        "/mgmt/bpl/getLostConnectionsReport",
+        "/mgmt/bpl/getCreationTimeReportForAppliance",
+        "/mgmt/bpl/cleanUpAnyImmortalChannels",
+        "/mgmt/bpl/changeStore",
     ];
     let is_read_only_mgmt = request.method() == axum::http::Method::GET
         && READ_ONLY_MGMT_PATHS.contains(&path);

@@ -1,6 +1,8 @@
 mod aliases;
 mod config_io;
+mod legacy;
 mod operations;
+mod p2;
 mod pv_control;
 mod pv_query;
 mod reports;
@@ -113,6 +115,94 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/mgmt/bpl/archivedPVsNotInListAction",
             post(reports::archived_pvs_not_in_list_action),
+        )
+        // P2 endpoints -----------------------------------------------------
+        .route("/mgmt/bpl/appendAndAliasPV", get(p2::append_and_alias_pv))
+        .route("/mgmt/bpl/changeStore", get(p2::change_store))
+        .route("/mgmt/bpl/changeTypeForPV", get(p2::change_type_for_pv))
+        .route("/mgmt/bpl/reassignAppliance", get(p2::reassign_appliance))
+        .route(
+            "/mgmt/bpl/cleanUpAnyImmortalChannels",
+            get(p2::clean_up_any_immortal_channels),
+        )
+        .route(
+            "/mgmt/bpl/aggregatedApplianceInfo",
+            get(p2::aggregated_appliance_info),
+        )
+        .route("/mgmt/bpl/metaGetsAction", get(p2::meta_gets_action))
+        .route(
+            "/mgmt/bpl/PVsMatchingParameter",
+            get(p2::pvs_matching_parameter),
+        )
+        .route("/mgmt/bpl/namedFlagsAll", get(p2::named_flags_all))
+        .route("/mgmt/bpl/namedFlagsGet", get(p2::named_flags_get))
+        .route("/mgmt/bpl/namedFlagsSet", get(p2::named_flags_set))
+        .route(
+            "/mgmt/bpl/getApplianceMetricsDetails",
+            get(p2::appliance_metrics_details),
+        )
+        // Drop-event reports (stubs returning [] until engine
+        // instrumentation lands).
+        .route(
+            "/mgmt/bpl/getDroppedEventsBufferOverflowReport",
+            get(p2::dropped_events_buffer_overflow_report),
+        )
+        .route(
+            "/mgmt/bpl/getDroppedEventsTimestampReport",
+            get(p2::dropped_events_timestamp_report),
+        )
+        .route(
+            "/mgmt/bpl/getDroppedEventsTypeChangeReport",
+            get(p2::dropped_events_type_change_report),
+        )
+        .route(
+            "/mgmt/bpl/getLostConnectionsReport",
+            get(p2::lost_connections_report),
+        )
+        .route(
+            "/mgmt/bpl/getCreationTimeReportForAppliance",
+            get(p2::creation_time_report_for_appliance),
+        )
+        // Legacy / not-applicable — return 410 Gone with a reason ---------
+        .route(
+            "/mgmt/bpl/addExternalArchiverServer",
+            get(legacy::add_external_archiver_server),
+        )
+        .route(
+            "/mgmt/bpl/addExternalArchiverServerArchives",
+            get(legacy::add_external_archiver_server_archives),
+        )
+        .route(
+            "/mgmt/bpl/removeExternalArchiverServer",
+            get(legacy::remove_external_archiver_server),
+        )
+        .route(
+            "/mgmt/bpl/channelArchiverListView",
+            get(legacy::channel_archiver_list_view),
+        )
+        .route(
+            "/mgmt/bpl/importChannelArchiverConfigAction",
+            get(legacy::import_channel_archiver_config),
+        )
+        .route(
+            "/mgmt/bpl/uploadChannelArchiverConfigAction",
+            get(legacy::upload_channel_archiver_config),
+        )
+        .route(
+            "/mgmt/bpl/refreshPVDataFromChannelArchivers",
+            get(legacy::refresh_pv_data_from_channel_archivers),
+        )
+        .route(
+            "/mgmt/bpl/restartArchiveWorkflowThreadForAppliance",
+            get(legacy::restart_archive_workflow_thread),
+        )
+        .route(
+            "/mgmt/bpl/skipAliasCheckAction",
+            get(legacy::skip_alias_check_action),
+        )
+        .route(
+            "/mgmt/bpl/syncStaticContentHeadersFooters",
+            get(legacy::sync_static_content_headers_footers),
         )
 }
 

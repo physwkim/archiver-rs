@@ -1401,3 +1401,86 @@ async fn test_p1_mgmt_metrics_exposes_counts() {
     assert_eq!(body["pvCount"]["active"], 3);
     assert!(body["version"].as_str().is_some());
 }
+
+#[tokio::test]
+async fn test_p2_named_flags_roundtrip() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+
+    let req = get_request("/mgmt/bpl/namedFlagsSet?name=alpha&value=true");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = get_request("/mgmt/bpl/namedFlagsGet?name=alpha");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["value"], true);
+
+    let req = get_request("/mgmt/bpl/namedFlagsAll");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["alpha"], true);
+}
+
+#[tokio::test]
+async fn test_p2_meta_gets_action() {
+    let (app, registry, _dir) = build_test_app_with_pvs().await;
+    registry
+        .update_archive_fields("SIM:Sine", &["HIHI".to_string(), "LOLO".to_string()])
+        .unwrap();
+    let req = get_request("/mgmt/bpl/metaGetsAction?pv=SIM:Sine");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["metaFieldCount"], 2);
+    let fields: Vec<String> = serde_json::from_value(body["metaFields"].clone()).unwrap();
+    assert!(fields.contains(&"HIHI".to_string()));
+}
+
+#[tokio::test]
+async fn test_p3_legacy_endpoints_return_410() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    for endpoint in [
+        "/mgmt/bpl/addExternalArchiverServer",
+        "/mgmt/bpl/channelArchiverListView",
+        "/mgmt/bpl/importChannelArchiverConfigAction",
+        "/mgmt/bpl/refreshPVDataFromChannelArchivers",
+        "/mgmt/bpl/restartArchiveWorkflowThreadForAppliance",
+        "/mgmt/bpl/skipAliasCheckAction",
+        "/mgmt/bpl/syncStaticContentHeadersFooters",
+    ] {
+        let req = get_request(endpoint);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE, "endpoint: {endpoint}");
+        let body = body_to_json(resp.into_body()).await;
+        assert_eq!(body["status"], "gone");
+        assert!(body["reason"].as_str().is_some());
+    }
+}
+
+#[tokio::test]
+async fn test_p2_change_type_for_pv_requires_pause() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    // Active PV → 409.
+    let req = get_request("/mgmt/bpl/changeTypeForPV?pv=SIM:Sine&newtype=2");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Pause then change → ok.
+    let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=SIM:Sine");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let req = get_request("/mgmt/bpl/changeTypeForPV?pv=SIM:Sine&newtype=2");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["newType"], 2);
+}
+
+#[tokio::test]
+async fn test_p2_aggregated_appliance_info_standalone() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/aggregatedApplianceInfo");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = body_to_json(resp.into_body()).await;
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "standalone");
+}
