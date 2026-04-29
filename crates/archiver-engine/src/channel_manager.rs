@@ -613,6 +613,43 @@ impl ChannelManager {
             .collect()
     }
 
+    /// One-shot CA `get` against the running channel for `pv`. Returns
+    /// `None` if the PV isn't actively archived. The timeout caps how
+    /// long the caller will wait for a value when the IOC is slow.
+    /// Powers `getEngineDataAction` / `getDataAtTimeEngine`.
+    pub async fn live_value(
+        &self,
+        pv_name: &str,
+        timeout: Duration,
+    ) -> Option<anyhow::Result<ArchiverValue>> {
+        let channel = self.channels.get(pv_name)?.channel.clone();
+        // Wait briefly for connection — channel.get on a disconnected
+        // channel would otherwise return an error from deep in the CA
+        // stack. Capped by the same timeout the caller chose.
+        if channel.wait_connected(timeout).await.is_err() {
+            return Some(Err(anyhow::anyhow!("channel not connected within {timeout:?}")));
+        }
+        match tokio::time::timeout(timeout, channel.get()).await {
+            Ok(Ok((_dbr_type, val))) => Some(Ok(epics_value_to_archiver(&val))),
+            Ok(Err(e)) => Some(Err(anyhow::anyhow!("CA get failed: {e}"))),
+            Err(_) => Some(Err(anyhow::anyhow!("CA get timed out after {timeout:?}"))),
+        }
+    }
+
+    /// Snapshot the latest cached extra-field values for `pv` —
+    /// `(field_name, stringified_value)` pairs. Empty map when the PV
+    /// isn't archived or has no archive_fields configured.
+    pub fn extras_snapshot(&self, pv_name: &str) -> std::collections::HashMap<String, String> {
+        match self.channels.get(pv_name) {
+            Some(handle) => handle
+                .extras
+                .iter()
+                .map(|e| (e.key().clone(), e.value().clone()))
+                .collect(),
+            None => std::collections::HashMap::new(),
+        }
+    }
+
     /// Get PV names that are currently disconnected (is_connected == false).
     pub fn get_currently_disconnected_pvs(&self) -> Vec<String> {
         self.channels

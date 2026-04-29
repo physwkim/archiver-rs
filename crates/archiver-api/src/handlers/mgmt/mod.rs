@@ -1,5 +1,6 @@
 mod aliases;
 mod config_io;
+mod engine;
 mod legacy;
 mod operations;
 mod p2;
@@ -204,6 +205,20 @@ pub fn routes() -> Router<AppState> {
             "/mgmt/bpl/syncStaticContentHeadersFooters",
             get(legacy::sync_static_content_headers_footers),
         )
+        // Engine BPL — live CA fetch + engine-detailed status -------------
+        .route(
+            "/mgmt/bpl/getEngineDataAction",
+            post(engine::get_engine_data),
+        )
+        .route(
+            "/mgmt/bpl/getDataAtTimeEngine",
+            post(engine::get_data_at_time_engine),
+        )
+        .route(
+            "/mgmt/bpl/getLatestMetaDataAction",
+            get(engine::get_latest_meta_data),
+        )
+        .route("/mgmt/bpl/pvStatusAction", get(engine::pv_status_action))
 }
 
 /// Resolve a possibly-alias PV name to its canonical form. Falls back to

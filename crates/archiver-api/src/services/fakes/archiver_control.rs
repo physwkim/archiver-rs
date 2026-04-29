@@ -35,6 +35,7 @@ impl Default for FakeArchiverControl {
     }
 }
 
+#[async_trait]
 impl ArchiverQuery for FakeArchiverControl {
     fn get_connection_info(&self, pv: &str) -> Option<ConnectionInfoDto> {
         let state = self.state.lock().unwrap();
@@ -56,6 +57,23 @@ impl ArchiverQuery for FakeArchiverControl {
     fn get_currently_disconnected_pvs(&self) -> Vec<String> {
         let state = self.state.lock().unwrap();
         state.paused.iter().cloned().collect()
+    }
+
+    async fn live_value(
+        &self,
+        pv: &str,
+        _timeout_secs: u64,
+    ) -> Option<Result<serde_json::Value, String>> {
+        let state = self.state.lock().unwrap();
+        if state.archived.contains(pv) {
+            Some(Ok(serde_json::Value::Null))
+        } else {
+            None
+        }
+    }
+
+    fn extras_snapshot(&self, _pv: &str) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
     }
 
     fn all_pv_counters(&self) -> Vec<(String, PvCountersDto)> {

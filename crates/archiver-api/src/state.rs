@@ -126,6 +126,8 @@ pub(crate) async fn api_key_auth(
         "/mgmt/bpl/getCreationTimeReportForAppliance",
         "/mgmt/bpl/cleanUpAnyImmortalChannels",
         "/mgmt/bpl/changeStore",
+        "/mgmt/bpl/getLatestMetaDataAction",
+        "/mgmt/bpl/pvStatusAction",
     ];
     let is_read_only_mgmt = request.method() == axum::http::Method::GET
         && READ_ONLY_MGMT_PATHS.contains(&path);

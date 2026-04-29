@@ -17,6 +17,7 @@ impl ChannelArchiverControl {
     }
 }
 
+#[async_trait]
 impl ArchiverQuery for ChannelArchiverControl {
     fn get_connection_info(&self, pv: &str) -> Option<ConnectionInfoDto> {
         self.inner.get_connection_info(pv).map(|c| ConnectionInfoDto {
@@ -54,6 +55,49 @@ impl ArchiverQuery for ChannelArchiverControl {
                 )
             })
             .collect()
+    }
+
+    async fn live_value(
+        &self,
+        pv: &str,
+        timeout_secs: u64,
+    ) -> Option<Result<serde_json::Value, String>> {
+        let timeout = std::time::Duration::from_secs(timeout_secs.max(1).min(60));
+        match self.inner.live_value(pv, timeout).await {
+            Some(Ok(v)) => Some(Ok(archiver_value_to_json(&v))),
+            Some(Err(e)) => Some(Err(format!("{e}"))),
+            None => None,
+        }
+    }
+
+    fn extras_snapshot(&self, pv: &str) -> std::collections::HashMap<String, String> {
+        self.inner.extras_snapshot(pv)
+    }
+}
+
+fn archiver_value_to_json(v: &archiver_core::types::ArchiverValue) -> serde_json::Value {
+    use archiver_core::types::ArchiverValue;
+    use serde_json::Value;
+    match v {
+        ArchiverValue::ScalarString(s) => Value::String(s.clone()),
+        ArchiverValue::ScalarShort(n) => (*n).into(),
+        ArchiverValue::ScalarInt(n) => (*n).into(),
+        ArchiverValue::ScalarEnum(n) => (*n).into(),
+        ArchiverValue::ScalarFloat(f) => (*f as f64).into(),
+        ArchiverValue::ScalarDouble(f) => (*f).into(),
+        ArchiverValue::ScalarByte(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorString(arr) => {
+            Value::Array(arr.iter().map(|s| Value::String(s.clone())).collect())
+        }
+        ArchiverValue::VectorChar(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorShort(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorInt(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorEnum(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorFloat(arr) => {
+            Value::Array(arr.iter().map(|x| (*x as f64).into()).collect())
+        }
+        ArchiverValue::VectorDouble(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::V4GenericBytes(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
     }
 }
 

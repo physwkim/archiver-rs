@@ -57,6 +57,7 @@ pub trait PvCommandRepository: Send + Sync {
 
 // --- ArchiverQuery (sync — read-only operations on archiver engine) ---
 
+#[async_trait]
 pub trait ArchiverQuery: Send + Sync {
     fn get_connection_info(&self, pv: &str) -> Option<ConnectionInfoDto>;
     fn get_never_connected_pvs(&self) -> Vec<String>;
@@ -64,6 +65,16 @@ pub trait ArchiverQuery: Send + Sync {
     /// Per-PV counter snapshots for the BPL drop / rate / connection
     /// reports. Returns one entry per actively-archived PV.
     fn all_pv_counters(&self) -> Vec<(String, PvCountersDto)>;
+    /// One-shot live CA fetch for `pv`. Returns `None` if the PV is
+    /// not actively archived; otherwise `Some(Ok(json_value))` on a
+    /// successful read or `Some(Err(message))` on timeout / IOC error.
+    async fn live_value(
+        &self,
+        pv: &str,
+        timeout_secs: u64,
+    ) -> Option<Result<serde_json::Value, String>>;
+    /// Cached snapshot of metadata fields (`HIHI`, `LOLO`, `EGU`, …).
+    fn extras_snapshot(&self, pv: &str) -> std::collections::HashMap<String, String>;
 }
 
 /// Trait-local counter snapshot. Mirrors `archiver_engine::channel_manager::

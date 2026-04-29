@@ -1653,3 +1653,50 @@ async fn test_d_update_archive_fields_concurrent_no_duplicate_tasks() {
             || r.archive_fields == vec!["EGU".to_string(), "PREC".to_string()],
     );
 }
+
+#[tokio::test]
+async fn test_engine_pv_status_action_shape() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/pvStatusAction?pv=SIM:Sine");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["pvName"], "SIM:Sine");
+    assert!(body["dbrType"].is_number());
+    // No CA traffic in tests, so connection / counters may be null/empty.
+    assert!(body["extras"].is_object());
+}
+
+#[tokio::test]
+async fn test_engine_get_latest_meta_data_empty_when_no_extras() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let req = get_request("/mgmt/bpl/getLatestMetaDataAction?pv=SIM:Sine");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    // No archive_fields configured → empty object.
+    assert_eq!(body, serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn test_engine_data_action_returns_per_pv_entries() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let body = serde_json::json!(["SIM:Sine", "NOT:Real"]).to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mgmt/bpl/getEngineDataAction")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    // Both PVs present in response. SIM:Sine has no live CA (no IOC),
+    // so we get an error string. NOT:Real reports "not archived".
+    assert!(body["SIM:Sine"].is_object());
+    assert!(body["NOT:Real"].is_object());
+    assert_eq!(
+        body["NOT:Real"]["error"].as_str().unwrap(),
+        "not archived on this appliance"
+    );
+}
