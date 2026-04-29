@@ -61,6 +61,24 @@ pub trait ArchiverQuery: Send + Sync {
     fn get_connection_info(&self, pv: &str) -> Option<ConnectionInfoDto>;
     fn get_never_connected_pvs(&self) -> Vec<String>;
     fn get_currently_disconnected_pvs(&self) -> Vec<String>;
+    /// Per-PV counter snapshots for the BPL drop / rate / connection
+    /// reports. Returns one entry per actively-archived PV.
+    fn all_pv_counters(&self) -> Vec<(String, PvCountersDto)>;
+}
+
+/// Trait-local counter snapshot. Mirrors `archiver_engine::channel_manager::
+/// PvCountersSnapshot`; we re-declare it here so handlers don't depend
+/// on the engine crate directly.
+#[derive(Debug, Clone)]
+pub struct PvCountersDto {
+    pub events_received: u64,
+    pub events_stored: u64,
+    pub first_event_unix_secs: Option<i64>,
+    pub buffer_overflow_drops: u64,
+    pub timestamp_drops: u64,
+    pub type_change_drops: u64,
+    pub disconnect_count: u64,
+    pub last_disconnect_unix_secs: Option<i64>,
 }
 
 // --- ArchiverCommand (async — write operations on archiver engine) ---

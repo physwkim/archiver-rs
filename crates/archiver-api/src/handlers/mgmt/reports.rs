@@ -196,33 +196,32 @@ pub async fn get_pvs_by_storage_consumed(
     Ok(axum::Json(json))
 }
 
-/// `GET /mgmt/bpl/getEventRateReport` — best-effort events/sec per PV
-/// estimated from the registry's `last_timestamp` delta and prometheus
-/// `archiver_events_stored_total`. Reports `null` rate when no signal.
+/// `GET /mgmt/bpl/getEventRateReport` — events/sec per PV computed from
+/// engine counters. `eventRate` = `events_stored / (now - first_event)`.
+/// `null` rate when no event has arrived yet for that PV.
 pub async fn get_event_rate_report(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let records = state.pv_query.all_records().map_err(ApiError::internal)?;
-    let now = SystemTime::now();
-    let entries: Vec<serde_json::Value> = records
+    let counters = state.archiver_query.all_pv_counters();
+    let now_secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let entries: Vec<serde_json::Value> = counters
         .into_iter()
-        .filter(|r| r.alias_for.is_none())
-        .map(|r| {
-            // Best-effort: use the gap between `created_at` and
-            // `last_timestamp` as a rough denominator. Real per-PV
-            // rate tracking belongs in the engine; this surfaces
-            // "is data flowing?" cheaply.
-            let secs = r.last_timestamp.and_then(|ts| {
-                ts.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_secs() as f64)
-            });
-            let connected = r
-                .last_timestamp
-                .map(|ts| now.duration_since(ts).unwrap_or_default().as_secs() < 300)
-                .unwrap_or(false);
+        .map(|(pv, c)| {
+            let rate = match c.first_event_unix_secs {
+                Some(first) if now_secs > first && c.events_stored > 0 => {
+                    Some(c.events_stored as f64 / (now_secs - first) as f64)
+                }
+                _ => None,
+            };
             serde_json::json!({
-                "pvName": r.pv_name,
-                "lastEventEpochSecs": secs,
-                "connected": connected,
+                "pvName": pv,
+                "eventRate": rate,
+                "eventsReceived": c.events_received,
+                "eventsStored": c.events_stored,
+                "firstEventEpochSecs": c.first_event_unix_secs,
             })
         })
         .collect();

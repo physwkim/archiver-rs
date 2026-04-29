@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -29,6 +30,76 @@ pub struct ConnectionInfo {
     pub is_connected: bool,
 }
 
+/// Per-PV diagnostic counters for the BPL drop / rate / connection
+/// reports. All counts are monotonic across the PV's lifetime; the
+/// rate handlers compute deltas against `first_event_unix_secs`.
+///
+/// Tracked here (not in ConnectionInfo) so they survive transient
+/// disconnects and are read lock-free from the report endpoints.
+#[derive(Debug, Default)]
+pub struct PvCounters {
+    /// Total events produced by monitor/scan, including those that
+    /// later got dropped before write.
+    pub events_received: AtomicU64,
+    /// Total events successfully written to storage.
+    pub events_stored: AtomicU64,
+    /// Unix-epoch seconds of the first event we ever saw for this PV.
+    /// 0 = "no event yet" (i64 because Atomic<Option<...>> doesn't exist).
+    pub first_event_unix_secs: AtomicI64,
+    /// Number of events the bounded sample channel rejected (write
+    /// loop falling behind producer). Surfaces as
+    /// `getDroppedEventsBufferOverflowReport`.
+    pub buffer_overflow_drops: AtomicU64,
+    /// Number of events whose timestamp went backwards relative to the
+    /// previously-stored event. Java archiver's
+    /// `DroppedEventsTimestampReport`.
+    pub timestamp_drops: AtomicU64,
+    /// Number of events whose runtime DBR type didn't match the
+    /// PvRecord's stored type — the engine drops these because mixing
+    /// types in one PB partition would corrupt downstream readers.
+    pub type_change_drops: AtomicU64,
+    /// Number of disconnect transitions seen on this PV's CA channel.
+    /// `LostConnectionsReport`.
+    pub disconnect_count: AtomicU64,
+    /// Last unix-epoch seconds of disconnect transition.
+    pub last_disconnect_unix_secs: AtomicI64,
+}
+
+/// Read-only snapshot of `PvCounters` — owned values so callers can
+/// move them across threads / serialise without reaching into Atomics.
+#[derive(Debug, Clone)]
+pub struct PvCountersSnapshot {
+    pub events_received: u64,
+    pub events_stored: u64,
+    pub first_event_unix_secs: Option<i64>,
+    pub buffer_overflow_drops: u64,
+    pub timestamp_drops: u64,
+    pub type_change_drops: u64,
+    pub disconnect_count: u64,
+    pub last_disconnect_unix_secs: Option<i64>,
+}
+
+impl From<&PvCounters> for PvCountersSnapshot {
+    fn from(c: &PvCounters) -> Self {
+        let first = c.first_event_unix_secs.load(Ordering::Relaxed);
+        let last_disc = c.last_disconnect_unix_secs.load(Ordering::Relaxed);
+        Self {
+            events_received: c.events_received.load(Ordering::Relaxed),
+            events_stored: c.events_stored.load(Ordering::Relaxed),
+            first_event_unix_secs: if first == 0 { None } else { Some(first) },
+            buffer_overflow_drops: c.buffer_overflow_drops.load(Ordering::Relaxed),
+            timestamp_drops: c.timestamp_drops.load(Ordering::Relaxed),
+            type_change_drops: c.type_change_drops.load(Ordering::Relaxed),
+            disconnect_count: c.disconnect_count.load(Ordering::Relaxed),
+            last_disconnect_unix_secs: if last_disc == 0 {
+                None
+            } else {
+                Some(last_disc)
+            },
+        }
+    }
+}
+
 
 /// Handle for a running PV archiving task.
 struct PvHandle {
@@ -50,6 +121,10 @@ struct PvHandle {
     /// Serialises concurrent `update_archive_fields` calls for this PV so
     /// add/remove/respawn never race with itself.
     update_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Diagnostic counters surfaced through the BPL drop / rate /
+    /// connection reports. Lock-free reads; updates from the producer
+    /// (monitor/scan) and the writer happen on different threads.
+    counters: Arc<PvCounters>,
 }
 
 /// Thread-safe cache of latest extra-field values for one PV.
@@ -100,6 +175,10 @@ pub struct PvSample {
     pub dbr_type: ArchDbType,
     pub sample: ArchiverSample,
     pub element_count: Option<i32>,
+    /// Counter handle used by the write loop to record timestamp /
+    /// type-change drops. None on samples produced before counter
+    /// support was wired up — write_loop tolerates the absence.
+    pub counters: Option<Arc<PvCounters>>,
 }
 
 impl ChannelManager {
@@ -242,6 +321,7 @@ impl ChannelManager {
         let extras: Arc<ExtraFieldsCache> = Arc::new(DashMap::new());
         let field_tokens: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
         let update_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let counters = Arc::new(PvCounters::default());
 
         // Hold update_lock around the whole insert+spawn block so a
         // concurrent update_archive_fields can't observe the empty
@@ -260,6 +340,7 @@ impl ChannelManager {
                 extras: extras.clone(),
                 field_tokens: field_tokens.clone(),
                 update_lock: update_lock.clone(),
+                counters: counters.clone(),
             },
         );
 
@@ -283,6 +364,7 @@ impl ChannelManager {
         let token = cancel_token.clone();
         let ci = conn_info.clone();
         let extras_for_loop = extras.clone();
+        let counters_for_loop = counters.clone();
 
         match &record.sample_mode {
             SampleMode::Monitor => {
@@ -296,6 +378,7 @@ impl ChannelManager {
                         token,
                         ci,
                         extras_for_loop,
+                        counters_for_loop,
                     )
                     .await;
                 });
@@ -313,6 +396,7 @@ impl ChannelManager {
                         period,
                         ci,
                         extras_for_loop,
+                        counters_for_loop,
                     )
                     .await;
                 });
@@ -513,6 +597,22 @@ impl ChannelManager {
             .collect()
     }
 
+    /// Snapshot the diagnostic counters for one PV. Returns None if the
+    /// PV isn't actively archived. The returned Arc is the live counter
+    /// — callers read with `Ordering::Relaxed`.
+    pub fn pv_counters(&self, pv_name: &str) -> Option<Arc<PvCounters>> {
+        self.channels.get(pv_name).map(|h| h.counters.clone())
+    }
+
+    /// Snapshot every active PV's counters. Returns `(pv_name,
+    /// PvCountersSnapshot)` so callers don't have to handle Arc.
+    pub fn all_pv_counters(&self) -> Vec<(String, PvCountersSnapshot)> {
+        self.channels
+            .iter()
+            .map(|e| (e.key().clone(), PvCountersSnapshot::from(&*e.value().counters)))
+            .collect()
+    }
+
     /// Get PV names that are currently disconnected (is_connected == false).
     pub fn get_currently_disconnected_pvs(&self) -> Vec<String> {
         self.channels
@@ -537,6 +637,7 @@ async fn monitor_loop(
     cancel_token: CancellationToken,
     conn_info: Arc<Mutex<ConnectionInfo>>,
     extras: Arc<ExtraFieldsCache>,
+    counters: Arc<PvCounters>,
 ) {
     loop {
         // Wait for connection, respecting cancellation.
@@ -624,6 +725,16 @@ async fn monitor_loop(
                                 ci.is_connected = true;
                                 ci.last_event_time = Some(now);
                             }
+                            counters.events_received.fetch_add(1, Ordering::Relaxed);
+                            // CAS the first-event timestamp once. 0 sentinel
+                            // means "no event yet"; replace with now.
+                            let now_secs = unix_secs(now);
+                            let _ = counters.first_event_unix_secs.compare_exchange(
+                                0,
+                                now_secs,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
                             let archiver_val = epics_value_to_archiver(&snapshot.value);
                             let mut sample = ArchiverSample::new(now, archiver_val);
                             attach_extras(&extras, &mut sample);
@@ -632,8 +743,16 @@ async fn monitor_loop(
                                 dbr_type,
                                 sample,
                                 element_count: Some(element_count),
+                                counters: Some(counters.clone()),
                             };
-                            if tx.send(pv_sample).await.is_err() {
+                            if let Err(pv_sample) = try_send_with_overflow_count(
+                                &tx,
+                                pv_sample,
+                                &counters,
+                            )
+                            .await
+                            {
+                                let _ = pv_sample;
                                 return; // Write loop shut down
                             }
                         }
@@ -651,7 +770,40 @@ async fn monitor_loop(
             let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
             ci.is_connected = false;
         }
+        counters.disconnect_count.fetch_add(1, Ordering::Relaxed);
+        counters
+            .last_disconnect_unix_secs
+            .store(unix_secs(SystemTime::now()), Ordering::Relaxed);
         debug!(pv = pv_name, "Monitor ended, waiting for reconnection");
+    }
+}
+
+fn unix_secs(t: SystemTime) -> i64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Send a sample and count buffer-overflow events. Tries non-blocking
+/// first; if the bounded channel is full we increment the counter and
+/// fall back to a blocking send so backpressure still works.
+async fn try_send_with_overflow_count(
+    tx: &mpsc::Sender<PvSample>,
+    pv_sample: PvSample,
+    counters: &PvCounters,
+) -> Result<(), PvSample> {
+    match tx.try_send(pv_sample) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(pv_sample)) => {
+            counters
+                .buffer_overflow_drops
+                .fetch_add(1, Ordering::Relaxed);
+            // Backpressure to the producer; this awaits until the writer
+            // drains some space. We count the saturation event but don't
+            // actually drop the sample.
+            tx.send(pv_sample).await.map_err(|e| e.0)
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(pv_sample)) => Err(pv_sample),
     }
 }
 
@@ -667,6 +819,7 @@ async fn scan_loop(
     period_secs: f64,
     conn_info: Arc<Mutex<ConnectionInfo>>,
     extras: Arc<ExtraFieldsCache>,
+    counters: Arc<PvCounters>,
 ) {
     let period = Duration::from_secs_f64(period_secs);
     let mut interval = tokio::time::interval(period);
@@ -678,8 +831,18 @@ async fn scan_loop(
         }
 
         if channel.wait_connected(CA_RETRY_DELAY).await.is_err() {
-            let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
-            ci.is_connected = false;
+            let was_connected = {
+                let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
+                let prev = ci.is_connected;
+                ci.is_connected = false;
+                prev
+            };
+            if was_connected {
+                counters.disconnect_count.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .last_disconnect_unix_secs
+                    .store(unix_secs(SystemTime::now()), Ordering::Relaxed);
+            }
             continue;
         }
 
@@ -694,6 +857,14 @@ async fn scan_loop(
                     ci.is_connected = true;
                     ci.last_event_time = Some(now);
                 }
+                counters.events_received.fetch_add(1, Ordering::Relaxed);
+                let now_secs = unix_secs(now);
+                let _ = counters.first_event_unix_secs.compare_exchange(
+                    0,
+                    now_secs,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
                 let archiver_val = epics_value_to_archiver(&epics_val);
                 let mut sample = ArchiverSample::new(now, archiver_val);
                 attach_extras(&extras, &mut sample);
@@ -702,8 +873,12 @@ async fn scan_loop(
                     dbr_type,
                     sample,
                     element_count: Some(element_count),
+                    counters: Some(counters.clone()),
                 };
-                if tx.send(pv_sample).await.is_err() {
+                if try_send_with_overflow_count(&tx, pv_sample, &counters)
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -869,8 +1044,14 @@ pub async fn write_loop(
 ) {
     info!("Write loop started");
     // HashMap keyed by PV name → latest timestamp. Avoids duplicate entries
-    // when the same PV receives many samples between flushes.
+    // when the same PV receives many samples between flushes, and feeds
+    // the per-PV out-of-order detector below.
     let mut ts_updates: std::collections::HashMap<String, SystemTime> =
+        std::collections::HashMap::new();
+    // Last-observed (registry-record) DBR type per PV, used to detect
+    // mid-stream type changes that we must drop to avoid corrupting the
+    // PB partition.
+    let mut last_dbr_type: std::collections::HashMap<String, ArchDbType> =
         std::collections::HashMap::new();
     let mut last_flush = std::time::Instant::now();
 
@@ -878,6 +1059,49 @@ pub async fn write_loop(
         tokio::select! {
             Some(pv_sample) = rx.recv() => {
                 let ts = pv_sample.sample.timestamp;
+
+                // Out-of-order timestamp drop. Storage requires monotonic
+                // appends per PV; an older timestamp would produce a
+                // corrupt partition.
+                if let Some(prev_ts) = ts_updates.get(&pv_sample.pv_name)
+                    && ts < *prev_ts
+                {
+                    if let Some(ref c) = pv_sample.counters {
+                        c.timestamp_drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                    debug!(
+                        pv = pv_sample.pv_name,
+                        ?ts,
+                        ?prev_ts,
+                        "Dropping out-of-order sample"
+                    );
+                    continue;
+                }
+
+                // Type-change drop. The first sample defines the PV's
+                // wire type; later samples with a different DBR get
+                // dropped (operator must changeTypeForPV first).
+                let prev_type = last_dbr_type
+                    .insert(pv_sample.pv_name.clone(), pv_sample.dbr_type);
+                if let Some(prev) = prev_type
+                    && prev != pv_sample.dbr_type
+                {
+                    if let Some(ref c) = pv_sample.counters {
+                        c.type_change_drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                    debug!(
+                        pv = pv_sample.pv_name,
+                        ?prev,
+                        new = ?pv_sample.dbr_type,
+                        "Dropping type-changed sample"
+                    );
+                    // Restore prev_type in the map so a single
+                    // mismatched sample doesn't permanently flip our
+                    // recorded type.
+                    last_dbr_type.insert(pv_sample.pv_name.clone(), prev);
+                    continue;
+                }
+
                 let meta = AppendMeta {
                     element_count: pv_sample.element_count,
                     ..Default::default()
@@ -894,6 +1118,9 @@ pub async fn write_loop(
                     error!(pv = pv_sample.pv_name, "Write error: {e}");
                 } else {
                     metrics::counter!("archiver_events_stored_total").increment(1);
+                    if let Some(ref c) = pv_sample.counters {
+                        c.events_stored.fetch_add(1, Ordering::Relaxed);
+                    }
                     ts_updates.insert(pv_sample.pv_name, ts);
                 }
 

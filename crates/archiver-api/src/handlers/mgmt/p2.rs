@@ -390,33 +390,76 @@ pub async fn appliance_metrics_details(
     .into_response()
 }
 
-// ─── Stub reports for drop-event tracking ─────────────────────────────
+// ─── Drop / connection reports backed by engine counters ──────────────
 //
-// Java exposes per-PV counters for buffer overflow / out-of-order
-// timestamps / mid-stream type changes. archiver-rs doesn't track
-// these counters yet; the endpoints return `[]` so clients that poll
-// them don't 404. When engine instrumentation lands these will turn
-// into real reports.
+// Each of the four reports below filters the same per-PV
+// `archiver_query.all_pv_counters()` snapshot for non-zero entries on
+// the relevant counter, returning `[{pvName, count, ...}]` shaped to
+// match the Java archiver's report consumers.
 
-pub async fn dropped_events_buffer_overflow_report() -> Response {
-    axum::Json(Vec::<serde_json::Value>::new()).into_response()
+pub async fn dropped_events_buffer_overflow_report(
+    State(state): State<AppState>,
+) -> Response {
+    let entries: Vec<serde_json::Value> = state
+        .archiver_query
+        .all_pv_counters()
+        .into_iter()
+        .filter(|(_, c)| c.buffer_overflow_drops > 0)
+        .map(|(pv, c)| {
+            serde_json::json!({
+                "pvName": pv,
+                "drops": c.buffer_overflow_drops,
+            })
+        })
+        .collect();
+    axum::Json(entries).into_response()
 }
 
-pub async fn dropped_events_timestamp_report() -> Response {
-    axum::Json(Vec::<serde_json::Value>::new()).into_response()
+pub async fn dropped_events_timestamp_report(State(state): State<AppState>) -> Response {
+    let entries: Vec<serde_json::Value> = state
+        .archiver_query
+        .all_pv_counters()
+        .into_iter()
+        .filter(|(_, c)| c.timestamp_drops > 0)
+        .map(|(pv, c)| {
+            serde_json::json!({
+                "pvName": pv,
+                "drops": c.timestamp_drops,
+            })
+        })
+        .collect();
+    axum::Json(entries).into_response()
 }
 
-pub async fn dropped_events_type_change_report() -> Response {
-    axum::Json(Vec::<serde_json::Value>::new()).into_response()
+pub async fn dropped_events_type_change_report(State(state): State<AppState>) -> Response {
+    let entries: Vec<serde_json::Value> = state
+        .archiver_query
+        .all_pv_counters()
+        .into_iter()
+        .filter(|(_, c)| c.type_change_drops > 0)
+        .map(|(pv, c)| {
+            serde_json::json!({
+                "pvName": pv,
+                "drops": c.type_change_drops,
+            })
+        })
+        .collect();
+    axum::Json(entries).into_response()
 }
 
 pub async fn lost_connections_report(State(state): State<AppState>) -> Response {
-    // Approximation: surface currently-disconnected PVs as "recently lost"
-    // until per-disconnect tracking lands.
-    let pvs = state.archiver_query.get_currently_disconnected_pvs();
-    let entries: Vec<serde_json::Value> = pvs
+    let entries: Vec<serde_json::Value> = state
+        .archiver_query
+        .all_pv_counters()
         .into_iter()
-        .map(|pv| serde_json::json!({"pvName": pv}))
+        .filter(|(_, c)| c.disconnect_count > 0)
+        .map(|(pv, c)| {
+            serde_json::json!({
+                "pvName": pv,
+                "disconnectCount": c.disconnect_count,
+                "lastDisconnectEpochSecs": c.last_disconnect_unix_secs,
+            })
+        })
         .collect();
     axum::Json(entries).into_response()
 }

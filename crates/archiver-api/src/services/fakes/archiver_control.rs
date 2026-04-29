@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use archiver_core::registry::SampleMode;
 
-use crate::services::traits::{ArchiverCommand, ArchiverQuery, ConnectionInfoDto};
+use crate::services::traits::{ArchiverCommand, ArchiverQuery, ConnectionInfoDto, PvCountersDto};
 
 struct FakeState {
     archived: HashSet<String>,
@@ -56,6 +56,32 @@ impl ArchiverQuery for FakeArchiverControl {
     fn get_currently_disconnected_pvs(&self) -> Vec<String> {
         let state = self.state.lock().unwrap();
         state.paused.iter().cloned().collect()
+    }
+
+    fn all_pv_counters(&self) -> Vec<(String, PvCountersDto)> {
+        // Fake: return a zeroed counter per archived PV so handlers
+        // exercising this path see a sensible shape under test.
+        let state = self.state.lock().unwrap();
+        state
+            .archived
+            .iter()
+            .cloned()
+            .map(|pv| {
+                (
+                    pv,
+                    PvCountersDto {
+                        events_received: 0,
+                        events_stored: 0,
+                        first_event_unix_secs: None,
+                        buffer_overflow_drops: 0,
+                        timestamp_drops: 0,
+                        type_change_drops: 0,
+                        disconnect_count: 0,
+                        last_disconnect_unix_secs: None,
+                    },
+                )
+            })
+            .collect()
     }
 }
 

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use archiver_core::registry::SampleMode;
 use archiver_engine::channel_manager::ChannelManager;
 
-use crate::services::traits::{ArchiverCommand, ArchiverQuery, ConnectionInfoDto};
+use crate::services::traits::{ArchiverCommand, ArchiverQuery, ConnectionInfoDto, PvCountersDto};
 
 pub struct ChannelArchiverControl {
     inner: Arc<ChannelManager>,
@@ -32,6 +32,28 @@ impl ArchiverQuery for ChannelArchiverControl {
 
     fn get_currently_disconnected_pvs(&self) -> Vec<String> {
         self.inner.get_currently_disconnected_pvs()
+    }
+
+    fn all_pv_counters(&self) -> Vec<(String, PvCountersDto)> {
+        self.inner
+            .all_pv_counters()
+            .into_iter()
+            .map(|(pv, c)| {
+                (
+                    pv,
+                    PvCountersDto {
+                        events_received: c.events_received,
+                        events_stored: c.events_stored,
+                        first_event_unix_secs: c.first_event_unix_secs,
+                        buffer_overflow_drops: c.buffer_overflow_drops,
+                        timestamp_drops: c.timestamp_drops,
+                        type_change_drops: c.type_change_drops,
+                        disconnect_count: c.disconnect_count,
+                        last_disconnect_unix_secs: c.last_disconnect_unix_secs,
+                    },
+                )
+            })
+            .collect()
     }
 }
 
