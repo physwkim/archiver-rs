@@ -6,6 +6,9 @@ edition.workspace = true
 [features]
 test-support = []
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [dependencies]
 archiver-core = { workspace = true }
 archiver-proto = { workspace = true }
@@ -29,3 +32,4 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 async-trait = { workspace = true }
 subtle = { workspace = true }
+epics-rs = { workspace = true }

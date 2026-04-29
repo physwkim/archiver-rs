@@ -22,6 +22,10 @@ pub struct ArchiverConfig {
     /// data and merge by timestamp (with duplicate-timestamp drop).
     #[serde(default)]
     pub failover: Option<FailoverConfig>,
+    /// PVA retrieval RPC server. When set, the archiver hosts
+    /// `archappl/getData` and `archappl/getDataAtTime` PVA RPC PVs.
+    #[serde(default)]
+    pub pva: Option<PvaConfig>,
     /// Optional API keys for management endpoint authentication.
     /// If set, mgmt write endpoints require `Authorization: Bearer <key>` or `X-API-Key: <key>`.
     /// Retrieval GET endpoints remain open.
@@ -204,6 +208,34 @@ pub struct FailoverConfig {
 
 fn default_failover_timeout() -> u64 {
     30
+}
+
+/// PVA retrieval RPC server configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PvaConfig {
+    /// TCP port the PVA server listens on (default 5075).
+    #[serde(default = "default_pva_tcp_port")]
+    pub tcp_port: u16,
+    /// UDP port for PVA search/beacon (default 5076).
+    #[serde(default = "default_pva_udp_port")]
+    pub udp_port: u16,
+}
+
+fn default_pva_tcp_port() -> u16 {
+    5075
+}
+
+fn default_pva_udp_port() -> u16 {
+    5076
+}
+
+impl Default for PvaConfig {
+    fn default() -> Self {
+        Self {
+            tcp_port: default_pva_tcp_port(),
+            udp_port: default_pva_udp_port(),
+        }
+    }
 }
 
 impl ArchiverConfig {

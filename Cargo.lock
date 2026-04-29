@@ -68,7 +68,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -79,7 +79,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -139,14 +139,16 @@ dependencies = [
  "axum",
  "chrono",
  "dashmap",
+ "epics-rs",
  "futures",
- "metrics",
+ "metrics 0.24.3",
  "metrics-exporter-prometheus",
  "prost",
  "reqwest",
  "serde",
  "serde_json",
  "subtle",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -164,7 +166,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dashmap",
- "metrics",
+ "metrics 0.24.3",
  "prost",
  "rusqlite",
  "serde",
@@ -185,7 +187,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "epics-rs",
- "metrics",
+ "metrics 0.24.3",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -536,36 +538,43 @@ checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.9.1"
-source = "git+https://github.com/epics-rs/epics-rs#7f9a6c0da8b40c88bbd466616e284b137fde3771"
+version = "0.10.5"
+source = "git+https://github.com/epics-rs/epics-rs#46b8734140395d8d1f7f8e5949fdbb218f8e8fb6"
 dependencies = [
  "bytes",
  "chrono",
  "clap",
  "epics-macros-rs",
  "hostname",
+ "parking_lot",
  "rustyline",
  "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.9.1"
-source = "git+https://github.com/epics-rs/epics-rs#7f9a6c0da8b40c88bbd466616e284b137fde3771"
+version = "0.10.5"
+source = "git+https://github.com/epics-rs/epics-rs#46b8734140395d8d1f7f8e5949fdbb218f8e8fb6"
 dependencies = [
+ "async-trait",
  "chrono",
  "clap",
  "epics-base-rs",
+ "futures-util",
+ "if-addrs",
+ "metrics 0.23.1",
  "socket2 0.5.10",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.9.1"
-source = "git+https://github.com/epics-rs/epics-rs#7f9a6c0da8b40c88bbd466616e284b137fde3771"
+version = "0.10.5"
+source = "git+https://github.com/epics-rs/epics-rs#46b8734140395d8d1f7f8e5949fdbb218f8e8fb6"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -574,12 +583,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "epics-pva-rs"
+version = "0.10.5"
+source = "git+https://github.com/epics-rs/epics-rs#46b8734140395d8d1f7f8e5949fdbb218f8e8fb6"
+dependencies = [
+ "chrono",
+ "clap",
+ "epics-base-rs",
+ "hostname",
+ "if-addrs",
+ "libc",
+ "parking_lot",
+ "rustls",
+ "rustls-pemfile",
+ "serde_json",
+ "socket2 0.5.10",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "epics-rs"
-version = "0.9.1"
-source = "git+https://github.com/epics-rs/epics-rs#7f9a6c0da8b40c88bbd466616e284b137fde3771"
+version = "0.10.5"
+source = "git+https://github.com/epics-rs/epics-rs#46b8734140395d8d1f7f8e5949fdbb218f8e8fb6"
 dependencies = [
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-pva-rs",
 ]
 
 [[package]]
@@ -595,7 +629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1126,6 +1160,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b2eeee38fef3aa9b4cc5f1beea8a2444fc00e7377cafae396de3f5c2065e24"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1315,6 +1359,16 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "metrics"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3045b4193fbdc5b5681f32f11070da9be3609f189a79f3390706d42587f46bb5"
+dependencies = [
+ "ahash",
+ "portable-atomic",
+]
+
+[[package]]
+name = "metrics"
 version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d5312e9ba3771cfa961b585728215e3d972c950a3eed9252aa093d6301277e8"
@@ -1336,7 +1390,7 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "ipnet",
- "metrics",
+ "metrics 0.24.3",
  "metrics-util",
  "quanta",
  "thiserror 1.0.69",
@@ -1353,7 +1407,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.15.5",
- "metrics",
+ "metrics 0.24.3",
  "quanta",
  "rand",
  "rand_xoshiro",
@@ -1432,7 +1486,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1936,7 +1990,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2211,7 +2265,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2273,7 +2327,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -4,6 +4,7 @@ pub mod errors;
 pub mod handlers;
 pub mod pv_data;
 pub mod pv_input;
+pub mod pva;
 pub mod security;
 pub mod services;
 mod state;

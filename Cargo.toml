@@ -71,7 +71,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
 
 # EPICS Channel Access
-epics-rs = { git = "https://github.com/epics-rs/epics-rs" }
+epics-rs = { git = "https://github.com/epics-rs/epics-rs", features = ["pva"] }
 
 # URL encoding
 urlencoding = "2"
@@ -128,3 +128,4 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 prost = { workspace = true }
 urlencoding = { workspace = true }
+epics-rs = { workspace = true }

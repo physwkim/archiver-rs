@@ -237,6 +237,28 @@ async fn main() -> anyhow::Result<()> {
         trust_proxy_headers: config.security.trust_proxy_headers,
         failover: failover_state,
     };
+    // Optional PVA retrieval RPC server. Starts before the HTTP listener
+    // so a startup failure surfaces while logs are still attached. The
+    // server keeps running concurrently for the lifetime of the process.
+    let _pva_handle = if let Some(ref pva_cfg) = config.pva {
+        let source = archiver_api::pva::build_archiver_pva_source(
+            app_state.storage.clone(),
+            app_state.pv_query.clone(),
+        );
+        info!(
+            tcp = pva_cfg.tcp_port,
+            udp = pva_cfg.udp_port,
+            "Starting PVA retrieval RPC server"
+        );
+        Some(archiver_api::pva::start_pva_retrieval_server(
+            source,
+            pva_cfg.tcp_port,
+            pva_cfg.udp_port,
+        ))
+    } else {
+        None
+    };
+
     let app = archiver_api::build_router(app_state, &config.security);
 
     let addr = format!("{}:{}", config.listen_addr, config.listen_port);
