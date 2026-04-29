@@ -86,8 +86,15 @@ impl StoragePlugin for TieredStorage {
         end: SystemTime,
     ) -> anyhow::Result<Vec<Box<dyn EventStream>>> {
         let mut all_streams = Vec::new();
-        // Read from LTS (oldest) → MTS → STS (newest).
+        // Read from LTS (oldest) → MTS → STS (newest). Skip any tier whose
+        // SKIP_<NAME>_FOR_RETRIEVAL flag is set so an operator can route
+        // around a wedged NFS-backed LTS without restarting the appliance
+        // (Java's namedFlags retrieval gate, 9f636c14).
         for tier in self.read_order() {
+            if crate::flags::skip_tier_for_retrieval(tier.name()) {
+                tracing::debug!(tier = tier.name(), pv, "skipping tier for retrieval");
+                continue;
+            }
             let mut streams = tier.get_data(pv, start, end).await?;
             all_streams.append(&mut streams);
         }
@@ -98,14 +105,48 @@ impl StoragePlugin for TieredStorage {
         &self,
         pv: &str,
     ) -> anyhow::Result<Option<ArchiverSample>> {
-        // Try STS first (most recent), then MTS, then LTS.
-        if let Some(sample) = self.sts.get_last_known_event(pv).await? {
+        // Try STS first (most recent), then MTS, then LTS. Honor the
+        // SKIP_<NAME>_FOR_RETRIEVAL flags here too so a flag flipped for
+        // outage routing affects every read path, not just `get_data`.
+        if !crate::flags::skip_tier_for_retrieval(self.sts.name())
+            && let Some(sample) = self.sts.get_last_known_event(pv).await?
+        {
             return Ok(Some(sample));
         }
-        if let Some(sample) = self.mts.get_last_known_event(pv).await? {
+        if !crate::flags::skip_tier_for_retrieval(self.mts.name())
+            && let Some(sample) = self.mts.get_last_known_event(pv).await?
+        {
             return Ok(Some(sample));
+        }
+        if crate::flags::skip_tier_for_retrieval(self.lts.name()) {
+            return Ok(None);
         }
         self.lts.get_last_known_event(pv).await
+    }
+
+    async fn get_last_event_before(
+        &self,
+        pv: &str,
+        target: SystemTime,
+    ) -> anyhow::Result<Option<ArchiverSample>> {
+        // Try STS → MTS → LTS, returning the first hit. Each tier already
+        // walks its own partition list newest-first, so this preserves the
+        // overall newest-first contract. Skipped tiers are silently
+        // bypassed.
+        if !crate::flags::skip_tier_for_retrieval(self.sts.name())
+            && let Some(sample) = self.sts.get_last_event_before(pv, target).await?
+        {
+            return Ok(Some(sample));
+        }
+        if !crate::flags::skip_tier_for_retrieval(self.mts.name())
+            && let Some(sample) = self.mts.get_last_event_before(pv, target).await?
+        {
+            return Ok(Some(sample));
+        }
+        if crate::flags::skip_tier_for_retrieval(self.lts.name()) {
+            return Ok(None);
+        }
+        self.lts.get_last_event_before(pv, target).await
     }
 
     async fn delete_pv_data(&self, pv: &str) -> anyhow::Result<u64> {

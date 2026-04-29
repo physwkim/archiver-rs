@@ -3,8 +3,6 @@
 //! Buffers one event per bin and yields it when the bin closes (next event
 //! crosses the boundary, or the input ends).
 
-use std::time::SystemTime;
-
 use crate::storage::traits::{EventStream, PostProcessor};
 use crate::types::{ArchiverSample, EventStreamDesc};
 
@@ -29,7 +27,7 @@ impl PostProcessor for LastSamplePostProcessor {
         Box::new(LastSampleStream {
             input,
             interval_secs: self.interval_secs,
-            window_start: None,
+            current_bin: None,
             pending: None,
         })
     }
@@ -38,7 +36,8 @@ impl PostProcessor for LastSamplePostProcessor {
 struct LastSampleStream {
     input: Box<dyn EventStream>,
     interval_secs: u64,
-    window_start: Option<SystemTime>,
+    /// Wall-clock-aligned bin (epoch_secs / interval_secs) of `pending`.
+    current_bin: Option<u64>,
     /// Last sample seen in the current bin, awaiting bin close.
     pending: Option<ArchiverSample>,
 }
@@ -52,15 +51,16 @@ impl EventStream for LastSampleStream {
         loop {
             match self.input.next_event()? {
                 Some(sample) => {
-                    let ts = sample.timestamp;
-                    let ws = *self.window_start.get_or_insert(ts);
-                    let elapsed = ts.duration_since(ws).unwrap_or_default().as_secs();
-                    if elapsed >= self.interval_secs {
+                    let bin = crate::etl::decimation::bin_of(
+                        sample.timestamp,
+                        self.interval_secs,
+                    );
+                    if self.current_bin != Some(bin) {
                         // Crossed the boundary: emit the pending sample and
                         // start a fresh bin with the current one as the new
                         // pending.
                         let emit = self.pending.take();
-                        self.window_start = Some(ts);
+                        self.current_bin = Some(bin);
                         self.pending = Some(sample);
                         if let Some(out) = emit {
                             return Ok(Some(out));
@@ -85,7 +85,7 @@ impl EventStream for LastSampleStream {
 mod tests {
     use super::*;
     use crate::types::{ArchDbType, ArchiverValue};
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     struct VecStream {
         desc: EventStreamDesc,

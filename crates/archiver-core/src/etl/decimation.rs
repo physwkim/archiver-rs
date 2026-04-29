@@ -1,5 +1,21 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use crate::storage::traits::{EventStream, PostProcessor};
 use crate::types::{ArchiverSample, ArchiverValue, EventStreamDesc};
+
+/// Compute the bin number that a timestamp falls into for a given interval.
+/// Mirrors Java's `epochSeconds / intervalSecs`. Two PVs aggregating with
+/// the same `interval_secs` produce bins anchored on the same wall-clock
+/// instants regardless of when their first sample arrived.
+pub fn bin_of(ts: SystemTime, interval_secs: u64) -> u64 {
+    let secs = ts.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    secs / interval_secs
+}
+
+/// Convert a bin number back to the wall-clock instant of its leading edge.
+pub fn bin_start(bin: u64, interval_secs: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(bin.saturating_mul(interval_secs))
+}
 
 /// Mean decimation post-processor: averages numeric values over fixed intervals.
 pub struct MeanDecimation {
@@ -26,7 +42,7 @@ impl PostProcessor for MeanDecimation {
             input,
             interval_secs: self.interval_secs,
             buffer: Vec::new(),
-            window_start: None,
+            current_bin: None,
             finished: false,
         })
     }
@@ -36,7 +52,7 @@ struct MeanDecimationStream {
     input: Box<dyn EventStream>,
     interval_secs: u64,
     buffer: Vec<f64>,
-    window_start: Option<std::time::SystemTime>,
+    current_bin: Option<u64>,
     finished: bool,
 }
 
@@ -53,41 +69,42 @@ impl EventStream for MeanDecimationStream {
         loop {
             match self.input.next_event()? {
                 Some(sample) => {
-                    let ts = sample.timestamp;
-                    let window_start = *self.window_start.get_or_insert(ts);
-                    let elapsed = ts
-                        .duration_since(window_start)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let bin = bin_of(sample.timestamp, self.interval_secs);
 
-                    if elapsed >= self.interval_secs && !self.buffer.is_empty() {
-                        // Emit averaged sample for the completed window.
+                    // Bin transition: emit the prior bin's mean before
+                    // starting the new one.
+                    if let Some(prev_bin) = self.current_bin
+                        && bin != prev_bin
+                        && !self.buffer.is_empty()
+                    {
                         let mean =
                             self.buffer.iter().sum::<f64>() / self.buffer.len() as f64;
                         let result = ArchiverSample::new(
-                            window_start,
+                            bin_start(prev_bin, self.interval_secs),
                             ArchiverValue::ScalarDouble(mean),
                         );
                         self.buffer.clear();
-                        self.window_start = Some(ts);
+                        self.current_bin = Some(bin);
                         if let Some(v) = sample.value.as_f64() {
                             self.buffer.push(v);
                         }
                         return Ok(Some(result));
                     }
 
+                    self.current_bin = Some(bin);
                     if let Some(v) = sample.value.as_f64() {
                         self.buffer.push(v);
                     }
                 }
                 None => {
                     self.finished = true;
-                    // Emit final window.
-                    if !self.buffer.is_empty() {
+                    if let Some(prev_bin) = self.current_bin
+                        && !self.buffer.is_empty()
+                    {
                         let mean =
                             self.buffer.iter().sum::<f64>() / self.buffer.len() as f64;
                         let result = ArchiverSample::new(
-                            self.window_start.expect("non-empty buffer implies window_start set"),
+                            bin_start(prev_bin, self.interval_secs),
                             ArchiverValue::ScalarDouble(mean),
                         );
                         self.buffer.clear();
@@ -124,8 +141,7 @@ impl PostProcessor for FirstSampleDecimation {
         Box::new(FirstSampleStream {
             input,
             interval_secs: self.interval_secs,
-            window_start: None,
-            emitted: false,
+            current_bin: None,
         })
     }
 }
@@ -133,8 +149,9 @@ impl PostProcessor for FirstSampleDecimation {
 struct FirstSampleStream {
     input: Box<dyn EventStream>,
     interval_secs: u64,
-    window_start: Option<std::time::SystemTime>,
-    emitted: bool,
+    /// The bin we've already emitted a sample for, so subsequent samples
+    /// in the same bin are skipped. `None` means "haven't emitted yet".
+    current_bin: Option<u64>,
 }
 
 impl EventStream for FirstSampleStream {
@@ -146,21 +163,9 @@ impl EventStream for FirstSampleStream {
         loop {
             match self.input.next_event()? {
                 Some(sample) => {
-                    let ts = sample.timestamp;
-                    let window_start = *self.window_start.get_or_insert(ts);
-                    let elapsed = ts
-                        .duration_since(window_start)
-                        .unwrap_or_default()
-                        .as_secs();
-
-                    if elapsed >= self.interval_secs {
-                        self.window_start = Some(ts);
-                        self.emitted = true;
-                        return Ok(Some(sample));
-                    }
-
-                    if !self.emitted {
-                        self.emitted = true;
+                    let bin = bin_of(sample.timestamp, self.interval_secs);
+                    if self.current_bin != Some(bin) {
+                        self.current_bin = Some(bin);
                         return Ok(Some(sample));
                     }
                 }

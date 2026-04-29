@@ -66,6 +66,17 @@ impl EtlExecutor {
     /// Execute one round of ETL: find old partition files in source, move to dest.
     /// Groups files by PV name for coherent transfers.
     async fn run_once(&self) -> anyhow::Result<()> {
+        // Operator-controlled bypass (Java's SKIP_<NAME>_FOR_ETL named flag,
+        // adc5889a). Set during e.g. an OS migration to pause writes into a
+        // particular tier without restarting the appliance.
+        if crate::flags::skip_tier_for_etl(self.dest.name()) {
+            debug!(
+                dest = self.dest.name(),
+                "ETL skipped: SKIP_<DEST>_FOR_ETL flag set"
+            );
+            return Ok(());
+        }
+
         let source_root = self.source.root_folder();
         if !source_root.exists() {
             return Ok(());

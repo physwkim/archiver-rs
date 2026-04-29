@@ -5,6 +5,13 @@ use crate::storage::traits::{EventStream, PostProcessor, StoragePlugin};
 use crate::types::{ArchiverSample, EventStreamDesc};
 
 /// Execute a data query across a storage plugin, optionally applying a post-processor.
+///
+/// Prepends the last sample whose timestamp is strictly before `start` so
+/// plots stay continuous when the requested window starts in a gap. Java's
+/// `getLastEventOfPreviousPartitionBeforeTimeAsStream` (5666a8b5) does the
+/// same: a slow PV last sampled 10 days ago, queried for the last 5
+/// minutes, returns that 10-day-old sample as the leading point instead
+/// of an empty stream.
 pub async fn query_data(
     storage: &dyn StoragePlugin,
     pv: &str,
@@ -13,8 +20,9 @@ pub async fn query_data(
     post_processor: Option<Box<dyn PostProcessor>>,
 ) -> anyhow::Result<Box<dyn EventStream>> {
     let streams = storage.get_data(pv, start, end).await?;
+    let prefix = storage.get_last_event_before(pv, start).await.unwrap_or(None);
 
-    if streams.is_empty() {
+    if streams.is_empty() && prefix.is_none() {
         let desc = EventStreamDesc {
             pv_name: pv.to_string(),
             db_type: crate::types::ArchDbType::ScalarDouble,
@@ -25,12 +33,52 @@ pub async fn query_data(
         return Ok(Box::new(EmptyStream { desc }));
     }
 
-    let desc = streams[0].description().clone();
-    let merged: Box<dyn EventStream> = Box::new(MergedEventStream::new(desc, streams));
+    // Pick a description: prefer the first in-range stream's description
+    // (it carries the right year/dbr_type for the PV); fall back to a
+    // synthetic one if only the prefix sample exists.
+    let desc = if let Some(s) = streams.first() {
+        s.description().clone()
+    } else {
+        EventStreamDesc {
+            pv_name: pv.to_string(),
+            db_type: crate::types::ArchDbType::ScalarDouble,
+            year: chrono::Utc::now().year(),
+            element_count: None,
+            headers: Vec::new(),
+        }
+    };
+
+    let mut all_streams = Vec::with_capacity(streams.len() + 1);
+    if let Some(sample) = prefix {
+        all_streams.push(Box::new(SingleSampleStream {
+            sample: Some(sample),
+            desc: desc.clone(),
+        }) as Box<dyn EventStream>);
+    }
+    all_streams.extend(streams);
+
+    let merged: Box<dyn EventStream> = Box::new(MergedEventStream::new(desc, all_streams));
 
     match post_processor {
         Some(pp) => Ok(pp.process(merged)),
         None => Ok(merged),
+    }
+}
+
+/// One-shot stream that yields a single pre-built sample. Used to prepend
+/// the prior-partition continuity sample to a query's results.
+struct SingleSampleStream {
+    sample: Option<ArchiverSample>,
+    desc: EventStreamDesc,
+}
+
+impl EventStream for SingleSampleStream {
+    fn description(&self) -> &EventStreamDesc {
+        &self.desc
+    }
+
+    fn next_event(&mut self) -> anyhow::Result<Option<ArchiverSample>> {
+        Ok(self.sample.take())
     }
 }
 

@@ -26,12 +26,9 @@
 //! Endpoints that mutate engine state still go through `try_mgmt_dispatch`
 //! so cluster operators don't end up running them on the wrong appliance.
 
-use std::sync::OnceLock;
-
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use dashmap::DashMap;
 use serde::Deserialize;
 
 use archiver_core::registry::PvStatus;
@@ -734,11 +731,11 @@ pub async fn pvs_matching_parameter(
 }
 
 // ─── NamedFlags ───────────────────────────────────────────────────────
-
-fn flag_store() -> &'static DashMap<String, bool> {
-    static STORE: OnceLock<DashMap<String, bool>> = OnceLock::new();
-    STORE.get_or_init(DashMap::new)
-}
+//
+// State is shared with archiver-core via `archiver_core::flags`, so that
+// gates like SKIP_<TIER>_FOR_RETRIEVAL set here actually take effect in
+// the read/ETL paths. Java keeps these in `ConfigService`; we picked a
+// process-global so storage code doesn't need a config-service handle.
 
 #[derive(Deserialize)]
 pub struct NamedFlagParam {
@@ -748,9 +745,9 @@ pub struct NamedFlagParam {
 }
 
 pub async fn named_flags_all() -> Response {
-    let pairs: serde_json::Map<String, serde_json::Value> = flag_store()
-        .iter()
-        .map(|e| (e.key().clone(), serde_json::Value::Bool(*e.value())))
+    let pairs: serde_json::Map<String, serde_json::Value> = archiver_core::flags::all()
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::Value::Bool(v)))
         .collect();
     axum::Json(serde_json::Value::Object(pairs)).into_response()
 }
@@ -759,7 +756,7 @@ pub async fn named_flags_get(Query(p): Query<NamedFlagParam>) -> Response {
     if p.name.is_empty() {
         return ApiError::BadRequest("name is required".to_string()).into_response();
     }
-    let v = flag_store().get(&p.name).map(|e| *e.value()).unwrap_or(false);
+    let v = archiver_core::flags::get(&p.name);
     axum::Json(serde_json::json!({ "name": p.name, "value": v })).into_response()
 }
 
@@ -768,7 +765,7 @@ pub async fn named_flags_set(Query(p): Query<NamedFlagParam>) -> Response {
         return ApiError::BadRequest("name is required".to_string()).into_response();
     }
     let value = p.value.unwrap_or(false);
-    flag_store().insert(p.name.clone(), value);
+    archiver_core::flags::set(&p.name, value);
     axum::Json(serde_json::json!({ "name": p.name, "value": value })).into_response()
 }
 

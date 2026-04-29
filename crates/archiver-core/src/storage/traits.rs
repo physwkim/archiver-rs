@@ -82,6 +82,26 @@ pub trait StoragePlugin: Send + Sync {
         pv: &str,
     ) -> anyhow::Result<Option<ArchiverSample>>;
 
+    /// Get the last sample whose timestamp is strictly before `target`.
+    /// Used by retrieval to prepend a continuity sample when the user's
+    /// query window starts in a gap between samples (Java's
+    /// `getLastEventOfPreviousPartitionBeforeTimeAsStream`). Returns None
+    /// if no such sample exists.
+    ///
+    /// Default implementation: walks `get_last_known_event` and returns
+    /// it iff its timestamp is < target. Plugins with cheaper backward
+    /// scans should override.
+    async fn get_last_event_before(
+        &self,
+        pv: &str,
+        target: SystemTime,
+    ) -> anyhow::Result<Option<ArchiverSample>> {
+        match self.get_last_known_event(pv).await? {
+            Some(sample) if sample.timestamp < target => Ok(Some(sample)),
+            _ => Ok(None),
+        }
+    }
+
     /// Delete all stored data for a PV. Returns the number of files deleted.
     /// Default implementation returns 0 (no-op for backward compatibility).
     async fn delete_pv_data(&self, _pv: &str) -> anyhow::Result<u64> {

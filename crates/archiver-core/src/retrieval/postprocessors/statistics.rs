@@ -51,7 +51,10 @@ struct StatStream {
     interval_secs: u64,
     op: StatOp,
     buffer: Vec<f64>,
-    window_start: Option<std::time::SystemTime>,
+    /// Wall-clock-aligned bin (epoch_secs / interval_secs). Mirrors
+    /// Java's SummaryStatsPostProcessor so two PVs with the same
+    /// `interval_secs` emit on the same wall-clock instants.
+    current_bin: Option<u64>,
     finished: bool,
 }
 
@@ -62,7 +65,7 @@ impl StatStream {
             interval_secs,
             op,
             buffer: Vec::new(),
-            window_start: None,
+            current_bin: None,
             finished: false,
         }
     }
@@ -136,37 +139,41 @@ impl EventStream for StatStream {
         loop {
             match self.input.next_event()? {
                 Some(sample) => {
-                    let ts = sample.timestamp;
-                    let window_start = *self.window_start.get_or_insert(ts);
-                    let elapsed = ts
-                        .duration_since(window_start)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let bin = crate::etl::decimation::bin_of(
+                        sample.timestamp,
+                        self.interval_secs,
+                    );
 
-                    if elapsed >= self.interval_secs && !self.buffer.is_empty() {
+                    if let Some(prev_bin) = self.current_bin
+                        && bin != prev_bin
+                        && !self.buffer.is_empty()
+                    {
                         let result_val = self.compute();
                         let result = ArchiverSample::new(
-                            window_start,
+                            crate::etl::decimation::bin_start(prev_bin, self.interval_secs),
                             ArchiverValue::ScalarDouble(result_val),
                         );
                         self.buffer.clear();
-                        self.window_start = Some(ts);
+                        self.current_bin = Some(bin);
                         if let Some(v) = sample.value.as_f64() {
                             self.buffer.push(v);
                         }
                         return Ok(Some(result));
                     }
 
+                    self.current_bin = Some(bin);
                     if let Some(v) = sample.value.as_f64() {
                         self.buffer.push(v);
                     }
                 }
                 None => {
                     self.finished = true;
-                    if !self.buffer.is_empty() {
+                    if let Some(prev_bin) = self.current_bin
+                        && !self.buffer.is_empty()
+                    {
                         let result_val = self.compute();
                         let result = ArchiverSample::new(
-                            self.window_start.expect("non-empty buffer implies window_start set"),
+                            crate::etl::decimation::bin_start(prev_bin, self.interval_secs),
                             ArchiverValue::ScalarDouble(result_val),
                         );
                         self.buffer.clear();
@@ -266,6 +273,55 @@ mod tests {
         let out = drain(pp, vec![(0, 3.0), (1, 4.0)]);
         assert_eq!(out.len(), 1);
         assert!((out[0] - 12.5_f64.sqrt()).abs() < 1e-9);
+    }
+
+    /// Wall-clock bin alignment (F-3). Bin start timestamps must be
+    /// `(epoch_secs / interval_secs) * interval_secs` regardless of where
+    /// the first sample falls within a bin — Java's
+    /// `binNumber = epochSeconds / intervalSecs`. Without this fix the
+    /// first emitted timestamp would be the first sample's, and two PVs
+    /// aggregating the same data would emit on different instants.
+    #[test]
+    fn bins_aligned_to_wall_clock() {
+        // VecStream's start is 1_700_000_000. With a 60s interval the
+        // bin boundaries fall at ...80, ...40, ...00 (mod 60 == 20):
+        //   offset 17  → ts 1_700_000_017 → bin starts at 1_699_999_980
+        //   offset 45  → ts 1_700_000_045 → bin starts at 1_700_000_040
+        //   offset 75  → ts 1_700_000_075 → same bin as offset 45
+        let pp: Box<dyn PostProcessor> = Box::new(MaxPostProcessor::new(60));
+        let stream = pp.process(Box::new(VecStream::new(vec![
+            (17, 5.0),
+            (45, 10.0),
+            (75, 7.0),
+        ])));
+        let mut s = stream;
+        let first = s.next_event().unwrap().unwrap();
+        let first_ts = first
+            .timestamp
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(
+            first_ts, 1_699_999_980,
+            "first bin must start at floor(ts/60)*60"
+        );
+        if let ArchiverValue::ScalarDouble(v) = first.value {
+            assert_eq!(v, 5.0);
+        } else {
+            panic!("wrong value type");
+        }
+        let second = s.next_event().unwrap().unwrap();
+        let second_ts = second
+            .timestamp
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(second_ts, 1_700_000_040);
+        if let ArchiverValue::ScalarDouble(v) = second.value {
+            assert_eq!(v, 10.0); // max of {10.0, 7.0}
+        } else {
+            panic!("wrong value type");
+        }
     }
 
     #[test]

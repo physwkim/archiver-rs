@@ -359,6 +359,45 @@ impl StoragePlugin for PlainPbStoragePlugin {
         Ok(None)
     }
 
+    async fn get_last_event_before(
+        &self,
+        pv: &str,
+        target: SystemTime,
+    ) -> anyhow::Result<Option<ArchiverSample>> {
+        self.flush_writes().await?;
+
+        let pb_files = list_pv_pb_files(&self.root_folder, pv)?;
+
+        // Walk newest-to-oldest; first file whose final sample is before
+        // `target` provides the answer (its last sample IS the answer).
+        // For files whose final sample is at-or-after target, scan from
+        // the start to find the last sample with ts < target.
+        for path in pb_files.into_iter().rev() {
+            let Some(last) = read_last_sample_from_file(&path)? else {
+                continue;
+            };
+            if last.timestamp < target {
+                return Ok(Some(last));
+            }
+            // Final sample is past target — scan the file forward and
+            // track the latest sample with ts < target.
+            let mut reader = PbFileReader::open(&path)?;
+            let mut last_before: Option<ArchiverSample> = None;
+            while let Some(sample) = reader.next_event()? {
+                if sample.timestamp >= target {
+                    break;
+                }
+                last_before = Some(sample);
+            }
+            if last_before.is_some() {
+                return Ok(last_before);
+            }
+            // Every sample in this file is at-or-after target; the answer,
+            // if any, lives in an older file.
+        }
+        Ok(None)
+    }
+
     async fn delete_pv_data(&self, pv: &str) -> anyhow::Result<u64> {
         // Evict the cached writer for this PV before deleting files.
         {

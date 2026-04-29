@@ -33,7 +33,7 @@ impl PostProcessor for CountPostProcessor {
             input,
             interval_secs: self.interval_secs,
             count: 0,
-            window_start: None,
+            current_bin: None,
             finished: false,
         })
     }
@@ -43,7 +43,9 @@ struct CountStream {
     input: Box<dyn EventStream>,
     interval_secs: u64,
     count: u64,
-    window_start: Option<SystemTime>,
+    /// Wall-clock-aligned bin (epoch_secs / interval_secs) for the
+    /// in-progress count.
+    current_bin: Option<u64>,
     finished: bool,
 }
 
@@ -59,29 +61,32 @@ impl EventStream for CountStream {
         loop {
             match self.input.next_event()? {
                 Some(sample) => {
-                    let ts = sample.timestamp;
-                    let window_start = *self.window_start.get_or_insert(ts);
-                    let elapsed = ts
-                        .duration_since(window_start)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if elapsed >= self.interval_secs && self.count > 0 {
+                    let bin = crate::etl::decimation::bin_of(
+                        sample.timestamp,
+                        self.interval_secs,
+                    );
+                    if let Some(prev_bin) = self.current_bin
+                        && bin != prev_bin
+                        && self.count > 0
+                    {
                         let result = ArchiverSample::new(
-                            window_start,
+                            crate::etl::decimation::bin_start(prev_bin, self.interval_secs),
                             ArchiverValue::ScalarDouble(self.count as f64),
                         );
                         self.count = 1;
-                        self.window_start = Some(ts);
+                        self.current_bin = Some(bin);
                         return Ok(Some(result));
                     }
+                    self.current_bin = Some(bin);
                     self.count += 1;
                 }
                 None => {
                     self.finished = true;
-                    if self.count > 0 {
-                        let ws = self.window_start.expect("count>0 implies window_start set");
+                    if let Some(prev_bin) = self.current_bin
+                        && self.count > 0
+                    {
                         let result = ArchiverSample::new(
-                            ws,
+                            crate::etl::decimation::bin_start(prev_bin, self.interval_secs),
                             ArchiverValue::ScalarDouble(self.count as f64),
                         );
                         self.count = 0;
