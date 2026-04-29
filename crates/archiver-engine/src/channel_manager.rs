@@ -241,6 +241,14 @@ impl ChannelManager {
         let conn_info = Arc::new(Mutex::new(ConnectionInfo::default()));
         let extras: Arc<ExtraFieldsCache> = Arc::new(DashMap::new());
         let field_tokens: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        let update_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        // Hold update_lock around the whole insert+spawn block so a
+        // concurrent update_archive_fields can't observe the empty
+        // field_tokens map and spawn its own copies of the same fields
+        // before we get to the spawn loop. update_archive_fields acquires
+        // the same update_lock before mutating tokens.
+        let _guard = update_lock.lock().await;
 
         self.channels.insert(
             pv_name.clone(),
@@ -251,7 +259,7 @@ impl ChannelManager {
                 conn_info: conn_info.clone(),
                 extras: extras.clone(),
                 field_tokens: field_tokens.clone(),
-                update_lock: Arc::new(tokio::sync::Mutex::new(())),
+                update_lock: update_lock.clone(),
             },
         );
 
@@ -268,6 +276,7 @@ impl ChannelManager {
                 child,
             );
         }
+        drop(_guard);
 
         let tx = self.sample_tx.clone();
         let token = cancel_token.clone();
