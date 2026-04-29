@@ -247,6 +247,31 @@ pub async fn reassign_appliance(
         .into_response();
     }
 
+    // Pre-flight: count samples without pausing so a rejection (PV too
+    // large) leaves the source running. We deliberately walk get_data
+    // twice — once now, once after pause — accepting the second call's
+    // possible new samples because pause stops further additions.
+    let start = std::time::SystemTime::UNIX_EPOCH;
+    let end = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
+    let preflight_streams = match state.storage.get_data(&canonical, start, end).await {
+        Ok(s) => s,
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
+    let mut preflight_count = 0usize;
+    for mut s in preflight_streams {
+        while let Ok(Some(_)) = s.next_event() {
+            preflight_count += 1;
+            if preflight_count > MAX_MIGRATION_SAMPLES {
+                return ApiError::BadRequest(format!(
+                    "PV '{}' has more than {} samples; split the migration \
+                     by time window before retrying",
+                    canonical, MAX_MIGRATION_SAMPLES,
+                ))
+                .into_response();
+            }
+        }
+    }
+
     if let Err(e) = state.archiver_cmd.pause_pv(&canonical) {
         return ApiError::internal(e).into_response();
     }
@@ -254,8 +279,6 @@ pub async fn reassign_appliance(
         return ApiError::internal(e).into_response();
     }
 
-    let start = std::time::SystemTime::UNIX_EPOCH;
-    let end = std::time::SystemTime::now() + std::time::Duration::from_secs(86_400);
     let streams = match state.storage.get_data(&canonical, start, end).await {
         Ok(s) => s,
         Err(e) => return ApiError::internal(e).into_response(),
@@ -267,12 +290,11 @@ pub async fn reassign_appliance(
             match s.next_event() {
                 Ok(Some(sample)) => {
                     if samples_json.len() >= MAX_MIGRATION_SAMPLES {
-                        return ApiError::BadRequest(format!(
-                            "PV '{}' has more than {} samples; split the migration \
-                             by time window before retrying",
-                            canonical, MAX_MIGRATION_SAMPLES,
-                        ))
-                        .into_response();
+                        // Reached the cap during the post-pause re-read
+                        // (a few samples landed between preflight and
+                        // pause). Accept what we have — operator can run
+                        // again to migrate the rest.
+                        break;
                     }
                     let secs = sample
                         .timestamp

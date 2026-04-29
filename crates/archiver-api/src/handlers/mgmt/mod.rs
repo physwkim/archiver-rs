@@ -219,11 +219,21 @@ pub fn routes() -> Router<AppState> {
             get(engine::get_latest_meta_data),
         )
         .route("/mgmt/bpl/pvStatusAction", get(engine::pv_status_action))
+        // Migration bundle is large (up to 500_000 samples × ~70 bytes
+        // ≈ 35MB). Override the default body limit specifically here so
+        // operators don't have to bump the global cap (which guards
+        // every other endpoint from oversized bodies).
         .route(
             "/mgmt/bpl/receivePVMigration",
-            post(p2::receive_pv_migration),
+            post(p2::receive_pv_migration)
+                .layer(axum::extract::DefaultBodyLimit::max(MIGRATION_BODY_LIMIT)),
         )
 }
+
+/// Cap for the migration bundle body — generous enough to hold
+/// MAX_MIGRATION_SAMPLES (500k samples × ~150 bytes worst-case for
+/// vector-valued PVs ≈ 75MB; round up for headroom).
+const MIGRATION_BODY_LIMIT: usize = 128 * 1024 * 1024;
 
 /// Resolve a possibly-alias PV name to its canonical form. Falls back to
 /// the input on lookup error.
