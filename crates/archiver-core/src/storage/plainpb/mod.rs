@@ -122,17 +122,17 @@ impl PlainPbStoragePlugin {
         // If the cached writer points at a different path, the partition has
         // rolled over — flush and drop the old writer before opening the new
         // one so we don't leak file handles.
-        if let Some(existing) = cache.get_mut(pv) {
-            if existing.path != path_buf {
-                if let Err(e) = existing.writer.flush() {
-                    tracing::warn!(
-                        pv,
-                        old_path = ?existing.path,
-                        "Failed to flush writer on partition rollover: {e}"
-                    );
-                }
-                cache.remove(pv);
+        if let Some(existing) = cache.get_mut(pv)
+            && existing.path != path_buf
+        {
+            if let Err(e) = existing.writer.flush() {
+                tracing::warn!(
+                    pv,
+                    old_path = ?existing.path,
+                    "Failed to flush writer on partition rollover: {e}"
+                );
             }
+            cache.remove(pv);
         }
 
         if !cache.contains_key(pv) {

@@ -7,6 +7,16 @@
 //! status). Wired into [`run_pva_retrieval_server`] which spawns a single
 //! tokio task hosting the PVA TCP+UDP listeners.
 //!
+//! ## Runtime requirement
+//!
+//! `OnRpcFn` from `epics-pva-rs` is sync, so the RPC handlers below run
+//! the async retrieval pipeline inside `tokio::task::block_in_place +
+//! Handle::current().block_on(...)`. **`block_in_place` requires a
+//! multi-threaded tokio runtime** — calling it from a `current_thread`
+//! runtime panics. archiver-rs's main binary uses `#[tokio::main]` (multi-
+//! threaded by default) so this is safe in production; tests that spin
+//! up a `PvaServer` must use `#[tokio::test(flavor = "multi_thread", ...)]`.
+//!
 //! The two RPC names exposed:
 //! - `archappl/getData` — required: `pv`, `from`, `to`. Optional:
 //!   `processing` (post-processor spec, e.g. `mean_60`).

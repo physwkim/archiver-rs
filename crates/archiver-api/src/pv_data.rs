@@ -217,34 +217,12 @@ async fn fetch_peer_raw_stream(
     }
     let bytes = resp.bytes().await?.to_vec();
     if bytes.is_empty() {
-        // Empty body — return an empty stream by feeding an empty Vec yields
-        // an error from PbBytesReader (no header). Return a no-op stream.
-        return Ok(Box::new(EmptyFailoverStream::default()));
+        // Empty body — caller's loop logs the warning and skips this peer
+        // rather than pushing a no-op stream into the merge.
+        anyhow::bail!("peer {peer_base} returned empty body for {pv}");
     }
     let reader = PbBytesReader::from_bytes(bytes)?;
     Ok(Box::new(reader))
-}
-
-#[derive(Default)]
-struct EmptyFailoverStream;
-
-impl archiver_core::storage::traits::EventStream for EmptyFailoverStream {
-    fn description(&self) -> &archiver_core::types::EventStreamDesc {
-        // A static empty desc; this stream yields nothing so the desc is
-        // never consumed in practice (MergedEventStream uses streams[0].desc).
-        static DESC: std::sync::OnceLock<archiver_core::types::EventStreamDesc> =
-            std::sync::OnceLock::new();
-        DESC.get_or_init(|| archiver_core::types::EventStreamDesc {
-            pv_name: String::new(),
-            db_type: archiver_core::types::ArchDbType::ScalarDouble,
-            year: 1970,
-            element_count: None,
-            headers: Vec::new(),
-        })
-    }
-    fn next_event(&mut self) -> anyhow::Result<Option<archiver_core::types::ArchiverSample>> {
-        Ok(None)
-    }
 }
 
 /// Parse and validate common retrieval parameters.

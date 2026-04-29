@@ -123,6 +123,62 @@ fn sample_std(values: &[f64]) -> f64 {
     variance.sqrt()
 }
 
+impl EventStream for StatStream {
+    fn description(&self) -> &EventStreamDesc {
+        self.input.description()
+    }
+
+    fn next_event(&mut self) -> anyhow::Result<Option<ArchiverSample>> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        loop {
+            match self.input.next_event()? {
+                Some(sample) => {
+                    let ts = sample.timestamp;
+                    let window_start = *self.window_start.get_or_insert(ts);
+                    let elapsed = ts
+                        .duration_since(window_start)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    if elapsed >= self.interval_secs && !self.buffer.is_empty() {
+                        let result_val = self.compute();
+                        let result = ArchiverSample::new(
+                            window_start,
+                            ArchiverValue::ScalarDouble(result_val),
+                        );
+                        self.buffer.clear();
+                        self.window_start = Some(ts);
+                        if let Some(v) = sample.value.as_f64() {
+                            self.buffer.push(v);
+                        }
+                        return Ok(Some(result));
+                    }
+
+                    if let Some(v) = sample.value.as_f64() {
+                        self.buffer.push(v);
+                    }
+                }
+                None => {
+                    self.finished = true;
+                    if !self.buffer.is_empty() {
+                        let result_val = self.compute();
+                        let result = ArchiverSample::new(
+                            self.window_start.expect("non-empty buffer implies window_start set"),
+                            ArchiverValue::ScalarDouble(result_val),
+                        );
+                        self.buffer.clear();
+                        return Ok(Some(result));
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,7 +252,8 @@ mod tests {
     fn variance_sample_formula() {
         // values 2,4,4,4,5,5,7,9 → mean 5, sample variance = 32/7 ≈ 4.571
         let pp: Box<dyn PostProcessor> = Box::new(VariancePostProcessor::new(100));
-        let items = (0u64..8).zip([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]).map(|(t, v)| (t, v)).collect();
+        let items: Vec<(u64, f64)> =
+            (0u64..8).zip([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]).collect();
         let out = drain(pp, items);
         assert_eq!(out.len(), 1);
         assert!((out[0] - (32.0 / 7.0)).abs() < 1e-9);
@@ -224,61 +281,5 @@ mod tests {
         // sample std of 1,2,3 = 1.0
         assert_eq!(out.len(), 1);
         assert!((out[0] - 1.0).abs() < 1e-9);
-    }
-}
-
-impl EventStream for StatStream {
-    fn description(&self) -> &EventStreamDesc {
-        self.input.description()
-    }
-
-    fn next_event(&mut self) -> anyhow::Result<Option<ArchiverSample>> {
-        if self.finished {
-            return Ok(None);
-        }
-
-        loop {
-            match self.input.next_event()? {
-                Some(sample) => {
-                    let ts = sample.timestamp;
-                    let window_start = *self.window_start.get_or_insert(ts);
-                    let elapsed = ts
-                        .duration_since(window_start)
-                        .unwrap_or_default()
-                        .as_secs();
-
-                    if elapsed >= self.interval_secs && !self.buffer.is_empty() {
-                        let result_val = self.compute();
-                        let result = ArchiverSample::new(
-                            window_start,
-                            ArchiverValue::ScalarDouble(result_val),
-                        );
-                        self.buffer.clear();
-                        self.window_start = Some(ts);
-                        if let Some(v) = sample.value.as_f64() {
-                            self.buffer.push(v);
-                        }
-                        return Ok(Some(result));
-                    }
-
-                    if let Some(v) = sample.value.as_f64() {
-                        self.buffer.push(v);
-                    }
-                }
-                None => {
-                    self.finished = true;
-                    if !self.buffer.is_empty() {
-                        let result_val = self.compute();
-                        let result = ArchiverSample::new(
-                            self.window_start.expect("non-empty buffer implies window_start set"),
-                            ArchiverValue::ScalarDouble(result_val),
-                        );
-                        self.buffer.clear();
-                        return Ok(Some(result));
-                    }
-                    return Ok(None);
-                }
-            }
-        }
     }
 }

@@ -40,7 +40,7 @@ async fn test_write_read_scalar_double() {
     let plugin = PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let ts: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap().into();
-    let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(3.14159));
+    let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(std::f64::consts::PI));
 
     plugin.append_event("SIM:Sine", ArchDbType::ScalarDouble, &sample).await.unwrap();
 
@@ -55,7 +55,7 @@ async fn test_write_read_scalar_double() {
 
     let read_sample = stream.next_event().unwrap().unwrap();
     match &read_sample.value {
-        ArchiverValue::ScalarDouble(v) => assert!((v - 3.14159).abs() < 1e-10),
+        ArchiverValue::ScalarDouble(v) => assert!((v - std::f64::consts::PI).abs() < 1e-10),
         other => panic!("Expected ScalarDouble, got {other:?}"),
     }
 
@@ -103,7 +103,7 @@ async fn test_write_read_multiple_samples() {
 
     assert_eq!(streams.len(), 1);
     let mut count = 0;
-    while let Some(_) = streams[0].next_event().unwrap() {
+    while streams[0].next_event().unwrap().is_some() {
         count += 1;
     }
     assert_eq!(count, 100);

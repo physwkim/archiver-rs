@@ -1088,7 +1088,7 @@ async fn test_get_appliance_metrics_shape() {
     assert_eq!(body["pvCount"]["total"], 3);
     assert_eq!(body["pvCount"]["active"], 3);
     assert_eq!(body["pvCount"]["paused"], 0);
-    assert!(body["stores"].as_array().unwrap().len() >= 1);
+    assert!(!body["stores"].as_array().unwrap().is_empty());
     let store = &body["stores"][0];
     assert!(store["name"].is_string());
     assert!(store["totalFiles"].is_number());
