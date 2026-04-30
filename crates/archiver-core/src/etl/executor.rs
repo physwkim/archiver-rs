@@ -11,8 +11,8 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_MOVE_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 
 use crate::registry::{PvRegistry, PvStatus};
-use crate::storage::plainpb::reader::PbFileReader;
 use crate::storage::plainpb::PlainPbStoragePlugin;
+use crate::storage::plainpb::reader::PbFileReader;
 use crate::storage::traits::{EventStream, StoragePlugin};
 
 /// ETL executor — periodically moves data from source tier to destination tier.
@@ -179,7 +179,8 @@ impl EtlExecutor {
         // everything that's been written so far.
         self.source.flush_writes().await?;
 
-        let pv_files = crate::storage::plainpb::list_pv_pb_files_pub(self.source.root_folder(), pv)?;
+        let pv_files =
+            crate::storage::plainpb::list_pv_pb_files_pub(self.source.root_folder(), pv)?;
         let total = pv_files.len() as u64;
         info!(
             pv,
@@ -203,9 +204,15 @@ impl EtlExecutor {
         // Check for a marker from a previous incomplete cleanup (crash after copy).
         let marker = source_path.with_extension("pb.etl_done");
         if marker.exists() {
-            info!(?source_path, "Found ETL marker — previous copy completed, cleaning up");
+            info!(
+                ?source_path,
+                "Found ETL marker — previous copy completed, cleaning up"
+            );
             if let Err(e) = tokio::fs::remove_file(source_path).await {
-                warn!(?source_path, "Failed to remove source after ETL marker found: {e}");
+                warn!(
+                    ?source_path,
+                    "Failed to remove source after ETL marker found: {e}"
+                );
             }
             if let Err(e) = tokio::fs::remove_file(&marker).await {
                 warn!(?marker, "Failed to remove ETL marker: {e}");
@@ -275,7 +282,10 @@ fn extract_pv_key(path: &Path) -> String {
         if let Some(colon_pos) = stem.find(':') {
             let leaf = &stem[..colon_pos];
             // Combine with parent directory name for full PV key.
-            if let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+            if let Some(parent) = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
             {
                 return format!("{parent}/{leaf}");
             }

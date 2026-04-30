@@ -7,11 +7,13 @@ use anyhow::Context;
 use tokio::sync::watch;
 use tracing::{error, info};
 
+use archiver_api::AppState;
 use archiver_api::cluster::ClusterClient;
 use archiver_api::security::RateLimiter;
-use archiver_api::services::impls::{ChannelArchiverControl, ClusterClientRouter, RegistryRepository};
+use archiver_api::services::impls::{
+    ChannelArchiverControl, ClusterClientRouter, RegistryRepository,
+};
 use archiver_api::services::traits::ClusterRouter;
-use archiver_api::AppState;
 
 use archiver_core::config::ArchiverConfig;
 use archiver_core::etl::executor::EtlExecutor;
@@ -27,8 +29,7 @@ use supervisor::RuntimeSupervisor;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -73,20 +74,25 @@ async fn main() -> anyhow::Result<()> {
     let mut supervisor = RuntimeSupervisor::new(shutdown_rx);
 
     // Load policy config if specified.
-    let policy = config
-        .engine
-        .policy_file
-        .as_ref()
-        .and_then(|path| match PolicyConfig::load(path) {
-            Ok(p) => {
-                info!(?path, policies = p.policies.len(), "Loaded PV policy config");
-                Some(p)
-            }
-            Err(e) => {
-                error!(?path, "Failed to load policy file: {e}");
-                None
-            }
-        });
+    let policy =
+        config
+            .engine
+            .policy_file
+            .as_ref()
+            .and_then(|path| match PolicyConfig::load(path) {
+                Ok(p) => {
+                    info!(
+                        ?path,
+                        policies = p.policies.len(),
+                        "Loaded PV policy config"
+                    );
+                    Some(p)
+                }
+                Err(e) => {
+                    error!(?path, "Failed to load policy file: {e}");
+                    None
+                }
+            });
 
     // Initialize channel manager + write loop. Drift bound is per-site
     // configurable (Java parity 6538631).
@@ -120,10 +126,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Compute ETL periods from tier config.
-    let sts_period_secs = config.storage.sts.hold as u64
-        * config.storage.sts.partition_granularity.approx_seconds();
-    let mts_period_secs = config.storage.mts.hold as u64
-        * config.storage.mts.partition_granularity.approx_seconds();
+    let sts_period_secs =
+        config.storage.sts.hold as u64 * config.storage.sts.partition_granularity.approx_seconds();
+    let mts_period_secs =
+        config.storage.mts.hold as u64 * config.storage.mts.partition_granularity.approx_seconds();
 
     let etl_sts_mts = Arc::new(
         EtlExecutor::new(
@@ -149,10 +155,14 @@ async fn main() -> anyhow::Result<()> {
 
     let etl1_shutdown = supervisor.shutdown_rx();
     let etl_sts_mts_run = etl_sts_mts.clone();
-    supervisor.spawn("etl_sts_mts", async move { etl_sts_mts_run.run(etl1_shutdown).await });
+    supervisor.spawn("etl_sts_mts", async move {
+        etl_sts_mts_run.run(etl1_shutdown).await
+    });
     let etl2_shutdown = supervisor.shutdown_rx();
     let etl_mts_lts_run = etl_mts_lts.clone();
-    supervisor.spawn("etl_mts_lts", async move { etl_mts_lts_run.run(etl2_shutdown).await });
+    supervisor.spawn("etl_mts_lts", async move {
+        etl_mts_lts_run.run(etl2_shutdown).await
+    });
 
     // Initialize cluster client if configured.
     let cluster: Option<Arc<dyn ClusterRouter>> = config.cluster.as_ref().map(|cc| {

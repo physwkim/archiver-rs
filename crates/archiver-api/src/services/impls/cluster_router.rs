@@ -42,11 +42,15 @@ impl ClusterRouter for ClusterClientRouter {
     }
 
     fn peers(&self) -> Vec<PeerDto> {
-        self.inner.peers().iter().map(|p| PeerDto {
-            name: p.name.clone(),
-            mgmt_url: p.mgmt_url.clone(),
-            retrieval_url: p.retrieval_url.clone(),
-        }).collect()
+        self.inner
+            .peers()
+            .iter()
+            .map(|p| PeerDto {
+                name: p.name.clone(),
+                mgmt_url: p.mgmt_url.clone(),
+                retrieval_url: p.retrieval_url.clone(),
+            })
+            .collect()
     }
 
     fn find_peer_by_name(&self, name: &str) -> Option<PeerDto> {
@@ -57,11 +61,21 @@ impl ClusterRouter for ClusterClientRouter {
         })
     }
 
-    async fn proxy_mgmt_get(&self, mgmt_url: &str, endpoint: &str, qs: &str) -> anyhow::Result<axum::response::Response> {
+    async fn proxy_mgmt_get(
+        &self,
+        mgmt_url: &str,
+        endpoint: &str,
+        qs: &str,
+    ) -> anyhow::Result<axum::response::Response> {
         self.inner.proxy_mgmt_get(mgmt_url, endpoint, qs).await
     }
 
-    async fn proxy_mgmt_post(&self, mgmt_url: &str, endpoint: &str, body: axum::body::Bytes) -> anyhow::Result<axum::response::Response> {
+    async fn proxy_mgmt_post(
+        &self,
+        mgmt_url: &str,
+        endpoint: &str,
+        body: axum::body::Bytes,
+    ) -> anyhow::Result<axum::response::Response> {
         self.inner.proxy_mgmt_post(mgmt_url, endpoint, body).await
     }
 
@@ -82,7 +96,9 @@ impl ClusterRouter for ClusterClientRouter {
         pattern: &str,
         limit: Option<i64>,
     ) -> Vec<String> {
-        self.inner.aggregate_matching_pvs_limited(pattern, limit).await
+        self.inner
+            .aggregate_matching_pvs_limited(pattern, limit)
+            .await
     }
 
     async fn aggregate_pv_count(&self) -> (u64, u64, u64, usize) {
@@ -101,8 +117,15 @@ impl ClusterRouter for ClusterClientRouter {
         }
     }
 
-    async fn proxy_retrieval(&self, peer_retrieval_url: &str, path: &str, query_string: &str) -> anyhow::Result<axum::response::Response> {
-        self.inner.proxy_retrieval(peer_retrieval_url, path, query_string).await
+    async fn proxy_retrieval(
+        &self,
+        peer_retrieval_url: &str,
+        path: &str,
+        query_string: &str,
+    ) -> anyhow::Result<axum::response::Response> {
+        self.inner
+            .proxy_retrieval(peer_retrieval_url, path, query_string)
+            .await
     }
 
     async fn proxy_data_at_time(
@@ -111,6 +134,8 @@ impl ClusterRouter for ClusterClientRouter {
         at: Option<&str>,
         pvs: &[String],
     ) -> anyhow::Result<serde_json::Value> {
-        self.inner.proxy_data_at_time(peer_retrieval_url, at, pvs).await
+        self.inner
+            .proxy_data_at_time(peer_retrieval_url, at, pvs)
+            .await
     }
 }

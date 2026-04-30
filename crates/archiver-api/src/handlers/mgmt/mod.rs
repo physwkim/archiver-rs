@@ -10,14 +10,14 @@ mod reports;
 mod system;
 mod type_info;
 
+use axum::Router;
 use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::{get, post};
-use axum::Router;
 
+use crate::AppState;
 use crate::dto::mgmt::BulkResult;
 use crate::services::traits::ClusterRouter;
-use crate::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -31,24 +31,54 @@ pub fn routes() -> Router<AppState> {
             get(pv_query::get_pv_status).post(pv_query::get_pv_status_post),
         )
         .route("/mgmt/bpl/archivePV", post(pv_control::archive_pv))
-        .route("/mgmt/bpl/pauseArchivingPV", get(pv_control::pause_archiving_pv).post(pv_control::bulk_pause_archiving_pv))
-        .route("/mgmt/bpl/resumeArchivingPV", get(pv_control::resume_archiving_pv).post(pv_control::bulk_resume_archiving_pv))
+        .route(
+            "/mgmt/bpl/pauseArchivingPV",
+            get(pv_control::pause_archiving_pv).post(pv_control::bulk_pause_archiving_pv),
+        )
+        .route(
+            "/mgmt/bpl/resumeArchivingPV",
+            get(pv_control::resume_archiving_pv).post(pv_control::bulk_resume_archiving_pv),
+        )
         .route("/mgmt/bpl/getPVCount", get(pv_query::get_pv_count))
         .route(
             "/mgmt/bpl/deletePV",
             get(pv_control::delete_pv).post(pv_control::bulk_delete_pv),
         )
-        .route("/mgmt/bpl/changeArchivalParameters", get(pv_control::change_archival_parameters))
-        .route("/mgmt/bpl/getPausedPVsReport", get(reports::get_paused_pvs_report))
-        .route("/mgmt/bpl/getNeverConnectedPVs", get(reports::get_never_connected_pvs))
-        .route("/mgmt/bpl/getCurrentlyDisconnectedPVs", get(reports::get_currently_disconnected_pvs))
-        .route("/mgmt/bpl/getRecentlyAddedPVs", get(reports::get_recently_added_pvs))
-        .route("/mgmt/bpl/getRecentlyModifiedPVs", get(reports::get_recently_modified_pvs))
-        .route("/mgmt/bpl/getSilentPVsReport", get(reports::get_silent_pvs_report))
+        .route(
+            "/mgmt/bpl/changeArchivalParameters",
+            get(pv_control::change_archival_parameters),
+        )
+        .route(
+            "/mgmt/bpl/getPausedPVsReport",
+            get(reports::get_paused_pvs_report),
+        )
+        .route(
+            "/mgmt/bpl/getNeverConnectedPVs",
+            get(reports::get_never_connected_pvs),
+        )
+        .route(
+            "/mgmt/bpl/getCurrentlyDisconnectedPVs",
+            get(reports::get_currently_disconnected_pvs),
+        )
+        .route(
+            "/mgmt/bpl/getRecentlyAddedPVs",
+            get(reports::get_recently_added_pvs),
+        )
+        .route(
+            "/mgmt/bpl/getRecentlyModifiedPVs",
+            get(reports::get_recently_modified_pvs),
+        )
+        .route(
+            "/mgmt/bpl/getSilentPVsReport",
+            get(reports::get_silent_pvs_report),
+        )
         .route("/mgmt/bpl/getVersions", get(system::get_versions))
         .route("/mgmt/bpl/getPVTypeInfo", get(pv_query::get_pv_type_info))
         .route("/mgmt/bpl/getPVDetails", get(pv_query::get_pv_details))
-        .route("/mgmt/bpl/abortArchivingPV", get(pv_control::abort_archiving_pv))
+        .route(
+            "/mgmt/bpl/abortArchivingPV",
+            get(pv_control::abort_archiving_pv),
+        )
         .route("/mgmt/bpl/exportConfig", get(config_io::export_config))
         .route("/mgmt/bpl/importConfig", post(config_io::import_config))
         .route("/mgmt/bpl/addAlias", get(aliases::add_alias))
@@ -63,9 +93,15 @@ pub fn routes() -> Router<AppState> {
             "/mgmt/bpl/getPVTypeInfoKeys",
             get(type_info::get_pv_type_info_keys),
         )
-        .route("/mgmt/bpl/getStoresForPV", get(type_info::get_stores_for_pv))
+        .route(
+            "/mgmt/bpl/getStoresForPV",
+            get(type_info::get_stores_for_pv),
+        )
         .route("/mgmt/bpl/renamePV", get(type_info::rename_pv))
-        .route("/mgmt/bpl/modifyMetaFields", get(type_info::modify_meta_fields))
+        .route(
+            "/mgmt/bpl/modifyMetaFields",
+            get(type_info::modify_meta_fields),
+        )
         .route(
             "/mgmt/bpl/getApplianceMetrics",
             get(operations::get_appliance_metrics),

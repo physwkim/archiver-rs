@@ -61,10 +61,7 @@ impl EventStream for CountStream {
         loop {
             match self.input.next_event()? {
                 Some(sample) => {
-                    let bin = crate::etl::decimation::bin_of(
-                        sample.timestamp,
-                        self.interval_secs,
-                    );
+                    let bin = crate::etl::decimation::bin_of(sample.timestamp, self.interval_secs);
                     if let Some(prev_bin) = self.current_bin
                         && bin != prev_bin
                         && self.count > 0

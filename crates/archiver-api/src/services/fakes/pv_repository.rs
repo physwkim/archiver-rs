@@ -131,10 +131,7 @@ impl PvQueryRepository for InMemoryPvRepository {
         let records: Vec<PvRecord> = lock
             .values()
             .filter(|r| {
-                r.alias_for.is_none()
-                    && r.last_timestamp
-                        .map(|ts| ts < cutoff)
-                        .unwrap_or(false)
+                r.alias_for.is_none() && r.last_timestamp.map(|ts| ts < cutoff).unwrap_or(false)
             })
             .cloned()
             .collect();

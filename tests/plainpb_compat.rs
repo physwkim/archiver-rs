@@ -2,9 +2,9 @@
 
 use std::time::SystemTime;
 
-use archiver_core::storage::plainpb::codec;
-use archiver_core::storage::plainpb::PlainPbStoragePlugin;
 use archiver_core::storage::partition::PartitionGranularity;
+use archiver_core::storage::plainpb::PlainPbStoragePlugin;
+use archiver_core::storage::plainpb::codec;
 use archiver_core::storage::traits::StoragePlugin;
 use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
 
@@ -37,12 +37,16 @@ fn test_codec_specific_bytes() {
 #[tokio::test]
 async fn test_write_read_scalar_double() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let ts: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap().into();
     let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(std::f64::consts::PI));
 
-    plugin.append_event("SIM:Sine", ArchDbType::ScalarDouble, &sample).await.unwrap();
+    plugin
+        .append_event("SIM:Sine", ArchDbType::ScalarDouble, &sample)
+        .await
+        .unwrap();
 
     let start: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 0, 0).unwrap().into();
     let end: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 11, 0, 0).unwrap().into();
@@ -65,12 +69,16 @@ async fn test_write_read_scalar_double() {
 #[tokio::test]
 async fn test_write_read_scalar_string() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Day);
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Day);
 
     let ts: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap().into();
     let sample = ArchiverSample::new(ts, ArchiverValue::ScalarString("hello world".to_string()));
 
-    plugin.append_event("SIM:Name", ArchDbType::ScalarString, &sample).await.unwrap();
+    plugin
+        .append_event("SIM:Name", ArchDbType::ScalarString, &sample)
+        .await
+        .unwrap();
 
     let start: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 0, 0, 0).unwrap().into();
     let end: SystemTime = Utc.with_ymd_and_hms(2024, 6, 16, 0, 0, 0).unwrap().into();
@@ -87,7 +95,8 @@ async fn test_write_read_scalar_string() {
 #[tokio::test]
 async fn test_write_read_multiple_samples() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let base_ts: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 0, 0).unwrap().into();
 
@@ -95,7 +104,10 @@ async fn test_write_read_multiple_samples() {
         let ts = base_ts + std::time::Duration::from_secs(i);
         let val = (i as f64).sin();
         let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(val));
-        plugin.append_event("SIM:Sine", ArchDbType::ScalarDouble, &sample).await.unwrap();
+        plugin
+            .append_event("SIM:Sine", ArchDbType::ScalarDouble, &sample)
+            .await
+            .unwrap();
     }
 
     let end: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 11, 0, 0).unwrap().into();
@@ -112,13 +124,17 @@ async fn test_write_read_multiple_samples() {
 #[tokio::test]
 async fn test_write_read_waveform() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let ts: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap().into();
     let waveform: Vec<f64> = (0..10).map(|i| i as f64 * 0.1).collect();
     let sample = ArchiverSample::new(ts, ArchiverValue::VectorDouble(waveform.clone()));
 
-    plugin.append_event("SIM:Waveform", ArchDbType::WaveformDouble, &sample).await.unwrap();
+    plugin
+        .append_event("SIM:Waveform", ArchDbType::WaveformDouble, &sample)
+        .await
+        .unwrap();
 
     let start: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 0, 0).unwrap().into();
     let end: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 11, 0, 0).unwrap().into();
@@ -138,7 +154,8 @@ async fn test_write_read_waveform() {
 #[tokio::test]
 async fn test_file_path_naming() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let ts: SystemTime = Utc.with_ymd_and_hms(2024, 3, 5, 9, 30, 0).unwrap().into();
     let path = plugin.file_path_for("SIM:Sine", ts);
@@ -151,13 +168,28 @@ async fn test_file_path_naming() {
 #[tokio::test]
 async fn test_last_known_event() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let ts1: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 0, 0).unwrap().into();
     let ts2: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap().into();
 
-    plugin.append_event("SIM:Test", ArchDbType::ScalarDouble, &ArchiverSample::new(ts1, ArchiverValue::ScalarDouble(1.0))).await.unwrap();
-    plugin.append_event("SIM:Test", ArchDbType::ScalarDouble, &ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(2.0))).await.unwrap();
+    plugin
+        .append_event(
+            "SIM:Test",
+            ArchDbType::ScalarDouble,
+            &ArchiverSample::new(ts1, ArchiverValue::ScalarDouble(1.0)),
+        )
+        .await
+        .unwrap();
+    plugin
+        .append_event(
+            "SIM:Test",
+            ArchDbType::ScalarDouble,
+            &ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(2.0)),
+        )
+        .await
+        .unwrap();
 
     let last = plugin.get_last_known_event("SIM:Test").await.unwrap();
     assert!(last.is_some());
@@ -380,11 +412,8 @@ async fn multi_year_timestamp_roundtrip() {
         // a non-zero secondsintoyear (year start is the trivial case).
         let ts: SystemTime = Utc.with_ymd_and_hms(year, 6, 15, 12, 0, 0).unwrap().into();
         let dir = temp_dir();
-        let plugin = PlainPbStoragePlugin::new(
-            "test",
-            dir.path().to_path_buf(),
-            PartitionGranularity::Year,
-        );
+        let plugin =
+            PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Year);
         let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(year as f64));
         plugin
             .append_event("YEAR:Test", ArchDbType::ScalarDouble, &sample)

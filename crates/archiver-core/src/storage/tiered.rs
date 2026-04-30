@@ -101,10 +101,7 @@ impl StoragePlugin for TieredStorage {
         Ok(all_streams)
     }
 
-    async fn get_last_known_event(
-        &self,
-        pv: &str,
-    ) -> anyhow::Result<Option<ArchiverSample>> {
+    async fn get_last_known_event(&self, pv: &str) -> anyhow::Result<Option<ArchiverSample>> {
         // Try STS first (most recent), then MTS, then LTS. Honor the
         // SKIP_<NAME>_FOR_RETRIEVAL flags here too so a flag flipped for
         // outage routing affects every read path, not just `get_data`.

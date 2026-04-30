@@ -173,9 +173,7 @@ impl EventStream for PbBytesReader {
             match decode_sample(self.desc.db_type, self.desc.year, &raw_bytes) {
                 Ok(sample) => return Ok(Some(sample)),
                 Err(e) => {
-                    warn!(
-                        "PB bytes-stream: skipping undecodable sample: {e}"
-                    );
+                    warn!("PB bytes-stream: skipping undecodable sample: {e}");
                     continue;
                 }
             }
@@ -416,7 +414,9 @@ fn sample_from_parts(
     field_actual_change: Option<bool>,
 ) -> anyhow::Result<ArchiverSample> {
     let timestamp = ArchiverSample::timestamp_from_epoch_parts(year, seconds_into_year, nanos)
-        .ok_or_else(|| anyhow::anyhow!("invalid timestamp: year={year} secs={seconds_into_year} nanos={nanos}"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("invalid timestamp: year={year} secs={seconds_into_year} nanos={nanos}")
+        })?;
     Ok(ArchiverSample {
         timestamp,
         value,

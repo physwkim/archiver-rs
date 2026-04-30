@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use tracing::info;
 
 use crate::types::ArchDbType;
@@ -156,7 +156,9 @@ impl SampleMode {
 
     fn from_db(mode: &str, period: f64) -> Self {
         match mode {
-            "scan" => Self::Scan { period_secs: period },
+            "scan" => Self::Scan {
+                period_secs: period,
+            },
             _ => Self::Monitor,
         }
     }
@@ -348,9 +350,8 @@ impl PvRegistry {
     /// [`Self::expanded_pv_names`] to include aliases.
     pub fn all_pv_names(&self) -> anyhow::Result<Vec<String>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT pv_name FROM pv_info WHERE alias_for IS NULL ORDER BY pv_name",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT pv_name FROM pv_info WHERE alias_for IS NULL ORDER BY pv_name")?;
         let names = stmt
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
@@ -394,9 +395,8 @@ impl PvRegistry {
     /// on `matching_pvs`.
     pub fn matching_pvs_expanded(&self, pattern: &str) -> anyhow::Result<Vec<String>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT pv_name FROM pv_info WHERE pv_name GLOB ?1 ORDER BY pv_name",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT pv_name FROM pv_info WHERE pv_name GLOB ?1 ORDER BY pv_name")?;
         let names = stmt
             .query_map(params![pattern], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
@@ -423,10 +423,7 @@ impl PvRegistry {
     }
 
     /// Batch update last timestamps (for periodic flush).
-    pub fn batch_update_timestamps(
-        &self,
-        updates: &[(&str, SystemTime)],
-    ) -> anyhow::Result<()> {
+    pub fn batch_update_timestamps(&self, updates: &[(&str, SystemTime)]) -> anyhow::Result<()> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         let now = Utc::now().to_rfc3339();
@@ -565,11 +562,7 @@ impl PvRegistry {
     }
 
     /// Set or clear the archive_fields list for a PV.
-    pub fn update_archive_fields(
-        &self,
-        pv_name: &str,
-        fields: &[String],
-    ) -> anyhow::Result<bool> {
+    pub fn update_archive_fields(&self, pv_name: &str, fields: &[String]) -> anyhow::Result<bool> {
         let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let json = if fields.is_empty() {
@@ -623,10 +616,12 @@ impl PvRegistry {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let (dbr_type, mode, period, ec, target_alias) = row
-            .ok_or_else(|| anyhow::anyhow!("target PV '{target}' not found"))?;
+        let (dbr_type, mode, period, ec, target_alias) =
+            row.ok_or_else(|| anyhow::anyhow!("target PV '{target}' not found"))?;
         if target_alias.is_some() {
-            anyhow::bail!("target PV '{target}' is itself an alias; aliases of aliases are not allowed");
+            anyhow::bail!(
+                "target PV '{target}' is itself an alias; aliases of aliases are not allowed"
+            );
         }
         // Reject if `alias` already exists either as a real PV or different alias.
         let existing: Option<Option<String>> = conn
@@ -681,15 +676,16 @@ impl PvRegistry {
     /// Return the canonical PV name. If `name` is an alias, returns the target;
     /// otherwise returns the input unchanged. Used by lookup/retrieval paths.
     pub fn canonical_name(&self, name: &str) -> anyhow::Result<String> {
-        Ok(self.resolve_alias(name)?.unwrap_or_else(|| name.to_string()))
+        Ok(self
+            .resolve_alias(name)?
+            .unwrap_or_else(|| name.to_string()))
     }
 
     /// List all alias names pointing at a given target PV.
     pub fn aliases_for(&self, target: &str) -> anyhow::Result<Vec<String>> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT pv_name FROM pv_info WHERE alias_for = ?1 ORDER BY pv_name",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT pv_name FROM pv_info WHERE alias_for = ?1 ORDER BY pv_name")?;
         let names = stmt
             .query_map(params![target], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
@@ -704,7 +700,9 @@ impl PvRegistry {
              WHERE alias_for IS NOT NULL ORDER BY pv_name",
         )?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -882,8 +880,13 @@ mod tests {
     #[test]
     fn test_register_and_get() {
         let reg = PvRegistry::in_memory().unwrap();
-        reg.register_pv("SIM:Sine", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
-            .unwrap();
+        reg.register_pv(
+            "SIM:Sine",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
 
         let record = reg.get_pv("SIM:Sine").unwrap().unwrap();
         assert_eq!(record.pv_name, "SIM:Sine");
@@ -894,8 +897,13 @@ mod tests {
     #[test]
     fn test_status_transitions() {
         let reg = PvRegistry::in_memory().unwrap();
-        reg.register_pv("SIM:Test", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
-            .unwrap();
+        reg.register_pv(
+            "SIM:Test",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
 
         reg.set_status("SIM:Test", PvStatus::Paused).unwrap();
         let r = reg.get_pv("SIM:Test").unwrap().unwrap();
@@ -909,10 +917,34 @@ mod tests {
     #[test]
     fn test_pattern_matching() {
         let reg = PvRegistry::in_memory().unwrap();
-        reg.register_pv("SIM:Sine", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
-        reg.register_pv("SIM:Cosine", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
-        reg.register_pv("EXP:BL1:run:active", ArchDbType::ScalarEnum, &SampleMode::Monitor, 1).unwrap();
-        reg.register_pv("EXP:BL1:motor:th:readback", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+        reg.register_pv(
+            "SIM:Sine",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
+        reg.register_pv(
+            "SIM:Cosine",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
+        reg.register_pv(
+            "EXP:BL1:run:active",
+            ArchDbType::ScalarEnum,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
+        reg.register_pv(
+            "EXP:BL1:motor:th:readback",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
 
         let sim = reg.matching_pvs("SIM:*").unwrap();
         assert_eq!(sim.len(), 2);
@@ -933,7 +965,8 @@ mod tests {
                 ArchDbType::ScalarDouble,
                 &SampleMode::Monitor,
                 1,
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         assert_eq!(reg.count(None).unwrap(), 100);
@@ -946,7 +979,13 @@ mod tests {
     #[test]
     fn test_remove_pv() {
         let reg = PvRegistry::in_memory().unwrap();
-        reg.register_pv("SIM:Gone", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+        reg.register_pv(
+            "SIM:Gone",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
         assert!(reg.get_pv("SIM:Gone").unwrap().is_some());
 
         reg.remove_pv("SIM:Gone").unwrap();
@@ -956,11 +995,14 @@ mod tests {
     #[test]
     fn test_batch_update_timestamps() {
         let reg = PvRegistry::in_memory().unwrap();
-        reg.register_pv("PV:A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
-        reg.register_pv("PV:B", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+        reg.register_pv("PV:A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+        reg.register_pv("PV:B", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
 
         let now = SystemTime::now();
-        reg.batch_update_timestamps(&[("PV:A", now), ("PV:B", now)]).unwrap();
+        reg.batch_update_timestamps(&[("PV:A", now), ("PV:B", now)])
+            .unwrap();
 
         let a = reg.get_pv("PV:A").unwrap().unwrap();
         assert!(a.last_timestamp.is_some());
@@ -970,7 +1012,8 @@ mod tests {
     fn test_recently_added_pvs() {
         let reg = PvRegistry::in_memory().unwrap();
         let before = SystemTime::now() - Duration::from_secs(1);
-        reg.register_pv("PV:New", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+        reg.register_pv("PV:New", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
 
         let recent = reg.recently_added_pvs(before).unwrap();
         assert_eq!(recent.len(), 1);
@@ -984,7 +1027,8 @@ mod tests {
     #[test]
     fn test_recently_modified_pvs() {
         let reg = PvRegistry::in_memory().unwrap();
-        reg.register_pv("PV:Mod", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+        reg.register_pv("PV:Mod", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
         let before = SystemTime::now() - Duration::from_secs(1);
 
         // Modify status to update updated_at.
@@ -997,7 +1041,8 @@ mod tests {
     #[test]
     fn test_update_sample_mode() {
         let reg = PvRegistry::in_memory().unwrap();
-        reg.register_pv("PV:Mode", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+        reg.register_pv("PV:Mode", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
 
         let new_mode = SampleMode::Scan { period_secs: 5.0 };
         assert!(reg.update_sample_mode("PV:Mode", &new_mode).unwrap());
@@ -1009,8 +1054,13 @@ mod tests {
     #[test]
     fn test_archive_fields_roundtrip() {
         let reg = PvRegistry::in_memory().unwrap();
-        reg.register_pv("PV:Fields", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
-            .unwrap();
+        reg.register_pv(
+            "PV:Fields",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
 
         // Default is empty.
         let r = reg.get_pv("PV:Fields").unwrap().unwrap();
@@ -1117,9 +1167,10 @@ mod tests {
         assert!(r.policy_name.is_none());
 
         // New writes work too.
-        assert!(reg
-            .update_archive_fields("PV:Legacy", &["HIHI".to_string()])
-            .unwrap());
+        assert!(
+            reg.update_archive_fields("PV:Legacy", &["HIHI".to_string()])
+                .unwrap()
+        );
         let r = reg.get_pv("PV:Legacy").unwrap().unwrap();
         assert_eq!(r.archive_fields, vec!["HIHI".to_string()]);
     }
@@ -1127,8 +1178,13 @@ mod tests {
     #[test]
     fn test_aliases_basic() {
         let reg = PvRegistry::in_memory().unwrap();
-        reg.register_pv("RING:Current", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
-            .unwrap();
+        reg.register_pv(
+            "RING:Current",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
 
         // Add an alias and verify resolution.
         reg.add_alias("DEV:Current", "RING:Current").unwrap();
@@ -1170,8 +1226,10 @@ mod tests {
     #[test]
     fn test_alias_conflicts() {
         let reg = PvRegistry::in_memory().unwrap();
-        reg.register_pv("PV:A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
-        reg.register_pv("PV:B", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+        reg.register_pv("PV:A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+        reg.register_pv("PV:B", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
 
         // Cannot alias to nonexistent target.
         assert!(reg.add_alias("Alias:X", "Nonexistent").is_err());
@@ -1194,8 +1252,20 @@ mod tests {
     #[test]
     fn test_silent_pvs() {
         let reg = PvRegistry::in_memory().unwrap();
-        reg.register_pv("PV:Silent", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
-        reg.register_pv("PV:NoData", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+        reg.register_pv(
+            "PV:Silent",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
+        reg.register_pv(
+            "PV:NoData",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
 
         // Set PV:Silent's last_timestamp to 2 hours ago.
         let old_time = SystemTime::now() - Duration::from_secs(7200);

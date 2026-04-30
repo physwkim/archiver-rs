@@ -75,7 +75,13 @@ impl PvQueryRepository for RegistryRepository {
 }
 
 impl PvCommandRepository for RegistryRepository {
-    fn register_pv(&self, pv: &str, dbr_type: ArchDbType, mode: &SampleMode, element_count: i32) -> anyhow::Result<()> {
+    fn register_pv(
+        &self,
+        pv: &str,
+        dbr_type: ArchDbType,
+        mode: &SampleMode,
+        element_count: i32,
+    ) -> anyhow::Result<()> {
         self.inner.register_pv(pv, dbr_type, mode, element_count)
     }
 
@@ -91,7 +97,12 @@ impl PvCommandRepository for RegistryRepository {
         self.inner.update_sample_mode(pv, mode)
     }
 
-    fn update_metadata(&self, pv: &str, prec: Option<&str>, egu: Option<&str>) -> anyhow::Result<bool> {
+    fn update_metadata(
+        &self,
+        pv: &str,
+        prec: Option<&str>,
+        egu: Option<&str>,
+    ) -> anyhow::Result<bool> {
         self.inner.update_metadata(pv, prec, egu)
     }
 

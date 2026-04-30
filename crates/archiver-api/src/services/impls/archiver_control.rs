@@ -20,12 +20,14 @@ impl ChannelArchiverControl {
 #[async_trait]
 impl ArchiverQuery for ChannelArchiverControl {
     fn get_connection_info(&self, pv: &str) -> Option<ConnectionInfoDto> {
-        self.inner.get_connection_info(pv).map(|c| ConnectionInfoDto {
-            connected_since: c.connected_since,
-            last_event_time: c.last_event_time,
-            is_connected: c.is_connected,
-            connection_state: Some(c.state.as_str()),
-        })
+        self.inner
+            .get_connection_info(pv)
+            .map(|c| ConnectionInfoDto {
+                connected_since: c.connected_since,
+                last_event_time: c.last_event_time,
+                is_connected: c.is_connected,
+                connection_state: Some(c.state.as_str()),
+            })
     }
 
     fn get_never_connected_pvs(&self) -> Vec<String> {

@@ -51,10 +51,7 @@ impl EventStream for LastSampleStream {
         loop {
             match self.input.next_event()? {
                 Some(sample) => {
-                    let bin = crate::etl::decimation::bin_of(
-                        sample.timestamp,
-                        self.interval_secs,
-                    );
+                    let bin = crate::etl::decimation::bin_of(sample.timestamp, self.interval_secs);
                     if self.current_bin != Some(bin) {
                         // Crossed the boundary: emit the pending sample and
                         // start a fresh bin with the current one as the new

@@ -100,7 +100,8 @@ async fn pva_rpc_get_data_end_to_end() {
         "path".into(),
         PvField::Scalar(ScalarValue::String("archappl/getData".into())),
     ));
-    root.fields.push(("query".into(), PvField::Structure(query)));
+    root.fields
+        .push(("query".into(), PvField::Structure(query)));
     let req_value = PvField::Structure(root);
 
     // ── Call the RPC ──

@@ -13,11 +13,11 @@ pub mod usecases;
 
 pub use state::{AppState, FailoverState};
 
+use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Method};
 use axum::middleware;
 use axum::routing::get;
-use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -53,16 +53,17 @@ pub fn build_router(state: AppState, security: &SecurityConfig) -> Router {
     // which means browsers block all cross-origin requests (same-origin only).
     // To allow cross-origin access, explicitly list origins in the config.
     let cors_layer = if security.cors_origins.is_empty() {
-        CorsLayer::new()
-            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        CorsLayer::new().allow_methods([Method::GET, Method::POST, Method::OPTIONS])
     } else {
         let origins: Vec<HeaderValue> = security
             .cors_origins
             .iter()
             .filter_map(|s| {
-                s.parse().map_err(|e| {
-                    tracing::warn!(origin = s, "Invalid CORS origin, skipping: {e}");
-                }).ok()
+                s.parse()
+                    .map_err(|e| {
+                        tracing::warn!(origin = s, "Invalid CORS origin, skipping: {e}");
+                    })
+                    .ok()
             })
             .collect();
         CorsLayer::new()

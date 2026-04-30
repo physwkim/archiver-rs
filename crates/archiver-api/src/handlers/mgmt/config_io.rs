@@ -3,13 +3,11 @@ use axum::response::IntoResponse;
 
 use archiver_core::registry::SampleMode;
 
+use crate::AppState;
 use crate::dto::mgmt::*;
 use crate::errors::ApiError;
-use crate::AppState;
 
-pub async fn export_config(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, ApiError> {
+pub async fn export_config(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let records = state.pv_query.all_records().map_err(ApiError::internal)?;
 
     let exports: Vec<ExportRecord> = records

@@ -77,10 +77,7 @@ pub trait StoragePlugin: Send + Sync {
     ) -> anyhow::Result<Vec<Box<dyn EventStream>>>;
 
     /// Get the most recent known event for a PV.
-    async fn get_last_known_event(
-        &self,
-        pv: &str,
-    ) -> anyhow::Result<Option<ArchiverSample>>;
+    async fn get_last_known_event(&self, pv: &str) -> anyhow::Result<Option<ArchiverSample>>;
 
     /// Get the last sample whose timestamp is strictly before `target`.
     /// Used by retrieval to prepend a continuity sample when the user's

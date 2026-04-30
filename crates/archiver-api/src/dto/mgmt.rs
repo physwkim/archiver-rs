@@ -68,9 +68,17 @@ pub struct PvStatusResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none", default, rename = "dbrType")]
     pub dbr_type: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none", default, rename = "samplingMethod")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "samplingMethod"
+    )]
     pub sample_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", default, rename = "elementCount")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        rename = "elementCount"
+    )]
     pub element_count: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none", default, rename = "lastEvent")]
     pub last_event_timestamp: Option<String>,
@@ -144,7 +152,11 @@ pub struct PvTypeInfoResponse {
     pub created_at: String,
     #[serde(rename = "aliasFor", skip_serializing_if = "Option::is_none")]
     pub alias_for: Option<String>,
-    #[serde(rename = "archiveFields", skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(
+        rename = "archiveFields",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
     pub archive_fields: Vec<String>,
     #[serde(rename = "policyName", skip_serializing_if = "Option::is_none")]
     pub policy_name: Option<String>,
@@ -174,10 +186,18 @@ pub struct ExportRecord {
     #[serde(rename = "aliasFor", skip_serializing_if = "Option::is_none", default)]
     pub alias_for: Option<String>,
     /// EPICS metadata field names archived alongside the value (.HIHI/.LOLO/...).
-    #[serde(rename = "archiveFields", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "archiveFields",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub archive_fields: Option<Vec<String>>,
     /// Policy that selected the sampling configuration for this PV.
-    #[serde(rename = "policyName", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "policyName",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub policy_name: Option<String>,
 }
 
@@ -237,7 +257,9 @@ pub fn record_to_type_info_with_name(
         PvStatus::Alias => "Alias",
     };
     PvTypeInfoResponse {
-        pv_name: requested_name.map(|s| s.to_string()).unwrap_or_else(|| r.pv_name.clone()),
+        pv_name: requested_name
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| r.pv_name.clone()),
         dbr_type: r.dbr_type as i32,
         sampling_method: method,
         sampling_period: period,

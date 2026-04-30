@@ -1,9 +1,9 @@
 //! Management UI — serves the static HTML management console and data viewer.
 
-use axum::http::{header, StatusCode};
+use axum::Router;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 
 use crate::AppState;
 
@@ -44,7 +44,10 @@ async fn serve_uplot_js() -> Response {
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
             (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
         UPLOT_JS,

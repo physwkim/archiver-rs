@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use dashmap::DashMap;
-use epics_rs::ca::client::{CaChannel, CaClient, ConnectionEvent};
 use epics_rs::base::types::{DbFieldType, EpicsValue};
+use epics_rs::ca::client::{CaChannel, CaClient, ConnectionEvent};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -201,7 +201,6 @@ impl From<&PvCounters> for PvCountersSnapshot {
     }
 }
 
-
 /// Handle for a running PV archiving task.
 struct PvHandle {
     #[allow(dead_code)]
@@ -368,18 +367,18 @@ impl ChannelManager {
         }
         metrics::gauge!("archiver_pvs_active").set(restored as f64);
         if restored < total {
-            warn!(restored, failed = total - restored, "Some PVs failed to restore");
+            warn!(
+                restored,
+                failed = total - restored,
+                "Some PVs failed to restore"
+            );
         }
 
         Ok(restored)
     }
 
     /// Start archiving a new PV.
-    pub async fn archive_pv(
-        &self,
-        pv_name: &str,
-        sample_mode: &SampleMode,
-    ) -> anyhow::Result<()> {
+    pub async fn archive_pv(&self, pv_name: &str, sample_mode: &SampleMode) -> anyhow::Result<()> {
         // Serialise with pause/resume/stop/destroy on the same PV.
         let lock = self.op_lock(pv_name);
         let _g = lock.lock().await;
@@ -390,7 +389,11 @@ impl ChannelManager {
 
         // Atomically claim the PV to prevent concurrent archive_pv races.
         // The guard ensures cleanup even if this future is cancelled.
-        if self.pending_archives.insert(pv_name.to_string(), ()).is_some() {
+        if self
+            .pending_archives
+            .insert(pv_name.to_string(), ())
+            .is_some()
+        {
             anyhow::bail!("PV {pv_name} archive operation already in progress");
         }
         let _guard = PendingGuard {
@@ -430,7 +433,10 @@ impl ChannelManager {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to {pv_name}: {e}"))?;
 
-        let info = self.ca_client.cainfo(pv_name).await
+        let info = self
+            .ca_client
+            .cainfo(pv_name)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to get info for {pv_name}: {e}"))?;
 
         let dbr_type = dbr_field_to_arch_type(info.native_type);
@@ -445,7 +451,9 @@ impl ChannelManager {
             self.registry.update_policy_name(pv_name, Some(name))?;
         }
 
-        let record = self.registry.get_pv(pv_name)?
+        let record = self
+            .registry
+            .get_pv(pv_name)?
             .ok_or_else(|| anyhow::anyhow!("PV {pv_name} not found in registry"))?;
         self.start_archiving_internal(&record).await?;
 
@@ -659,7 +667,10 @@ impl ChannelManager {
 
         // Guard: if already active with a live task, nothing to do.
         if record.status == PvStatus::Active && self.channels.contains_key(pv_name) {
-            info!(pv = pv_name, "PV is already actively archived, skipping resume");
+            info!(
+                pv = pv_name,
+                "PV is already actively archived, skipping resume"
+            );
             return Ok(());
         }
 
@@ -743,9 +754,12 @@ impl ChannelManager {
 
     /// Get connection info for a PV.
     pub fn get_connection_info(&self, pv: &str) -> Option<ConnectionInfo> {
-        self.channels
-            .get(pv)
-            .map(|h| h.conn_info.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        self.channels.get(pv).map(|h| {
+            h.conn_info
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
     }
 
     /// Get PV names that have never received any event (connected_since == None).
@@ -753,7 +767,11 @@ impl ChannelManager {
         self.channels
             .iter()
             .filter(|entry| {
-                let ci = entry.value().conn_info.lock().unwrap_or_else(|e| e.into_inner());
+                let ci = entry
+                    .value()
+                    .conn_info
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 ci.connected_since.is_none()
             })
             .map(|entry| entry.key().clone())
@@ -772,7 +790,12 @@ impl ChannelManager {
     pub fn all_pv_counters(&self) -> Vec<(String, PvCountersSnapshot)> {
         self.channels
             .iter()
-            .map(|e| (e.key().clone(), PvCountersSnapshot::from(&*e.value().counters)))
+            .map(|e| {
+                (
+                    e.key().clone(),
+                    PvCountersSnapshot::from(&*e.value().counters),
+                )
+            })
             .collect()
     }
 
@@ -790,7 +813,9 @@ impl ChannelManager {
         // channel would otherwise return an error from deep in the CA
         // stack. Capped by the same timeout the caller chose.
         if channel.wait_connected(timeout).await.is_err() {
-            return Some(Err(anyhow::anyhow!("channel not connected within {timeout:?}")));
+            return Some(Err(anyhow::anyhow!(
+                "channel not connected within {timeout:?}"
+            )));
         }
         match tokio::time::timeout(timeout, channel.get()).await {
             Ok(Ok((_dbr_type, val))) => Some(Ok(epics_value_to_archiver(&val))),
@@ -818,7 +843,11 @@ impl ChannelManager {
         self.channels
             .iter()
             .filter(|entry| {
-                let ci = entry.value().conn_info.lock().unwrap_or_else(|e| e.into_inner());
+                let ci = entry
+                    .value()
+                    .conn_info
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 !ci.is_connected
             })
             .map(|entry| entry.key().clone())
@@ -922,7 +951,9 @@ async fn monitor_loop(
         let mut monitor = match channel.subscribe().await {
             Ok(m) => m,
             Err(e) => {
-                counters.transient_error_count.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .transient_error_count
+                    .fetch_add(1, Ordering::Relaxed);
                 warn!(pv = pv_name, "Subscribe failed: {e}, retrying...");
                 tokio::select! {
                     _ = cancel_token.cancelled() => return,
@@ -1144,9 +1175,7 @@ async fn scan_loop(
                 let mut sample = ArchiverSample::new(now, archiver_val);
                 attach_extras(&extras, &mut sample);
                 if first_after_connect {
-                    let lost_secs = counters
-                        .last_disconnect_unix_secs
-                        .load(Ordering::Relaxed);
+                    let lost_secs = counters.last_disconnect_unix_secs.load(Ordering::Relaxed);
                     attach_cnx_lost_headers(&mut sample, lost_secs, now_secs);
                 }
                 let pv_sample = PvSample {
@@ -1164,7 +1193,9 @@ async fn scan_loop(
                 }
             }
             Err(e) => {
-                counters.transient_error_count.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .transient_error_count
+                    .fetch_add(1, Ordering::Relaxed);
                 debug!(pv = pv_name, "Scan read error: {e}");
             }
         }
@@ -1177,18 +1208,15 @@ async fn scan_loop(
 /// on a clean startup `lost_secs` is 0, which is itself a valid value
 /// for downstream gap detection.
 fn attach_cnx_lost_headers(sample: &mut ArchiverSample, lost_secs: i64, now_secs: i64) {
-    sample.field_values.push((
-        "cnxlostepsecs".to_string(),
-        lost_secs.to_string(),
-    ));
-    sample.field_values.push((
-        "cnxregainedepsecs".to_string(),
-        now_secs.to_string(),
-    ));
-    sample.field_values.push((
-        "startup".to_string(),
-        "true".to_string(),
-    ));
+    sample
+        .field_values
+        .push(("cnxlostepsecs".to_string(), lost_secs.to_string()));
+    sample
+        .field_values
+        .push(("cnxregainedepsecs".to_string(), now_secs.to_string()));
+    sample
+        .field_values
+        .push(("startup".to_string(), "true".to_string()));
 }
 
 /// Snapshot the extras cache into `sample.field_values`. We sort for stable

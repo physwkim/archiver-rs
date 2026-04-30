@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use axum::body::Bytes;
 use axum::extract::FromRequest;
-use axum::http::{header, Request};
+use axum::http::{Request, header};
 
 use crate::errors::ApiError;
 
@@ -52,7 +52,10 @@ where
 {
     type Rejection = ApiError;
 
-    async fn from_request(req: Request<axum::body::Body>, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(
+        req: Request<axum::body::Body>,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
         let content_type = req
             .headers()
             .get(header::CONTENT_TYPE)

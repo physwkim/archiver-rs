@@ -58,22 +58,28 @@ impl RateLimiter {
 }
 
 /// Middleware that adds security headers to all responses.
-pub(crate) async fn security_headers(
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+pub(crate) async fn security_headers(request: Request<axum::body::Body>, next: Next) -> Response {
     let mut resp = next.run(request).await;
     let headers = resp.headers_mut();
-    headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    headers.insert("x-xss-protection", HeaderValue::from_static("1; mode=block"));
+    headers.insert(
+        "x-xss-protection",
+        HeaderValue::from_static("1; mode=block"),
+    );
     headers.insert(
         "content-security-policy",
         HeaderValue::from_static(
             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
         ),
     );
-    headers.insert("referrer-policy", HeaderValue::from_static("strict-origin-when-cross-origin"));
+    headers.insert(
+        "referrer-policy",
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
     resp
 }
 
@@ -104,12 +110,13 @@ pub(crate) async fn rate_limit(
         };
 
         if let Some(ip) = ip
-            && !limiter.check(ip) {
-                return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
-            }
+            && !limiter.check(ip)
+        {
+            return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
+        }
     }
     next.run(request).await
 }
 
-use axum::extract::State;
 use crate::AppState;
+use axum::extract::State;

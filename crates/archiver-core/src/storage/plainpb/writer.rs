@@ -135,188 +135,160 @@ pub fn encode_sample(dbr_type: ArchDbType, sample: &ArchiverSample) -> anyhow::R
     };
 
     let bytes = match (&sample.value, dbr_type) {
-        (ArchiverValue::ScalarString(v), ArchDbType::ScalarString) => {
-            epics_event::ScalarString {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: v.clone(),
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        (ArchiverValue::ScalarString(v), ArchDbType::ScalarString) => epics_event::ScalarString {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: v.clone(),
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::ScalarByte(v), ArchDbType::ScalarByte) => {
-            epics_event::ScalarByte {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: v.clone(),
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::ScalarByte(v), ArchDbType::ScalarByte) => epics_event::ScalarByte {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: v.clone(),
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::ScalarShort(v), ArchDbType::ScalarShort) => {
-            epics_event::ScalarShort {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: *v,
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::ScalarShort(v), ArchDbType::ScalarShort) => epics_event::ScalarShort {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: *v,
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::ScalarInt(v), ArchDbType::ScalarInt) => {
-            epics_event::ScalarInt {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: *v,
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::ScalarInt(v), ArchDbType::ScalarInt) => epics_event::ScalarInt {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: *v,
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::ScalarEnum(v), ArchDbType::ScalarEnum) => {
-            epics_event::ScalarEnum {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: *v,
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::ScalarEnum(v), ArchDbType::ScalarEnum) => epics_event::ScalarEnum {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: *v,
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::ScalarFloat(v), ArchDbType::ScalarFloat) => {
-            epics_event::ScalarFloat {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: *v,
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::ScalarFloat(v), ArchDbType::ScalarFloat) => epics_event::ScalarFloat {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: *v,
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::ScalarDouble(v), ArchDbType::ScalarDouble) => {
-            epics_event::ScalarDouble {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: *v,
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::ScalarDouble(v), ArchDbType::ScalarDouble) => epics_event::ScalarDouble {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: *v,
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::VectorString(v), ArchDbType::WaveformString) => {
-            epics_event::VectorString {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: v.clone(),
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::VectorString(v), ArchDbType::WaveformString) => epics_event::VectorString {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: v.clone(),
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::VectorChar(v), ArchDbType::WaveformByte) => {
-            epics_event::VectorChar {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: v.clone(),
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::VectorChar(v), ArchDbType::WaveformByte) => epics_event::VectorChar {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: v.clone(),
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::VectorShort(v), ArchDbType::WaveformShort) => {
-            epics_event::VectorShort {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: v.clone(),
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::VectorShort(v), ArchDbType::WaveformShort) => epics_event::VectorShort {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: v.clone(),
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::VectorInt(v), ArchDbType::WaveformInt) => {
-            epics_event::VectorInt {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: v.clone(),
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::VectorInt(v), ArchDbType::WaveformInt) => epics_event::VectorInt {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: v.clone(),
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::VectorEnum(v), ArchDbType::WaveformEnum) => {
-            epics_event::VectorEnum {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: v.clone(),
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::VectorEnum(v), ArchDbType::WaveformEnum) => epics_event::VectorEnum {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: v.clone(),
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::VectorFloat(v), ArchDbType::WaveformFloat) => {
-            epics_event::VectorFloat {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: v.clone(),
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::VectorFloat(v), ArchDbType::WaveformFloat) => epics_event::VectorFloat {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: v.clone(),
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
-        (ArchiverValue::VectorDouble(v), ArchDbType::WaveformDouble) => {
-            epics_event::VectorDouble {
-                secondsintoyear: secs,
-                nano: nanos,
-                val: v.clone(),
-                severity,
-                status,
-                repeatcount: rc,
-                fieldvalues: fvs,
-                fieldactualchange: fac,
-            }
-            .encode_to_vec()
+        .encode_to_vec(),
+        (ArchiverValue::VectorDouble(v), ArchDbType::WaveformDouble) => epics_event::VectorDouble {
+            secondsintoyear: secs,
+            nano: nanos,
+            val: v.clone(),
+            severity,
+            status,
+            repeatcount: rc,
+            fieldvalues: fvs,
+            fieldactualchange: fac,
         }
+        .encode_to_vec(),
         (ArchiverValue::V4GenericBytes(v), ArchDbType::V4GenericBytes) => {
             epics_event::V4GenericBytes {
                 secondsintoyear: secs,

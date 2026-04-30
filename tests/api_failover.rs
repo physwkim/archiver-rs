@@ -6,14 +6,14 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use axum::body::{to_bytes, Body};
+use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use prost::Message;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 use archiver_api::services::impls::{ChannelArchiverControl, RegistryRepository};
-use archiver_api::{build_router, AppState, FailoverState};
+use archiver_api::{AppState, FailoverState, build_router};
 use archiver_core::config::SecurityConfig;
 use archiver_core::registry::{PvRegistry, SampleMode};
 use archiver_core::storage::partition::PartitionGranularity;
@@ -71,8 +71,8 @@ fn build_pb_body(pv: &str, year: i32, samples: &[(u32, u32, f64)]) -> Vec<u8> {
 /// Spawn an HTTP server that serves a fixed PB body for any /data/getData.raw
 /// request. Returns the bound base URL like "http://127.0.0.1:54321/retrieval".
 async fn start_fake_peer(body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
-    use axum::routing::get;
     use axum::Router;
+    use axum::routing::get;
     use std::sync::Mutex;
 
     let body = Arc::new(Mutex::new(body));
@@ -110,7 +110,12 @@ async fn failover_merges_and_dedupes_peer_samples() {
     ));
     let registry = Arc::new(PvRegistry::in_memory().unwrap());
     registry
-        .register_pv("RING:Current", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "RING:Current",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
 
     // Local samples: t=10s and t=30s (in 2024).
@@ -205,7 +210,12 @@ async fn failover_tolerates_unreachable_peer() {
     ));
     let registry = Arc::new(PvRegistry::in_memory().unwrap());
     registry
-        .register_pv("PV:Local", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "PV:Local",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
 
     let year = 2024i32;
@@ -217,7 +227,12 @@ async fn failover_tolerates_unreachable_peer() {
     let ts = |secs: u32| SystemTime::from(year_start + chrono::Duration::seconds(secs as i64));
     let sample = ArchiverSample::new(ts(5), ArchiverValue::ScalarDouble(42.0));
     storage
-        .append_event_with_meta("PV:Local", ArchDbType::ScalarDouble, &sample, &AppendMeta::default())
+        .append_event_with_meta(
+            "PV:Local",
+            ArchDbType::ScalarDouble,
+            &sample,
+            &AppendMeta::default(),
+        )
         .await
         .unwrap();
     storage.flush_writes().await.unwrap();

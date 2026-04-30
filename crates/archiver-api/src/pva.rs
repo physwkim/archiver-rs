@@ -31,7 +31,7 @@ use chrono::DateTime;
 use epics_rs::pva::nt::NTTable;
 use epics_rs::pva::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_rs::pva::server_native::{
-    run_pva_server, PvaServer, PvaServerConfig, SharedPV, SharedSource,
+    PvaServer, PvaServerConfig, SharedPV, SharedSource, run_pva_server,
 };
 
 use archiver_core::retrieval::query::{parse_post_processor, query_data};
@@ -198,8 +198,8 @@ fn run_get_data_rpc(
 
     let post = processing.as_deref().and_then(parse_post_processor);
 
-    let samples = collect_samples(storage, &canonical, start, end, post)
-        .map_err(|e| format!("{e}"))?;
+    let samples =
+        collect_samples(storage, &canonical, start, end, post).map_err(|e| format!("{e}"))?;
     Ok((response_table().build(), build_table_value(&samples)))
 }
 
@@ -293,7 +293,10 @@ fn build_table_value(samples: &[ArchiverSample]) -> PvField {
     let mut statuses: Vec<ScalarValue> = Vec::with_capacity(samples.len());
 
     for s in samples {
-        let dur = s.timestamp.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        let dur = s
+            .timestamp
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
         secs.push(ScalarValue::Long(dur.as_secs() as i64));
         nanos.push(ScalarValue::Int(dur.subsec_nanos() as i32));
         let v = sample_to_double(&s.value);
@@ -423,12 +426,7 @@ mod tests {
         ));
         let registry = Arc::new(PvRegistry::in_memory().unwrap());
         registry
-            .register_pv(
-                "PV:Test",
-                ArchDbType::ScalarDouble,
-                &SampleMode::Monitor,
-                1,
-            )
+            .register_pv("PV:Test", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
             .unwrap();
 
         // Year-2024 samples: t=10s and t=20s.
@@ -439,10 +437,7 @@ mod tests {
             .and_utc();
         for (offset, val) in [(10u64, 1.5), (20u64, 2.5)] {
             let ts = year_start + chrono::Duration::seconds(offset as i64);
-            let sample = ArchiverSample::new(
-                ts.into(),
-                ArchiverValue::ScalarDouble(val),
-            );
+            let sample = ArchiverSample::new(ts.into(), ArchiverValue::ScalarDouble(val));
             storage
                 .append_event_with_meta(
                     "PV:Test",
@@ -467,8 +462,7 @@ mod tests {
         q.fields.push((
             "from".into(),
             PvField::Scalar(ScalarValue::String(
-                chrono::DateTime::<chrono::Utc>::from(SystemTime::from(year_start))
-                    .to_rfc3339(),
+                chrono::DateTime::<chrono::Utc>::from(SystemTime::from(year_start)).to_rfc3339(),
             )),
         ));
         q.fields.push((
@@ -481,12 +475,10 @@ mod tests {
             )),
         ));
         let mut root = PvStructure::new("epics:nt/NTURI:1.0");
-        root.fields
-            .push(("query".into(), PvField::Structure(q)));
+        root.fields.push(("query".into(), PvField::Structure(q)));
         let req = PvField::Structure(root);
 
-        let (_desc, value) =
-            run_get_data_rpc(&storage, pv_query.as_ref(), req).expect("rpc ok");
+        let (_desc, value) = run_get_data_rpc(&storage, pv_query.as_ref(), req).expect("rpc ok");
 
         let PvField::Structure(resp) = value else {
             panic!("expected struct");

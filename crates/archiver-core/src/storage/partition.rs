@@ -122,13 +122,11 @@ pub fn next_partition_start(ts: SystemTime, granularity: PartitionGranularity) -
     let dt = chrono::DateTime::<Utc>::from(ts);
 
     let next = match granularity {
-        PartitionGranularity::Year => {
-            NaiveDate::from_ymd_opt(dt.year() + 1, 1, 1)
-                .expect("Jan 1 is always valid")
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid")
-                .and_utc()
-        }
+        PartitionGranularity::Year => NaiveDate::from_ymd_opt(dt.year() + 1, 1, 1)
+            .expect("Jan 1 is always valid")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid")
+            .and_utc(),
         PartitionGranularity::Month => {
             let (y, m) = if dt.month() == 12 {
                 (dt.year() + 1, 1)
@@ -141,12 +139,10 @@ pub fn next_partition_start(ts: SystemTime, granularity: PartitionGranularity) -
                 .expect("midnight is always valid")
                 .and_utc()
         }
-        PartitionGranularity::Day => {
-            (dt.date_naive() + Duration::days(1))
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid")
-                .and_utc()
-        }
+        PartitionGranularity::Day => (dt.date_naive() + Duration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid")
+            .and_utc(),
         PartitionGranularity::Hour => {
             let current_hour = dt
                 .date_naive()
@@ -177,13 +173,11 @@ fn prev_partition_end(ts: SystemTime, granularity: PartitionGranularity) -> Syst
     let dt = chrono::DateTime::<Utc>::from(ts);
 
     let prev_end = match granularity {
-        PartitionGranularity::Year => {
-            NaiveDate::from_ymd_opt(dt.year() - 1, 12, 31)
-                .expect("Dec 31 is always valid")
-                .and_hms_opt(23, 59, 59)
-                .expect("23:59:59 is always valid")
-                .and_utc()
-        }
+        PartitionGranularity::Year => NaiveDate::from_ymd_opt(dt.year() - 1, 12, 31)
+            .expect("Dec 31 is always valid")
+            .and_hms_opt(23, 59, 59)
+            .expect("23:59:59 is always valid")
+            .and_utc(),
         PartitionGranularity::Month => {
             let first_of_month = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
                 .expect("1st of month is always valid");
@@ -228,37 +222,25 @@ mod tests {
 
     #[test]
     fn test_partition_name_year() {
-        let ts: SystemTime = Utc
-            .with_ymd_and_hms(2024, 6, 15, 10, 30, 0)
-            .unwrap()
-            .into();
+        let ts: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap().into();
         assert_eq!(partition_name(ts, PartitionGranularity::Year), "2024");
     }
 
     #[test]
     fn test_partition_name_month() {
-        let ts: SystemTime = Utc
-            .with_ymd_and_hms(2024, 3, 15, 10, 30, 0)
-            .unwrap()
-            .into();
+        let ts: SystemTime = Utc.with_ymd_and_hms(2024, 3, 15, 10, 30, 0).unwrap().into();
         assert_eq!(partition_name(ts, PartitionGranularity::Month), "2024_03");
     }
 
     #[test]
     fn test_partition_name_day() {
-        let ts: SystemTime = Utc
-            .with_ymd_and_hms(2024, 3, 5, 10, 30, 0)
-            .unwrap()
-            .into();
+        let ts: SystemTime = Utc.with_ymd_and_hms(2024, 3, 5, 10, 30, 0).unwrap().into();
         assert_eq!(partition_name(ts, PartitionGranularity::Day), "2024_03_05");
     }
 
     #[test]
     fn test_partition_name_hour() {
-        let ts: SystemTime = Utc
-            .with_ymd_and_hms(2024, 3, 5, 9, 30, 0)
-            .unwrap()
-            .into();
+        let ts: SystemTime = Utc.with_ymd_and_hms(2024, 3, 5, 9, 30, 0).unwrap().into();
         assert_eq!(
             partition_name(ts, PartitionGranularity::Hour),
             "2024_03_05_09"
@@ -267,10 +249,7 @@ mod tests {
 
     #[test]
     fn test_partition_name_15min() {
-        let ts: SystemTime = Utc
-            .with_ymd_and_hms(2024, 3, 5, 9, 47, 0)
-            .unwrap()
-            .into();
+        let ts: SystemTime = Utc.with_ymd_and_hms(2024, 3, 5, 9, 47, 0).unwrap().into();
         assert_eq!(
             partition_name(ts, PartitionGranularity::FifteenMin),
             "2024_03_05_09_45"
@@ -279,15 +258,12 @@ mod tests {
 
     #[test]
     fn test_partitions_in_range() {
-        let start: SystemTime = Utc
-            .with_ymd_and_hms(2024, 3, 5, 10, 0, 0)
-            .unwrap()
-            .into();
-        let end: SystemTime = Utc
-            .with_ymd_and_hms(2024, 3, 5, 12, 30, 0)
-            .unwrap()
-            .into();
+        let start: SystemTime = Utc.with_ymd_and_hms(2024, 3, 5, 10, 0, 0).unwrap().into();
+        let end: SystemTime = Utc.with_ymd_and_hms(2024, 3, 5, 12, 30, 0).unwrap().into();
         let names = partitions_in_range(start, end, PartitionGranularity::Hour);
-        assert_eq!(names, vec!["2024_03_05_10", "2024_03_05_11", "2024_03_05_12"]);
+        assert_eq!(
+            names,
+            vec!["2024_03_05_10", "2024_03_05_11", "2024_03_05_12"]
+        );
     }
 }

@@ -32,11 +32,22 @@ pub trait PvQueryRepository: Send + Sync {
 // --- PvCommandRepository (sync — write operations) ---
 
 pub trait PvCommandRepository: Send + Sync {
-    fn register_pv(&self, pv: &str, dbr_type: ArchDbType, mode: &SampleMode, element_count: i32) -> anyhow::Result<()>;
+    fn register_pv(
+        &self,
+        pv: &str,
+        dbr_type: ArchDbType,
+        mode: &SampleMode,
+        element_count: i32,
+    ) -> anyhow::Result<()>;
     fn remove_pv(&self, pv: &str) -> anyhow::Result<bool>;
     fn set_status(&self, pv: &str, status: PvStatus) -> anyhow::Result<bool>;
     fn update_sample_mode(&self, pv: &str, mode: &SampleMode) -> anyhow::Result<bool>;
-    fn update_metadata(&self, pv: &str, prec: Option<&str>, egu: Option<&str>) -> anyhow::Result<bool>;
+    fn update_metadata(
+        &self,
+        pv: &str,
+        prec: Option<&str>,
+        egu: Option<&str>,
+    ) -> anyhow::Result<bool>;
     #[allow(clippy::too_many_arguments)]
     fn import_pv(
         &self,
@@ -159,8 +170,18 @@ pub trait ClusterRouter: Send + Sync {
     fn identity(&self) -> ApplianceIdentityDto;
     fn peers(&self) -> Vec<PeerDto>;
     fn find_peer_by_name(&self, name: &str) -> Option<PeerDto>;
-    async fn proxy_mgmt_get(&self, mgmt_url: &str, endpoint: &str, qs: &str) -> anyhow::Result<axum::response::Response>;
-    async fn proxy_mgmt_post(&self, mgmt_url: &str, endpoint: &str, body: axum::body::Bytes) -> anyhow::Result<axum::response::Response>;
+    async fn proxy_mgmt_get(
+        &self,
+        mgmt_url: &str,
+        endpoint: &str,
+        qs: &str,
+    ) -> anyhow::Result<axum::response::Response>;
+    async fn proxy_mgmt_post(
+        &self,
+        mgmt_url: &str,
+        endpoint: &str,
+        body: axum::body::Bytes,
+    ) -> anyhow::Result<axum::response::Response>;
     async fn aggregate_all_pvs(&self) -> Vec<String>;
     /// Java parity (5ebf1e1 + 9b78b21): forward `&limit=N` to peers so a
     /// `?cluster=true&limit=500` against a 100k-PV deployment doesn't
@@ -181,7 +202,12 @@ pub trait ClusterRouter: Send + Sync {
     /// negatively" from "at least one peer was unreachable" so callers
     /// can surface `Appliance Down` for the latter (Java parity c2d9f9e).
     async fn remote_pv_status_detailed(&self, pv: &str) -> RemoteStatusOutcomeDto;
-    async fn proxy_retrieval(&self, peer_retrieval_url: &str, path: &str, query_string: &str) -> anyhow::Result<axum::response::Response>;
+    async fn proxy_retrieval(
+        &self,
+        peer_retrieval_url: &str,
+        path: &str,
+        query_string: &str,
+    ) -> anyhow::Result<axum::response::Response>;
     /// Java parity (26124b6): POST `pvs` to the peer's
     /// `/retrieval/data/getDataAtTime` and return the parsed JSON
     /// response so multi-PV requests can fan out across appliances.

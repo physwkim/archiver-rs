@@ -20,7 +20,10 @@ pub async fn query_data(
     post_processor: Option<Box<dyn PostProcessor>>,
 ) -> anyhow::Result<Box<dyn EventStream>> {
     let streams = storage.get_data(pv, start, end).await?;
-    let prefix = storage.get_last_event_before(pv, start).await.unwrap_or(None);
+    let prefix = storage
+        .get_last_event_before(pv, start)
+        .await
+        .unwrap_or(None);
 
     if streams.is_empty() && prefix.is_none() {
         let desc = EventStreamDesc {
@@ -102,8 +105,12 @@ pub fn parse_post_processor(spec: &str) -> Option<Box<dyn PostProcessor>> {
     }
     use crate::retrieval::postprocessors::{counts, last_sample, statistics};
     match parts[0] {
-        "mean" => Some(Box::new(crate::etl::decimation::MeanDecimation::new(interval))),
-        "firstSample" => Some(Box::new(crate::etl::decimation::FirstSampleDecimation::new(interval))),
+        "mean" => Some(Box::new(crate::etl::decimation::MeanDecimation::new(
+            interval,
+        ))),
+        "firstSample" => Some(Box::new(
+            crate::etl::decimation::FirstSampleDecimation::new(interval),
+        )),
         "max" => Some(Box::new(statistics::MaxPostProcessor::new(interval))),
         "min" => Some(Box::new(statistics::MinPostProcessor::new(interval))),
         "std" => Some(Box::new(statistics::StdPostProcessor::new(interval))),
@@ -112,7 +119,9 @@ pub fn parse_post_processor(spec: &str) -> Option<Box<dyn PostProcessor>> {
         "rms" => Some(Box::new(statistics::RmsPostProcessor::new(interval))),
         "count" => Some(Box::new(counts::CountPostProcessor::new(interval))),
         "ncount" => Some(Box::new(counts::NCountPostProcessor::new(interval))),
-        "lastSample" => Some(Box::new(last_sample::LastSamplePostProcessor::new(interval))),
+        "lastSample" => Some(Box::new(last_sample::LastSamplePostProcessor::new(
+            interval,
+        ))),
         _ => None,
     }
 }

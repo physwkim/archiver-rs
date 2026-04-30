@@ -42,7 +42,12 @@ struct BoundedReader {
 
 impl BoundedReader {
     fn new(inner: PbFileReader, start: SystemTime, end: SystemTime) -> Self {
-        Self { inner, start, end, done: false }
+        Self {
+            inner,
+            start,
+            end,
+            done: false,
+        }
     }
 }
 
@@ -106,19 +111,13 @@ impl PlainPbStoragePlugin {
     /// where pv_key replaces `:` with `/` in the PV name.
     pub fn file_path_for(&self, pv: &str, ts: SystemTime) -> PathBuf {
         let pv_key = pv_name_to_key(pv);
-        let partition_name =
-            crate::storage::partition::partition_name(ts, self.granularity);
+        let partition_name = crate::storage::partition::partition_name(ts, self.granularity);
         let filename = format!("{pv_key}:{partition_name}.pb");
         self.root_folder.join(filename)
     }
 
     /// List all PB files for a PV in a time range.
-    fn list_files_for_range(
-        &self,
-        pv: &str,
-        start: SystemTime,
-        end: SystemTime,
-    ) -> Vec<PathBuf> {
+    fn list_files_for_range(&self, pv: &str, start: SystemTime, end: SystemTime) -> Vec<PathBuf> {
         let partitions =
             crate::storage::partition::partitions_in_range(start, end, self.granularity);
         let pv_key = pv_name_to_key(pv);
@@ -140,13 +139,17 @@ impl PlainPbStoragePlugin {
     fn ensure_parent_dir(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             let needs_create = {
-                let dirs = self.known_dirs.lock()
+                let dirs = self
+                    .known_dirs
+                    .lock()
                     .map_err(|e| anyhow::anyhow!("dir cache poisoned: {e}"))?;
                 !dirs.contains(parent)
             };
             if needs_create {
                 std::fs::create_dir_all(parent)?;
-                let mut dirs = self.known_dirs.lock()
+                let mut dirs = self
+                    .known_dirs
+                    .lock()
                     .map_err(|e| anyhow::anyhow!("dir cache poisoned: {e}"))?;
                 dirs.insert(parent.to_path_buf());
             }
@@ -166,7 +169,9 @@ impl PlainPbStoragePlugin {
         let sample_bytes = writer::encode_sample(dbr_type, sample)?;
         let escaped_sample = codec::escape(&sample_bytes);
 
-        let mut cache = self.write_cache.lock()
+        let mut cache = self
+            .write_cache
+            .lock()
             .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
 
         let path_buf = path.to_path_buf();
@@ -193,7 +198,9 @@ impl PlainPbStoragePlugin {
             // appending samples to a file with no PayloadInfo header,
             // producing a permanently undecodable file.
             let needs_header = !path.exists()
-                || std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false);
+                || std::fs::metadata(path)
+                    .map(|m| m.len() == 0)
+                    .unwrap_or(false);
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -203,7 +210,11 @@ impl PlainPbStoragePlugin {
             if needs_header {
                 let (year, _, _) = sample.decompose_timestamp();
                 let header = writer::build_payload_info(
-                    pv, dbr_type, year, meta.element_count, &meta.headers,
+                    pv,
+                    dbr_type,
+                    year,
+                    meta.element_count,
+                    &meta.headers,
                 );
                 let header_bytes = header.encode_to_vec();
                 let escaped_header = codec::escape(&header_bytes);
@@ -213,7 +224,10 @@ impl PlainPbStoragePlugin {
 
             cache.insert(
                 pv.to_string(),
-                CachedWriter { path: path_buf, writer: bw },
+                CachedWriter {
+                    path: path_buf,
+                    writer: bw,
+                },
             );
         }
 
@@ -249,7 +263,10 @@ pub(crate) fn pv_name_to_key(pv: &str) -> String {
                 sanitized.push('_');
             }
         }
-        tracing::warn!(pv, "PV name rejected by validator; sanitized to {sanitized}");
+        tracing::warn!(
+            pv,
+            "PV name rejected by validator; sanitized to {sanitized}"
+        );
         return sanitized;
     }
     pv.replace(':', "/")
@@ -275,8 +292,7 @@ fn read_last_sample_from_file(path: &Path) -> anyhow::Result<Option<ArchiverSamp
     let header_bytes = codec::unescape(&header_line);
     let payload_info = archiver_proto::epics_event::PayloadInfo::decode(header_bytes.as_slice())?;
     let year = payload_info.year;
-    let dbr_type = ArchDbType::from_i32(payload_info.r#type)
-        .unwrap_or(ArchDbType::ScalarDouble);
+    let dbr_type = ArchDbType::from_i32(payload_info.r#type).unwrap_or(ArchDbType::ScalarDouble);
 
     let header_end = rdr.stream_position()?;
     if header_end >= file_len {
@@ -377,12 +393,9 @@ fn list_pv_pb_files(root: &Path, pv: &str) -> anyhow::Result<Vec<PathBuf>> {
         .map(|e| e.path())
         .filter(|p| {
             p.extension().and_then(|e| e.to_str()) == Some("pb")
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| {
-                        n.starts_with(&file_prefix)
-                            && n[file_prefix.len()..].starts_with(':')
-                    })
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with(&file_prefix) && n[file_prefix.len()..].starts_with(':')
+                })
         })
         .collect();
 
@@ -407,7 +420,8 @@ impl StoragePlugin for PlainPbStoragePlugin {
         sample: &ArchiverSample,
     ) -> anyhow::Result<()> {
         let meta = AppendMeta::default();
-        self.append_event_with_meta(pv, dbr_type, sample, &meta).await
+        self.append_event_with_meta(pv, dbr_type, sample, &meta)
+            .await
     }
 
     async fn append_event_with_meta(
@@ -470,10 +484,7 @@ impl StoragePlugin for PlainPbStoragePlugin {
         Ok(streams)
     }
 
-    async fn get_last_known_event(
-        &self,
-        pv: &str,
-    ) -> anyhow::Result<Option<ArchiverSample>> {
+    async fn get_last_known_event(&self, pv: &str) -> anyhow::Result<Option<ArchiverSample>> {
         // Flush cached writes so readers can see the latest data.
         self.flush_writes().await?;
 
@@ -530,7 +541,9 @@ impl StoragePlugin for PlainPbStoragePlugin {
     async fn delete_pv_data(&self, pv: &str) -> anyhow::Result<u64> {
         // Evict the cached writer for this PV before deleting files.
         {
-            let mut cache = self.write_cache.lock()
+            let mut cache = self
+                .write_cache
+                .lock()
                 .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
             if let Some(mut cached) = cache.remove(pv) {
                 let _ = cached.writer.flush();
@@ -559,7 +572,9 @@ impl StoragePlugin for PlainPbStoragePlugin {
     }
 
     async fn flush_writes(&self) -> anyhow::Result<()> {
-        let mut cache = self.write_cache.lock()
+        let mut cache = self
+            .write_cache
+            .lock()
             .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
         let mut to_remove = Vec::new();
         for (pv, cached) in cache.iter_mut() {
@@ -610,7 +625,9 @@ impl StoragePlugin for PlainPbStoragePlugin {
         // Evict any cached writers for the source PV so they don't keep an
         // open handle on a soon-to-be-renamed file.
         {
-            let mut cache = self.write_cache.lock()
+            let mut cache = self
+                .write_cache
+                .lock()
                 .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
             if let Some(mut cached) = cache.remove(from) {
                 let _ = cached.writer.flush();
@@ -649,7 +666,9 @@ impl StoragePlugin for PlainPbStoragePlugin {
             let suffix = file_name
                 .strip_prefix(&from_leaf)
                 .and_then(|s| s.strip_prefix(':'))
-                .ok_or_else(|| anyhow::anyhow!("filename {file_name} did not match expected PV leaf"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("filename {file_name} did not match expected PV leaf")
+                })?;
             let new_name = format!("{to_leaf}:{suffix}");
             let dst = to_dir.join(new_name);
             std::fs::rename(src, &dst)?;

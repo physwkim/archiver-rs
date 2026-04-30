@@ -33,9 +33,9 @@ use serde::Deserialize;
 
 use archiver_core::registry::PvStatus;
 
-use crate::dto::mgmt::{parse_sample_mode, MatchingPvsParams, PvNameParam};
-use crate::errors::ApiError;
 use crate::AppState;
+use crate::dto::mgmt::{MatchingPvsParams, PvNameParam, parse_sample_mode};
+use crate::errors::ApiError;
 
 // ─── AppendAndAliasPV ─────────────────────────────────────────────────
 
@@ -83,8 +83,7 @@ pub async fn append_and_alias_pv(
             // "archive started, alias failed, rollback also failed" state
             // that needs a human to either delete the channel or manually
             // add the alias.
-            metrics::counter!("archiver_dangling_archive_after_alias_failure")
-                .increment(1);
+            metrics::counter!("archiver_dangling_archive_after_alias_failure").increment(1);
             let appliance = state
                 .cluster
                 .as_ref()
@@ -163,11 +162,7 @@ pub async fn change_type_for_pv(
     if q.pv.is_empty() {
         return ApiError::BadRequest("pv is required".to_string()).into_response();
     }
-    let qs = format!(
-        "pv={}&newtype={}",
-        urlencoding::encode(&q.pv),
-        q.newtype
-    );
+    let qs = format!("pv={}&newtype={}", urlencoding::encode(&q.pv), q.newtype);
     if let Some(resp) =
         super::try_mgmt_dispatch(&state, &q.pv, "changeTypeForPV", &qs, &headers).await
     {
@@ -245,10 +240,8 @@ pub async fn reassign_appliance(
     let cluster = match state.cluster.as_ref() {
         Some(c) => c,
         None => {
-            return ApiError::BadRequest(
-                "reassignAppliance requires cluster mode".to_string(),
-            )
-            .into_response();
+            return ApiError::BadRequest("reassignAppliance requires cluster mode".to_string())
+                .into_response();
         }
     };
     let identity = cluster.identity_name();
@@ -444,8 +437,7 @@ pub async fn receive_pv_migration(
 ) -> Response {
     if headers.get("X-Archiver-Proxied").is_none() {
         return ApiError::BadRequest(
-            "receivePVMigration is cluster-internal; missing X-Archiver-Proxied"
-                .to_string(),
+            "receivePVMigration is cluster-internal; missing X-Archiver-Proxied".to_string(),
         )
         .into_response();
     }
@@ -523,17 +515,13 @@ pub async fn receive_pv_migration(
     for s in samples {
         let secs_i = s["secs"].as_i64().unwrap_or(0);
         if secs_i < 0 {
-            return ApiError::BadRequest(format!(
-                "sample has negative secs: {secs_i}"
-            ))
-            .into_response();
+            return ApiError::BadRequest(format!("sample has negative secs: {secs_i}"))
+                .into_response();
         }
         let nanos_i = s["nanos"].as_i64().unwrap_or(0);
         if !(0..1_000_000_000).contains(&nanos_i) {
-            return ApiError::BadRequest(format!(
-                "sample nanos out of range [0, 1e9): {nanos_i}"
-            ))
-            .into_response();
+            return ApiError::BadRequest(format!("sample nanos out of range [0, 1e9): {nanos_i}"))
+                .into_response();
         }
         let secs = secs_i as u64;
         let nanos = nanos_i as u32;
@@ -593,33 +581,59 @@ fn json_to_archiver_value(
         ArchDbType::ScalarDouble => ArchiverValue::ScalarDouble(v.as_f64()?),
         ArchDbType::ScalarByte => {
             let arr = v.as_array()?;
-            ArchiverValue::ScalarByte(arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
+            ArchiverValue::ScalarByte(
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as u8))
+                    .collect(),
+            )
         }
         ArchDbType::WaveformString => {
             let arr = v.as_array()?;
             ArchiverValue::VectorString(
-                arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect(),
             )
         }
         ArchDbType::WaveformByte => {
             let arr = v.as_array()?;
-            ArchiverValue::VectorChar(arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
+            ArchiverValue::VectorChar(
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as u8))
+                    .collect(),
+            )
         }
         ArchDbType::WaveformShort => {
             let arr = v.as_array()?;
-            ArchiverValue::VectorShort(arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect())
+            ArchiverValue::VectorShort(
+                arr.iter()
+                    .filter_map(|x| x.as_i64().map(|n| n as i32))
+                    .collect(),
+            )
         }
         ArchDbType::WaveformInt => {
             let arr = v.as_array()?;
-            ArchiverValue::VectorInt(arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect())
+            ArchiverValue::VectorInt(
+                arr.iter()
+                    .filter_map(|x| x.as_i64().map(|n| n as i32))
+                    .collect(),
+            )
         }
         ArchDbType::WaveformEnum => {
             let arr = v.as_array()?;
-            ArchiverValue::VectorEnum(arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect())
+            ArchiverValue::VectorEnum(
+                arr.iter()
+                    .filter_map(|x| x.as_i64().map(|n| n as i32))
+                    .collect(),
+            )
         }
         ArchDbType::WaveformFloat => {
             let arr = v.as_array()?;
-            ArchiverValue::VectorFloat(arr.iter().filter_map(|x| x.as_f64().map(|n| n as f32)).collect())
+            ArchiverValue::VectorFloat(
+                arr.iter()
+                    .filter_map(|x| x.as_f64().map(|n| n as f32))
+                    .collect(),
+            )
         }
         ArchDbType::WaveformDouble => {
             let arr = v.as_array()?;
@@ -628,7 +642,9 @@ fn json_to_archiver_value(
         ArchDbType::V4GenericBytes => {
             let arr = v.as_array()?;
             ArchiverValue::V4GenericBytes(
-                arr.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect(),
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as u8))
+                    .collect(),
             )
         }
     })
@@ -636,9 +652,7 @@ fn json_to_archiver_value(
 
 // ─── CleanUpAnyImmortalChannels ───────────────────────────────────────
 
-pub async fn clean_up_any_immortal_channels(
-    State(state): State<AppState>,
-) -> Response {
+pub async fn clean_up_any_immortal_channels(State(state): State<AppState>) -> Response {
     let count = state.archiver_query.get_currently_disconnected_pvs().len();
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -651,9 +665,7 @@ pub async fn clean_up_any_immortal_channels(
 
 // ─── AggregatedApplianceInfo ──────────────────────────────────────────
 
-pub async fn aggregated_appliance_info(
-    State(state): State<AppState>,
-) -> Response {
+pub async fn aggregated_appliance_info(State(state): State<AppState>) -> Response {
     let mut entries: Vec<serde_json::Value> = Vec::new();
     if let Some(ref cluster) = state.cluster {
         let identity = cluster.identity();
@@ -708,7 +720,11 @@ pub async fn pvs_matching_parameter(
     State(state): State<AppState>,
     Query(p): Query<MatchingPvsParams>,
 ) -> Response {
-    let pattern = if p.pv.is_empty() { "*".to_string() } else { p.pv };
+    let pattern = if p.pv.is_empty() {
+        "*".to_string()
+    } else {
+        p.pv
+    };
     match state.pv_query.matching_pvs(&pattern) {
         Ok(pvs) => axum::Json(pvs).into_response(),
         Err(e) => ApiError::internal(e).into_response(),
@@ -756,9 +772,7 @@ pub async fn named_flags_set(Query(p): Query<NamedFlagParam>) -> Response {
 
 // ─── ApplianceMetricsDetails ──────────────────────────────────────────
 
-pub async fn appliance_metrics_details(
-    State(state): State<AppState>,
-) -> Response {
+pub async fn appliance_metrics_details(State(state): State<AppState>) -> Response {
     let summaries = match state.storage.appliance_metrics() {
         Ok(s) => s,
         Err(e) => return ApiError::internal(e).into_response(),
@@ -800,9 +814,7 @@ pub async fn appliance_metrics_details(
 // the relevant counter, returning `[{pvName, count, ...}]` shaped to
 // match the Java archiver's report consumers.
 
-pub async fn dropped_events_buffer_overflow_report(
-    State(state): State<AppState>,
-) -> Response {
+pub async fn dropped_events_buffer_overflow_report(State(state): State<AppState>) -> Response {
     let entries: Vec<serde_json::Value> = state
         .archiver_query
         .all_pv_counters()
@@ -878,9 +890,7 @@ pub async fn lost_connections_report(State(state): State<AppState>) -> Response 
     axum::Json(entries).into_response()
 }
 
-pub async fn creation_time_report_for_appliance(
-    State(state): State<AppState>,
-) -> Response {
+pub async fn creation_time_report_for_appliance(State(state): State<AppState>) -> Response {
     let records = match state.pv_query.all_records() {
         Ok(r) => r,
         Err(e) => return ApiError::internal(e).into_response(),

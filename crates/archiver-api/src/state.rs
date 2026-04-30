@@ -51,10 +51,7 @@ pub struct AppState {
 
 /// Middleware that records HTTP request metrics.
 /// Uses the path (without query string) as a label.
-pub(crate) async fn http_metrics(
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+pub(crate) async fn http_metrics(request: Request<axum::body::Body>, next: Next) -> Response {
     let method = request.method().to_string();
     // Use only the path component, not the query string, to keep label cardinality bounded.
     let path = request.uri().path().to_string();
@@ -132,8 +129,8 @@ pub(crate) async fn api_key_auth(
         "/mgmt/bpl/getLatestMetaDataAction",
         "/mgmt/bpl/pvStatusAction",
     ];
-    let is_read_only_mgmt = request.method() == axum::http::Method::GET
-        && READ_ONLY_MGMT_PATHS.contains(&path);
+    let is_read_only_mgmt =
+        request.method() == axum::http::Method::GET && READ_ONLY_MGMT_PATHS.contains(&path);
 
     if is_exempt || is_read_only_mgmt {
         return next.run(request).await;
@@ -144,11 +141,7 @@ pub(crate) async fn api_key_auth(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .or_else(|| {
-            headers
-                .get("x-api-key")
-                .and_then(|v| v.to_str().ok())
-        });
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
 
     // Cluster-internal requests: accept the cluster api_key, but only when
     // the request carries X-Archiver-Proxied (set by ClusterClient, not forgeable
@@ -156,17 +149,19 @@ pub(crate) async fn api_key_auth(
     let is_proxied = request.headers().get("X-Archiver-Proxied").is_some();
     if is_proxied
         && let Some(ref cluster_key) = state.cluster_api_key
-            && let Some(key) = provided_key
-                && bool::from(cluster_key.as_bytes().ct_eq(key.as_bytes())) {
-                    return next.run(request).await;
-                }
+        && let Some(key) = provided_key
+        && bool::from(cluster_key.as_bytes().ct_eq(key.as_bytes()))
+    {
+        return next.run(request).await;
+    }
 
     // External clients: check against api_keys.
     if let Some(ref keys) = state.api_keys {
         match provided_key {
-            Some(key) if keys.iter().any(|k| {
-                bool::from(k.as_bytes().ct_eq(key.as_bytes()))
-            }) => {}
+            Some(key)
+                if keys
+                    .iter()
+                    .any(|k| bool::from(k.as_bytes().ct_eq(key.as_bytes()))) => {}
             _ => return (StatusCode::UNAUTHORIZED, "Invalid or missing API key").into_response(),
         }
     }

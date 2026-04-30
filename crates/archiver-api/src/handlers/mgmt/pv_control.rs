@@ -5,10 +5,10 @@ use serde::Deserialize;
 
 use archiver_core::registry::SampleMode;
 
+use crate::AppState;
 use crate::dto::mgmt::*;
 use crate::errors::ApiError;
-use crate::pv_input::{parse_pv_list, PvListInput};
-use crate::AppState;
+use crate::pv_input::{PvListInput, parse_pv_list};
 
 use super::{forward_all_peer_batches, route_pvs, try_mgmt_dispatch};
 
@@ -28,11 +28,19 @@ pub async fn archive_pv(
 
     // Try parsing as single PV request first.
     if let Ok(req) = serde_json::from_str::<ArchivePvRequest>(&body_str)
-        && let Some(pv) = req.pv {
-            let pv = archiver_core::registry::normalize_pv_name(&pv).to_string();
-            let sample_mode = parse_sample_mode(req.sampling_method.as_deref(), req.sampling_period);
-            return archive_single_pv(&state, &pv, &sample_mode, req.appliance.as_deref(), &headers).await;
-        }
+        && let Some(pv) = req.pv
+    {
+        let pv = archiver_core::registry::normalize_pv_name(&pv).to_string();
+        let sample_mode = parse_sample_mode(req.sampling_method.as_deref(), req.sampling_period);
+        return archive_single_pv(
+            &state,
+            &pv,
+            &sample_mode,
+            req.appliance.as_deref(),
+            &headers,
+        )
+        .await;
+    }
 
     // Try as JSON array of ArchivePvRequest objects (with per-PV appliance + sampling).
     if let Ok(reqs) = serde_json::from_str::<Vec<ArchivePvRequest>>(&body_str) {
@@ -114,10 +122,7 @@ async fn bulk_archive_requests(
 
         match target {
             Some(peer_name) => {
-                peer_batches
-                    .entry(peer_name)
-                    .or_default()
-                    .push(req);
+                peer_batches.entry(peer_name).or_default().push(req);
             }
             None => local_reqs.push(req),
         }
@@ -185,14 +190,16 @@ async fn bulk_archive_requests(
                 }
             };
             let bytes = axum::body::Bytes::from(json);
-            match cluster.proxy_mgmt_post(&peer.mgmt_url, "archivePV", bytes).await {
+            match cluster
+                .proxy_mgmt_post(&peer.mgmt_url, "archivePV", bytes)
+                .await
+            {
                 Ok(resp) => {
                     let status_code = resp.status();
                     let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
                         .await
                         .unwrap_or_default();
-                    if let Ok(peer_results) =
-                        serde_json::from_slice::<Vec<BulkResult>>(&body_bytes)
+                    if let Ok(peer_results) = serde_json::from_slice::<Vec<BulkResult>>(&body_bytes)
                     {
                         results.extend(peer_results);
                     } else {
@@ -234,9 +241,11 @@ async fn archive_single_pv(
     // Refuse to archive PVs whose name already exists as an alias — the user
     // should archive the target PV directly. (Aliases are added with addAlias
     // after archiving the real PV.)
-    if let Ok(Some(target)) = state.pv_query.canonical_name(pv).map(|c| {
-        if c != pv { Some(c) } else { None }
-    }) {
+    if let Ok(Some(target)) = state
+        .pv_query
+        .canonical_name(pv)
+        .map(|c| if c != pv { Some(c) } else { None })
+    {
         return ApiError::Conflict(format!(
             "'{pv}' is an alias for '{target}'; archive the target PV instead",
         ))
@@ -246,29 +255,38 @@ async fn archive_single_pv(
     if !is_proxied {
         if let Some(target) = appliance
             && let Some(ref cluster) = state.cluster
-                && target != cluster.identity_name() {
-                    if let Some(peer) = cluster.find_peer_by_name(target) {
-                        let mut body = serde_json::json!({ "pv": pv });
-                        if let SampleMode::Scan { period_secs } = sample_mode {
-                            body["sampling_method"] = serde_json::json!("scan");
-                            body["sampling_period"] = serde_json::json!(period_secs);
-                        }
-                        let bytes = axum::body::Bytes::from(body.to_string());
-                        return match cluster.proxy_mgmt_post(&peer.mgmt_url, "archivePV", bytes).await {
-                            Ok(resp) => resp,
-                            Err(e) => ApiError::bad_gateway(e).into_response(),
-                        };
-                    }
-                    return ApiError::NotFound(format!("Appliance '{target}' not found in cluster")).into_response();
+            && target != cluster.identity_name()
+        {
+            if let Some(peer) = cluster.find_peer_by_name(target) {
+                let mut body = serde_json::json!({ "pv": pv });
+                if let SampleMode::Scan { period_secs } = sample_mode {
+                    body["sampling_method"] = serde_json::json!("scan");
+                    body["sampling_period"] = serde_json::json!(period_secs);
                 }
+                let bytes = axum::body::Bytes::from(body.to_string());
+                return match cluster
+                    .proxy_mgmt_post(&peer.mgmt_url, "archivePV", bytes)
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => ApiError::bad_gateway(e).into_response(),
+                };
+            }
+            return ApiError::NotFound(format!("Appliance '{target}' not found in cluster"))
+                .into_response();
+        }
 
         if let Some(ref cluster) = state.cluster
-            && cluster.resolve_peer(pv).await.is_some() {
-                return ApiError::Conflict(format!("PV {pv} is already archived on another appliance")).into_response();
-            }
+            && cluster.resolve_peer(pv).await.is_some()
+        {
+            return ApiError::Conflict(format!("PV {pv} is already archived on another appliance"))
+                .into_response();
+        }
     }
 
-    match crate::usecases::archive_pv::archive_pv(state.archiver_cmd.as_ref(), pv, sample_mode).await {
+    match crate::usecases::archive_pv::archive_pv(state.archiver_cmd.as_ref(), pv, sample_mode)
+        .await
+    {
         Ok(msg) => msg.into_response(),
         Err(e) => e.into_response(),
     }
@@ -291,7 +309,9 @@ pub async fn pause_archiving_pv(
     }
     let canonical = super::resolve_canonical(&state, &params.pv);
     let qs = format!("pv={}", urlencoding::encode(&canonical));
-    if let Some(resp) = try_mgmt_dispatch(&state, &canonical, "pauseArchivingPV", &qs, &headers).await {
+    if let Some(resp) =
+        try_mgmt_dispatch(&state, &canonical, "pauseArchivingPV", &qs, &headers).await
+    {
         return Ok(resp);
     }
     state
@@ -341,11 +361,7 @@ async fn expand_pv_spec(state: &AppState, spec: &str) -> Vec<String> {
 /// the POST bulk handler. Routes through `route_pvs` so peer-owned PVs
 /// in the input are forwarded to their owning appliance instead of
 /// being silently no-op'd locally.
-async fn pause_pvs_bulk(
-    state: &AppState,
-    headers: &HeaderMap,
-    pvs: Vec<String>,
-) -> Response {
+async fn pause_pvs_bulk(state: &AppState, headers: &HeaderMap, pvs: Vec<String>) -> Response {
     let is_proxied = headers.get("X-Archiver-Proxied").is_some();
     let (local_pvs, remote_batches) = super::route_pvs(state, &pvs, is_proxied).await;
     let mut results = Vec::with_capacity(pvs.len());
@@ -374,11 +390,7 @@ async fn pause_pvs_bulk(
     axum::Json(results).into_response()
 }
 
-async fn resume_pvs_bulk(
-    state: &AppState,
-    headers: &HeaderMap,
-    pvs: Vec<String>,
-) -> Response {
+async fn resume_pvs_bulk(state: &AppState, headers: &HeaderMap, pvs: Vec<String>) -> Response {
     let is_proxied = headers.get("X-Archiver-Proxied").is_some();
     let (local_pvs, remote_batches) = super::route_pvs(state, &pvs, is_proxied).await;
     let mut results = Vec::with_capacity(pvs.len());
@@ -428,7 +440,9 @@ pub async fn resume_archiving_pv(
     }
     let canonical = super::resolve_canonical(&state, &params.pv);
     let qs = format!("pv={}", urlencoding::encode(&canonical));
-    if let Some(resp) = try_mgmt_dispatch(&state, &canonical, "resumeArchivingPV", &qs, &headers).await {
+    if let Some(resp) =
+        try_mgmt_dispatch(&state, &canonical, "resumeArchivingPV", &qs, &headers).await
+    {
         return Ok(resp);
     }
     state
@@ -504,9 +518,8 @@ pub async fn bulk_delete_pv(
     let mut results = Vec::with_capacity(pvs.len());
 
     if let Some(ref cluster) = state.cluster {
-        results.extend(
-            forward_all_peer_batches(cluster.as_ref(), remote_batches, "deletePV").await,
-        );
+        results
+            .extend(forward_all_peer_batches(cluster.as_ref(), remote_batches, "deletePV").await);
     }
 
     for pv in &local_pvs {
@@ -556,13 +569,18 @@ pub async fn change_archival_parameters(
     if let Some(ref method) = params.samplingmethod {
         qs.push_str(&format!("&samplingmethod={method}"));
     }
-    if let Some(resp) = try_mgmt_dispatch(&state, &canonical, "changeArchivalParameters", &qs, &headers).await {
+    if let Some(resp) = try_mgmt_dispatch(
+        &state,
+        &canonical,
+        "changeArchivalParameters",
+        &qs,
+        &headers,
+    )
+    .await
+    {
         return Ok(resp);
     }
-    let new_mode = parse_sample_mode(
-        params.samplingmethod.as_deref(),
-        params.samplingperiod,
-    );
+    let new_mode = parse_sample_mode(params.samplingmethod.as_deref(), params.samplingperiod);
 
     let msg = crate::usecases::change_parameters::change_parameters(
         state.pv_query.as_ref(),
@@ -585,15 +603,15 @@ pub async fn abort_archiving_pv(
 ) -> Result<impl IntoResponse, ApiError> {
     let canonical = super::resolve_canonical(&state, &params.pv);
     let qs = format!("pv={}", urlencoding::encode(&canonical));
-    if let Some(resp) = try_mgmt_dispatch(&state, &canonical, "abortArchivingPV", &qs, &headers).await {
+    if let Some(resp) =
+        try_mgmt_dispatch(&state, &canonical, "abortArchivingPV", &qs, &headers).await
+    {
         return Ok(resp);
     }
 
-    let msg = crate::usecases::abort_archiving::abort_archiving(
-        state.archiver_cmd.as_ref(),
-        &canonical,
-    )
-    .await?;
+    let msg =
+        crate::usecases::abort_archiving::abort_archiving(state.archiver_cmd.as_ref(), &canonical)
+            .await?;
 
     Ok(msg.into_response())
 }

@@ -5,16 +5,16 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
+use archiver_api::services::impls::{ChannelArchiverControl, RegistryRepository};
+use archiver_api::{AppState, build_router};
+use archiver_core::config::SecurityConfig;
 use archiver_core::registry::{PvRegistry, SampleMode};
 use archiver_core::storage::partition::PartitionGranularity;
-use archiver_core::storage::plainpb::reader::PbFileReader;
 use archiver_core::storage::plainpb::PlainPbStoragePlugin;
+use archiver_core::storage::plainpb::reader::PbFileReader;
 use archiver_core::storage::traits::{EventStream, StoragePlugin};
 use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
 use archiver_engine::channel_manager::ChannelManager;
-use archiver_core::config::SecurityConfig;
-use archiver_api::{build_router, AppState};
-use archiver_api::services::impls::{RegistryRepository, ChannelArchiverControl};
 
 /// Build a test app with sample data pre-populated in storage.
 async fn build_retrieval_app() -> (axum::Router, SystemTime, SystemTime, tempfile::TempDir) {
@@ -27,7 +27,12 @@ async fn build_retrieval_app() -> (axum::Router, SystemTime, SystemTime, tempfil
     let registry = Arc::new(PvRegistry::in_memory().unwrap());
 
     registry
-        .register_pv("SIM:Sine", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "SIM:Sine",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
 
     // Write 20 samples, 1 second apart.
@@ -65,14 +70,16 @@ async fn build_retrieval_app() -> (axum::Router, SystemTime, SystemTime, tempfil
         etl_chain: Vec::new(),
         reassign_appliance_enabled: false,
     };
-    (build_router(state, &SecurityConfig::default()), data_start, data_end, dir)
+    (
+        build_router(state, &SecurityConfig::default()),
+        data_start,
+        data_end,
+        dir,
+    )
 }
 
 fn get_request(uri: &str) -> Request<Body> {
-    Request::builder()
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap()
+    Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
 async fn body_to_bytes(body: Body) -> Vec<u8> {
@@ -171,7 +178,12 @@ async fn test_get_data_csv_basic() {
 
     let resp = app.oneshot(get_request(&uri)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert_eq!(ct, "text/csv");
     let body = body_to_bytes(resp.into_body()).await;
     let text = String::from_utf8(body).unwrap();
@@ -190,7 +202,12 @@ async fn test_get_data_raw_basic() {
 
     let resp = app.oneshot(get_request(&uri)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert_eq!(ct, "application/x-protobuf");
     let body = body_to_bytes(resp.into_body()).await;
     assert!(!body.is_empty());
@@ -219,9 +236,7 @@ async fn test_get_data_json_post_processor() {
     let from = to_rfc3339(start - Duration::from_secs(1));
     let to = to_rfc3339(end + Duration::from_secs(1));
     // Use mean_60 post-processor syntax.
-    let uri = format!(
-        "/retrieval/data/getData.json?pv=mean_60(SIM:Sine)&from={from}&to={to}"
-    );
+    let uri = format!("/retrieval/data/getData.json?pv=mean_60(SIM:Sine)&from={from}&to={to}");
 
     let resp = app.oneshot(get_request(&uri)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -236,13 +251,15 @@ async fn test_get_data_json_post_processor() {
 // --- Binary search / open_seeked tests ---
 
 /// Write a PB file with many samples and return the file path and timestamps.
-async fn write_large_pb_file() -> (tempfile::TempDir, std::path::PathBuf, SystemTime, SystemTime) {
+async fn write_large_pb_file() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    SystemTime,
+    SystemTime,
+) {
     let dir = tempfile::tempdir().unwrap();
-    let storage = PlainPbStoragePlugin::new(
-        "sts",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let storage =
+        PlainPbStoragePlugin::new("sts", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     // Write 100 samples, 1 second apart.
     let base_time = SystemTime::now() - Duration::from_secs(200);
@@ -335,7 +352,10 @@ async fn test_get_data_seeked_correctness() {
     // Query a narrow window: samples 60-70.
     let query_start = base_time + Duration::from_secs(60);
     let query_end = base_time + Duration::from_secs(70);
-    let streams = storage.get_data("SIM:Query", query_start, query_end).await.unwrap();
+    let streams = storage
+        .get_data("SIM:Query", query_start, query_end)
+        .await
+        .unwrap();
 
     let mut samples = Vec::new();
     for mut stream in streams {

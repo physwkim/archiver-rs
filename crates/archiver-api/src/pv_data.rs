@@ -1,20 +1,20 @@
 use std::time::SystemTime;
 
+use axum::Router;
 use axum::extract::{OriginalUri, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
 
-use archiver_core::retrieval::query::{parse_post_processor, TwoWeekRawProcessor};
+use archiver_core::retrieval::query::{TwoWeekRawProcessor, parse_post_processor};
 use archiver_core::storage::traits::EventStream;
 use archiver_core::types::{ArchiverSample, ArchiverValue};
 
-use crate::errors::ApiError;
 use crate::AppState;
+use crate::errors::ApiError;
 
 /// Default time range when no `from` parameter is specified (1 hour).
 const DEFAULT_TIME_RANGE_SECS: u64 = 3600;
@@ -55,7 +55,11 @@ async fn try_cluster_proxy(
     // `redirect=false`) keep the legacy proxy path.
     let prefer_redirect = !redirect_disabled(headers, uri);
     if prefer_redirect {
-        let mut location = format!("{}/{}", resolved.retrieval_url.trim_end_matches('/'), path.trim_start_matches('/'));
+        let mut location = format!(
+            "{}/{}",
+            resolved.retrieval_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        );
         if !qs.is_empty() {
             location.push('?');
             location.push_str(qs);
@@ -67,7 +71,10 @@ async fn try_cluster_proxy(
             .ok();
     }
 
-    match cluster.proxy_retrieval(&resolved.retrieval_url, path, qs).await {
+    match cluster
+        .proxy_retrieval(&resolved.retrieval_url, path, qs)
+        .await
+    {
         Ok(resp) => Some(resp),
         Err(e) => {
             tracing::warn!(pv = pv_name, "Cluster proxy failed: {e}");
@@ -128,11 +135,10 @@ async fn get_data_at_time(
     axum::extract::Query(p): axum::extract::Query<GetDataAtTimeParams>,
     crate::pv_input::PvListInput(pvs): crate::pv_input::PvListInput,
 ) -> Response {
-    let target = p
-        .at
-        .as_deref()
-        .and_then(parse_iso8601)
-        .unwrap_or_else(SystemTime::now);
+    let target =
+        p.at.as_deref()
+            .and_then(parse_iso8601)
+            .unwrap_or_else(SystemTime::now);
 
     let mut out = serde_json::Map::new();
 
@@ -224,7 +230,11 @@ async fn get_data_at_time(
                 // than 30 days (Java fix 7b26bec5 widened to +31d, but
                 // we have a tier-aware backward walk that's unbounded
                 // and cheap enough — STS→MTS→LTS, newest-first).
-                match state.storage.get_last_event_before(&canonical, target).await {
+                match state
+                    .storage
+                    .get_last_event_before(&canonical, target)
+                    .await
+                {
                     Ok(opt) => opt,
                     Err(e) => {
                         tracing::warn!(pv, "get_last_event_before failed: {e}");
@@ -325,11 +335,12 @@ fn parse_iso8601(s: &str) -> Option<SystemTime> {
 /// Parse PV specification: optionally "postprocessor(pvname)" or just "pvname".
 fn parse_pv_spec(spec: &str) -> (String, Option<String>) {
     if let Some(paren_pos) = spec.find('(')
-        && spec.ends_with(')') {
-            let pp = &spec[..paren_pos];
-            let pv = &spec[paren_pos + 1..spec.len() - 1];
-            return (pv.to_string(), Some(pp.to_string()));
-        }
+        && spec.ends_with(')')
+    {
+        let pp = &spec[..paren_pos];
+        let pv = &spec[paren_pos + 1..spec.len() - 1];
+        return (pv.to_string(), Some(pp.to_string()));
+    }
     (spec.to_string(), None)
 }
 
@@ -463,12 +474,13 @@ fn parse_retrieval_params(params: &GetDataParams) -> RetrievalParams {
         .as_deref()
         .and_then(parse_iso8601)
         .unwrap_or(now - std::time::Duration::from_secs(DEFAULT_TIME_RANGE_SECS));
-    let end = params
-        .to
-        .as_deref()
-        .and_then(parse_iso8601)
-        .unwrap_or(now);
-    let limit = Some(params.limit.unwrap_or(MAX_RETRIEVAL_LIMIT).min(MAX_RETRIEVAL_LIMIT));
+    let end = params.to.as_deref().and_then(parse_iso8601).unwrap_or(now);
+    let limit = Some(
+        params
+            .limit
+            .unwrap_or(MAX_RETRIEVAL_LIMIT)
+            .min(MAX_RETRIEVAL_LIMIT),
+    );
     let use_reduced = params
         .usereduced
         .as_deref()
@@ -498,8 +510,15 @@ fn resolve_post_processor(
     rp: &RetrievalParams,
 ) -> Option<Box<dyn archiver_core::storage::traits::PostProcessor>> {
     if let Some(ref spec) = rp.pp_spec {
-        if let Some(num_bins) = spec.strip_prefix("optimized_").and_then(|s| s.parse::<u64>().ok()) {
-            let range_secs = rp.end.duration_since(rp.start).unwrap_or_default().as_secs();
+        if let Some(num_bins) = spec
+            .strip_prefix("optimized_")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            let range_secs = rp
+                .end
+                .duration_since(rp.start)
+                .unwrap_or_default()
+                .as_secs();
             let interval = range_secs.checked_div(num_bins).unwrap_or(1).max(1);
             return Some(Box::new(
                 archiver_core::etl::decimation::MeanDecimation::new(interval),
@@ -512,7 +531,6 @@ fn resolve_post_processor(
     }
     None
 }
-
 
 fn sample_to_json(s: &ArchiverSample) -> JsonSample {
     let dt = DateTime::<Utc>::from(s.timestamp);
@@ -574,7 +592,8 @@ fn drain_stream(
     limit: Option<usize>,
     tx: std::sync::mpsc::Sender<Vec<ArchiverSample>>,
 ) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(RETRIEVAL_DEADLINE_SECS);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(RETRIEVAL_DEADLINE_SECS);
     let mut count = 0usize;
     let mut batch = Vec::with_capacity(DRAIN_BATCH_SIZE);
 
@@ -587,15 +606,21 @@ fn drain_stream(
             count += 1;
 
             if batch.len() >= DRAIN_BATCH_SIZE
-                && tx.send(std::mem::replace(&mut batch, Vec::with_capacity(DRAIN_BATCH_SIZE))).is_err()
+                && tx
+                    .send(std::mem::replace(
+                        &mut batch,
+                        Vec::with_capacity(DRAIN_BATCH_SIZE),
+                    ))
+                    .is_err()
             {
                 return;
             }
 
             if let Some(max) = limit
-                && count >= max {
-                    break;
-                }
+                && count >= max
+            {
+                break;
+            }
         }
         // Check deadline every 10k samples to avoid excessive clock reads.
         if count.is_multiple_of(10_000) && std::time::Instant::now() > deadline {
@@ -619,7 +644,9 @@ async fn get_data_json(
     let mut rp = parse_retrieval_params(&params);
     rp.pv_name = resolve_alias(&state, &rp.pv_name);
 
-    if let Some(resp) = try_cluster_proxy(&state, &rp.pv_name, "data/getData.json", &headers, &uri).await {
+    if let Some(resp) =
+        try_cluster_proxy(&state, &rp.pv_name, "data/getData.json", &headers, &uri).await
+    {
         return resp;
     }
 
@@ -695,9 +722,7 @@ async fn get_data_json(
                     }
                 }
             }
-            if !buf.is_empty()
-                && chunk_tx.send(Ok(buf.clone())).await.is_err()
-            {
+            if !buf.is_empty() && chunk_tx.send(Ok(buf.clone())).await.is_err() {
                 break;
             }
         }
@@ -723,7 +748,9 @@ async fn get_data_csv(
     let mut rp = parse_retrieval_params(&params);
     rp.pv_name = resolve_alias(&state, &rp.pv_name);
 
-    if let Some(resp) = try_cluster_proxy(&state, &rp.pv_name, "data/getData.csv", &headers, &uri).await {
+    if let Some(resp) =
+        try_cluster_proxy(&state, &rp.pv_name, "data/getData.csv", &headers, &uri).await
+    {
         return resp;
     }
 
@@ -760,9 +787,7 @@ async fn get_data_csv(
             for sample in &batch {
                 buf.push_str(&sample_to_csv_row(sample));
             }
-            if !buf.is_empty()
-                && chunk_tx.send(Ok(buf.clone())).await.is_err()
-            {
+            if !buf.is_empty() && chunk_tx.send(Ok(buf.clone())).await.is_err() {
                 break;
             }
         }
@@ -786,7 +811,9 @@ async fn get_data_raw(
     let mut rp = parse_retrieval_params(&params);
     rp.pv_name = resolve_alias(&state, &rp.pv_name);
 
-    if let Some(resp) = try_cluster_proxy(&state, &rp.pv_name, "data/getData.raw", &headers, &uri).await {
+    if let Some(resp) =
+        try_cluster_proxy(&state, &rp.pv_name, "data/getData.raw", &headers, &uri).await
+    {
         return resp;
     }
 
@@ -810,8 +837,8 @@ async fn get_data_raw(
     // request → response.
     let response_pv_name = rp.requested_name.clone();
     tokio::task::spawn_blocking(move || {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(RETRIEVAL_DEADLINE_SECS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(RETRIEVAL_DEADLINE_SECS);
         let mut count = 0usize;
         for mut stream in streams {
             let desc = stream.description().clone();
@@ -852,21 +879,25 @@ async fn get_data_raw(
                     break;
                 }
                 if sample.timestamp >= start
-                    && let Ok(sample_bytes) =
-                        archiver_core::storage::plainpb::writer::encode_sample(desc.db_type, &sample)
-                    {
-                        let mut escaped =
-                            archiver_core::storage::plainpb::codec::escape(&sample_bytes);
-                        escaped.push(archiver_core::storage::plainpb::codec::NEWLINE);
-                        if chunk_tx.blocking_send(Ok(escaped)).is_err() {
-                            return;
-                        }
-                        count += 1;
+                    && let Ok(sample_bytes) = archiver_core::storage::plainpb::writer::encode_sample(
+                        desc.db_type,
+                        &sample,
+                    )
+                {
+                    let mut escaped = archiver_core::storage::plainpb::codec::escape(&sample_bytes);
+                    escaped.push(archiver_core::storage::plainpb::codec::NEWLINE);
+                    if chunk_tx.blocking_send(Ok(escaped)).is_err() {
+                        return;
                     }
+                    count += 1;
+                }
                 // Bound total wall-clock time so a slow/stalled client cannot
                 // tie up a blocking worker indefinitely.
                 if count.is_multiple_of(10_000) && std::time::Instant::now() > deadline {
-                    tracing::warn!(count, "Raw retrieval deadline exceeded, truncating response");
+                    tracing::warn!(
+                        count,
+                        "Raw retrieval deadline exceeded, truncating response"
+                    );
                     return;
                 }
             }

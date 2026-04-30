@@ -160,7 +160,11 @@ impl ArchiverSample {
     }
 
     /// Reconstruct a SystemTime from year + seconds_into_year + nanos.
-    pub fn timestamp_from_epoch_parts(year: i32, seconds_into_year: u32, nanos: u32) -> Option<SystemTime> {
+    pub fn timestamp_from_epoch_parts(
+        year: i32,
+        seconds_into_year: u32,
+        nanos: u32,
+    ) -> Option<SystemTime> {
         let year_start = chrono::NaiveDate::from_ymd_opt(year, 1, 1)?
             .and_hms_opt(0, 0, 0)?
             .and_utc();
@@ -174,8 +178,7 @@ impl ArchiverSample {
     pub fn from_unix_timestamp(epoch_secs: f64, value: ArchiverValue) -> Self {
         let secs = epoch_secs as u64;
         let nanos = ((epoch_secs - secs as f64) * 1e9) as u32;
-        let ts = SystemTime::UNIX_EPOCH
-            + std::time::Duration::new(secs, nanos);
+        let ts = SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
         Self::new(ts, value)
     }
 }

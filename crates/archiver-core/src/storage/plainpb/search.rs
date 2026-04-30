@@ -16,10 +16,7 @@ use super::reader::decode_sample;
 ///
 /// Returns the byte offset into the file where the matching line starts,
 /// or None if all samples are before the target time.
-pub fn binary_search_pb_file(
-    path: &Path,
-    target: SystemTime,
-) -> anyhow::Result<Option<u64>> {
+pub fn binary_search_pb_file(path: &Path, target: SystemTime) -> anyhow::Result<Option<u64>> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut reader = BufReader::new(file);
@@ -33,8 +30,7 @@ pub fn binary_search_pb_file(
     let header_bytes = codec::unescape(&header_line);
     let payload_info = PayloadInfo::decode(header_bytes.as_slice())?;
     let year = payload_info.year;
-    let dbr_type = ArchDbType::from_i32(payload_info.r#type)
-        .unwrap_or(ArchDbType::ScalarDouble);
+    let dbr_type = ArchDbType::from_i32(payload_info.r#type).unwrap_or(ArchDbType::ScalarDouble);
 
     let data_start = reader.stream_position()?;
 

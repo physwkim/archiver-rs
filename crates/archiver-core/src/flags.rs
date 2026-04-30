@@ -21,17 +21,12 @@ fn store() -> &'static DashMap<String, bool> {
 
 /// Set a named flag. Returns the previous value, or `false` if unset.
 pub fn set(name: &str, value: bool) -> bool {
-    store()
-        .insert(name.to_string(), value)
-        .unwrap_or(false)
+    store().insert(name.to_string(), value).unwrap_or(false)
 }
 
 /// Get a named flag. Returns `false` if the flag is unset.
 pub fn get(name: &str) -> bool {
-    store()
-        .get(name)
-        .map(|e| *e.value())
-        .unwrap_or(false)
+    store().get(name).map(|e| *e.value()).unwrap_or(false)
 }
 
 /// Snapshot of all flags as `(name, value)` pairs, sorted by name.

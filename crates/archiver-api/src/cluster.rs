@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -84,7 +84,11 @@ impl ClusterClient {
 
     /// Apply the appropriate outbound credential. Uses the per-peer key if one
     /// is configured for `peer_url`, otherwise falls back to the cluster-level key.
-    fn apply_auth(&self, builder: reqwest::RequestBuilder, peer_url: &str) -> reqwest::RequestBuilder {
+    fn apply_auth(
+        &self,
+        builder: reqwest::RequestBuilder,
+        peer_url: &str,
+    ) -> reqwest::RequestBuilder {
         let key = self.peer_keys.get(peer_url).or(self.api_key.as_ref());
         if let Some(key) = key {
             builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
@@ -207,9 +211,10 @@ impl ClusterClient {
 
         // Forward content-type header.
         if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE)
-            && let Ok(ct_str) = ct.to_str() {
-                builder = builder.header(axum::http::header::CONTENT_TYPE, ct_str);
-            }
+            && let Ok(ct_str) = ct.to_str()
+        {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, ct_str);
+        }
 
         // Stream the body.
         let stream = resp.bytes_stream();
@@ -244,9 +249,10 @@ impl ClusterClient {
 
         let mut builder = axum::http::Response::builder().status(status);
         if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE)
-            && let Ok(ct_str) = ct.to_str() {
-                builder = builder.header(axum::http::header::CONTENT_TYPE, ct_str);
-            }
+            && let Ok(ct_str) = ct.to_str()
+        {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, ct_str);
+        }
 
         let stream = resp.bytes_stream();
         let body = axum::body::Body::from_stream(stream);
@@ -278,9 +284,10 @@ impl ClusterClient {
 
         let mut builder = axum::http::Response::builder().status(status);
         if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE)
-            && let Ok(ct_str) = ct.to_str() {
-                builder = builder.header(axum::http::header::CONTENT_TYPE, ct_str);
-            }
+            && let Ok(ct_str) = ct.to_str()
+        {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, ct_str);
+        }
 
         let stream = resp.bytes_stream();
         let body = axum::body::Body::from_stream(stream);
@@ -574,10 +581,7 @@ impl ClusterClient {
 /// Unlike `resp.bytes()`, this never fully buffers a body that would
 /// blow past the cap — the chunk loop drops accumulated bytes and
 /// returns an error on the chunk that crosses the threshold.
-async fn read_capped_body(
-    resp: reqwest::Response,
-    cap: usize,
-) -> anyhow::Result<Vec<u8>> {
+async fn read_capped_body(resp: reqwest::Response, cap: usize) -> anyhow::Result<Vec<u8>> {
     use futures::StreamExt;
     let mut acc = Vec::with_capacity(8 * 1024);
     let mut stream = resp.bytes_stream();
@@ -709,6 +713,7 @@ mod tests {
                 api_key: None,
             }],
             api_key: None,
+            reassign_appliance_enabled: false,
         }
     }
 

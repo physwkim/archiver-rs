@@ -5,14 +5,14 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
+use archiver_api::services::impls::{ChannelArchiverControl, RegistryRepository};
+use archiver_api::{AppState, build_router};
+use archiver_core::config::SecurityConfig;
 use archiver_core::registry::{PvRegistry, PvStatus, SampleMode};
 use archiver_core::storage::partition::PartitionGranularity;
 use archiver_core::storage::plainpb::PlainPbStoragePlugin;
 use archiver_core::storage::traits::StoragePlugin as _;
 use archiver_engine::channel_manager::ChannelManager;
-use archiver_core::config::SecurityConfig;
-use archiver_api::{build_router, AppState};
-use archiver_api::services::impls::{ChannelArchiverControl, RegistryRepository};
 
 async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -58,13 +58,28 @@ async fn build_test_app_with_pvs() -> (axum::Router, Arc<PvRegistry>, tempfile::
 
     // Register test PVs.
     registry
-        .register_pv("SIM:Sine", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "SIM:Sine",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     registry
-        .register_pv("SIM:Cosine", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "SIM:Cosine",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     registry
-        .register_pv("TEST:Counter", archiver_core::types::ArchDbType::ScalarInt, &SampleMode::Scan { period_secs: 1.0 }, 1)
+        .register_pv(
+            "TEST:Counter",
+            archiver_core::types::ArchDbType::ScalarInt,
+            &SampleMode::Scan { period_secs: 1.0 },
+            1,
+        )
         .unwrap();
 
     let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
@@ -89,14 +104,15 @@ async fn build_test_app_with_pvs() -> (axum::Router, Arc<PvRegistry>, tempfile::
         etl_chain: Vec::new(),
         reassign_appliance_enabled: false,
     };
-    (build_router(state, &SecurityConfig::default()), registry, dir)
+    (
+        build_router(state, &SecurityConfig::default()),
+        registry,
+        dir,
+    )
 }
 
 fn get_request(uri: &str) -> Request<Body> {
-    Request::builder()
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap()
+    Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
 async fn body_to_bytes(body: Body) -> Vec<u8> {
@@ -114,7 +130,10 @@ async fn body_to_json(body: Body) -> serde_json::Value {
 #[tokio::test]
 async fn test_get_all_pvs_empty() {
     let (app, _dir) = build_test_app().await;
-    let resp = app.oneshot(get_request("/mgmt/bpl/getAllPVs")).await.unwrap();
+    let resp = app
+        .oneshot(get_request("/mgmt/bpl/getAllPVs"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_to_json(resp.into_body()).await;
     assert_eq!(json, serde_json::json!([]));
@@ -123,7 +142,10 @@ async fn test_get_all_pvs_empty() {
 #[tokio::test]
 async fn test_get_all_pvs_with_data() {
     let (app, _reg, _dir) = build_test_app_with_pvs().await;
-    let resp = app.oneshot(get_request("/mgmt/bpl/getAllPVs")).await.unwrap();
+    let resp = app
+        .oneshot(get_request("/mgmt/bpl/getAllPVs"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_to_json(resp.into_body()).await;
     let pvs = json.as_array().unwrap();
@@ -375,7 +397,8 @@ async fn test_get_pv_details() {
 async fn test_abort_archiving_pv() {
     let (app, reg, _dir) = build_test_app_with_pvs().await;
     // Pause first, then abort.
-    reg.set_status("TEST:Counter", archiver_core::registry::PvStatus::Paused).unwrap();
+    reg.set_status("TEST:Counter", archiver_core::registry::PvStatus::Paused)
+        .unwrap();
 
     let resp = app
         .oneshot(get_request("/mgmt/bpl/abortArchivingPV?pv=TEST:Counter"))
@@ -383,7 +406,10 @@ async fn test_abort_archiving_pv() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     // PV should remain in registry with Inactive status after abort.
-    let record = reg.get_pv("TEST:Counter").unwrap().expect("PV should still exist");
+    let record = reg
+        .get_pv("TEST:Counter")
+        .unwrap()
+        .expect("PV should still exist");
     assert_eq!(record.status, archiver_core::registry::PvStatus::Inactive);
 }
 
@@ -411,7 +437,8 @@ async fn test_export_import_roundtrip() {
     let (app, reg, _dir) = build_test_app_with_pvs().await;
 
     // Update metadata for one PV.
-    reg.update_metadata("SIM:Sine", Some("3"), Some("mm")).unwrap();
+    reg.update_metadata("SIM:Sine", Some("3"), Some("mm"))
+        .unwrap();
     // Pause one PV to test status preservation.
     reg.set_status("SIM:Cosine", PvStatus::Paused).unwrap();
 
@@ -427,12 +454,18 @@ async fn test_export_import_roundtrip() {
     assert_eq!(export_arr.len(), 3);
 
     // Find the SIM:Sine record to verify metadata was exported.
-    let sine = export_arr.iter().find(|r| r["pvName"] == "SIM:Sine").unwrap();
+    let sine = export_arr
+        .iter()
+        .find(|r| r["pvName"] == "SIM:Sine")
+        .unwrap();
     assert_eq!(sine["PREC"], "3");
     assert_eq!(sine["EGU"], "mm");
 
     // Verify status and created_at are exported.
-    let cosine = export_arr.iter().find(|r| r["pvName"] == "SIM:Cosine").unwrap();
+    let cosine = export_arr
+        .iter()
+        .find(|r| r["pvName"] == "SIM:Cosine")
+        .unwrap();
     assert_eq!(cosine["status"], "paused");
     assert!(cosine["createdAt"].is_string());
 
@@ -519,10 +552,16 @@ async fn test_export_import_preserves_status() {
     assert_eq!(record.status, PvStatus::Active);
 
     // Verify created_at is preserved (should match original, not import time).
-    let orig_sine = export_arr.iter().find(|r| r["pvName"] == "SIM:Sine").unwrap();
+    let orig_sine = export_arr
+        .iter()
+        .find(|r| r["pvName"] == "SIM:Sine")
+        .unwrap();
     let orig_created = orig_sine["createdAt"].as_str().unwrap();
     let imported_created = record.created_at.to_rfc3339();
-    assert_eq!(orig_created, imported_created, "created_at should be preserved across export/import");
+    assert_eq!(
+        orig_created, imported_created,
+        "created_at should be preserved across export/import"
+    );
 }
 
 #[tokio::test]
@@ -548,7 +587,12 @@ async fn build_test_app_with_auth() -> (axum::Router, tempfile::TempDir) {
     ));
     let registry = Arc::new(PvRegistry::in_memory().unwrap());
     registry
-        .register_pv("SIM:Sine", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "SIM:Sine",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
         .await
@@ -635,8 +679,13 @@ async fn test_auth_rejects_invalid_key() {
 #[tokio::test]
 async fn test_metadata_prec_egu_in_registry() {
     let reg = PvRegistry::in_memory().unwrap();
-    reg.register_pv("TEST:Meta", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
-        .unwrap();
+    reg.register_pv(
+        "TEST:Meta",
+        archiver_core::types::ArchDbType::ScalarDouble,
+        &SampleMode::Monitor,
+        1,
+    )
+    .unwrap();
 
     // Initially null.
     let r = reg.get_pv("TEST:Meta").unwrap().unwrap();
@@ -644,7 +693,8 @@ async fn test_metadata_prec_egu_in_registry() {
     assert!(r.egu.is_none());
 
     // Update metadata.
-    reg.update_metadata("TEST:Meta", Some("5"), Some("keV")).unwrap();
+    reg.update_metadata("TEST:Meta", Some("5"), Some("keV"))
+        .unwrap();
 
     let r = reg.get_pv("TEST:Meta").unwrap().unwrap();
     assert_eq!(r.prec.as_deref(), Some("5"));
@@ -654,17 +704,24 @@ async fn test_metadata_prec_egu_in_registry() {
 #[tokio::test]
 async fn test_metadata_partial_update() {
     let reg = PvRegistry::in_memory().unwrap();
-    reg.register_pv("TEST:Partial", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
-        .unwrap();
+    reg.register_pv(
+        "TEST:Partial",
+        archiver_core::types::ArchDbType::ScalarDouble,
+        &SampleMode::Monitor,
+        1,
+    )
+    .unwrap();
 
     // Update only EGU.
-    reg.update_metadata("TEST:Partial", None, Some("mm")).unwrap();
+    reg.update_metadata("TEST:Partial", None, Some("mm"))
+        .unwrap();
     let r = reg.get_pv("TEST:Partial").unwrap().unwrap();
     assert!(r.prec.is_none());
     assert_eq!(r.egu.as_deref(), Some("mm"));
 
     // Update only PREC — EGU should be preserved.
-    reg.update_metadata("TEST:Partial", Some("2"), None).unwrap();
+    reg.update_metadata("TEST:Partial", Some("2"), None)
+        .unwrap();
     let r = reg.get_pv("TEST:Partial").unwrap().unwrap();
     assert_eq!(r.prec.as_deref(), Some("2"));
     assert_eq!(r.egu.as_deref(), Some("mm"));
@@ -730,8 +787,14 @@ async fn test_rate_limiter_blocks_excess_requests() {
     }
 
     // With burst=2, at most 2 requests should succeed.
-    assert!(ok_count <= 2, "Expected at most 2 OK responses, got {ok_count}");
-    assert!(throttled_count >= 3, "Expected at least 3 throttled responses, got {throttled_count}");
+    assert!(
+        ok_count <= 2,
+        "Expected at most 2 OK responses, got {ok_count}"
+    );
+    assert!(
+        throttled_count >= 3,
+        "Expected at least 3 throttled responses, got {throttled_count}"
+    );
 }
 
 #[tokio::test]
@@ -840,7 +903,10 @@ async fn test_remove_alias() {
     let (app, _reg, _dir) = build_test_app_with_pvs().await;
 
     let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Cosine&aliasname=DEV:Cos");
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     let req = get_request("/mgmt/bpl/removeAlias?pv=SIM:Cosine&aliasname=DEV:Cos");
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -860,7 +926,10 @@ async fn test_get_pv_status_resolves_alias() {
     let (app, _reg, _dir) = build_test_app_with_pvs().await;
 
     let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Foo");
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     // Querying the alias returns the target's status, but the response
     // echoes the user-supplied alias name (Java parity, F-12) so clients
@@ -878,7 +947,10 @@ async fn test_archive_pv_rejects_alias_name() {
     let (app, _reg, _dir) = build_test_app_with_pvs().await;
 
     let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Bar");
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     // POST archivePV with the alias name should be rejected.
     let body = serde_json::json!({"pv": "DEV:Bar"}).to_string();
@@ -896,7 +968,10 @@ async fn test_archive_pv_rejects_alias_name() {
 async fn test_get_pv_type_info_keys_includes_aliases() {
     let (app, _reg, _dir) = build_test_app_with_pvs().await;
     let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Foo");
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     let req = get_request("/mgmt/bpl/getPVTypeInfoKeys");
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -992,7 +1067,10 @@ async fn test_get_stores_for_pv() {
 async fn test_get_stores_for_pv_resolves_alias() {
     let (app, _reg, _dir) = build_test_app_with_pvs().await;
     let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Foo");
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     let req = get_request("/mgmt/bpl/getStoresForPV?pv=DEV:Foo");
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1016,7 +1094,10 @@ async fn test_rename_pv_after_pause_creates_destination() {
 
     // Pause source.
     let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=SIM:Cosine");
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     let req = get_request("/mgmt/bpl/renamePV?pv=SIM:Cosine&newname=SIM:CosineRenamed");
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1046,7 +1127,10 @@ async fn test_modify_meta_fields_requires_pause() {
 async fn test_modify_meta_fields_add_remove_clear() {
     let (app, registry, _dir) = build_test_app_with_pvs().await;
     let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=SIM:Sine");
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     // Add HIHI, LOLO.
     let req = get_request("/mgmt/bpl/modifyMetaFields?pv=SIM:Sine&command=add,HIHI,LOLO");
@@ -1062,9 +1146,8 @@ async fn test_modify_meta_fields_add_remove_clear() {
     );
 
     // Remove LOLO, add EGU in one call (multiple `command=`).
-    let req = get_request(
-        "/mgmt/bpl/modifyMetaFields?pv=SIM:Sine&command=remove,LOLO&command=add,EGU",
-    );
+    let req =
+        get_request("/mgmt/bpl/modifyMetaFields?pv=SIM:Sine&command=remove,LOLO&command=add,EGU");
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_to_json(resp.into_body()).await;
@@ -1086,7 +1169,10 @@ async fn test_modify_meta_fields_add_remove_clear() {
 async fn test_modify_meta_fields_invalid_verb() {
     let (app, _reg, _dir) = build_test_app_with_pvs().await;
     let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=SIM:Sine");
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     let req = get_request("/mgmt/bpl/modifyMetaFields?pv=SIM:Sine&command=xyz,HIHI");
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1151,7 +1237,10 @@ async fn test_pause_resume_via_alias_targets_real_pv() {
 
     // Create alias DEV:Foo -> SIM:Sine.
     let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Foo");
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     // Pause via alias name.
     let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=DEV:Foo");
@@ -1184,7 +1273,10 @@ async fn test_alias_excluded_from_count_and_status_queries() {
 
     // Add an alias — count must stay 3 (not 4).
     let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Foo");
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
     let req = get_request("/mgmt/bpl/getPVCount");
     let resp = app.clone().oneshot(req).await.unwrap();
     let body = body_to_json(resp.into_body()).await;
@@ -1204,12 +1296,12 @@ async fn test_alias_excluded_from_count_and_status_queries() {
 
 #[tokio::test]
 async fn test_restore_from_registry_skips_aliases() {
-    use std::sync::Arc;
     use archiver_core::registry::{PvRegistry, PvStatus, SampleMode};
     use archiver_core::storage::partition::PartitionGranularity;
     use archiver_core::storage::plainpb::PlainPbStoragePlugin;
     use archiver_core::types::ArchDbType;
     use archiver_engine::channel_manager::ChannelManager;
+    use std::sync::Arc;
 
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(PlainPbStoragePlugin::new(
@@ -1218,7 +1310,9 @@ async fn test_restore_from_registry_skips_aliases() {
         PartitionGranularity::Hour,
     ));
     let registry = Arc::new(PvRegistry::in_memory().unwrap());
-    registry.register_pv("REAL:PV", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1).unwrap();
+    registry
+        .register_pv("REAL:PV", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
     registry.add_alias("ALIAS:PV", "REAL:PV").unwrap();
 
     // Sanity: alias has 'alias' status.
@@ -1278,15 +1372,13 @@ async fn test_consolidate_forwards_to_peer_for_remote_pv() {
         mgmt_url: "http://app1/mgmt/bpl".to_string(),
         retrieval_url: "http://app1/retrieval".to_string(),
     }];
-    let cluster = Arc::new(
-        FakeClusterRouter::new(identity, peers).with_pv_routing(
-            "REMOTE:PV",
-            ResolvedPeerDto {
-                mgmt_url: "http://app1/mgmt/bpl".to_string(),
-                retrieval_url: "http://app1/retrieval".to_string(),
-            },
-        ),
-    );
+    let cluster = Arc::new(FakeClusterRouter::new(identity, peers).with_pv_routing(
+        "REMOTE:PV",
+        ResolvedPeerDto {
+            mgmt_url: "http://app1/mgmt/bpl".to_string(),
+            retrieval_url: "http://app1/retrieval".to_string(),
+        },
+    ));
 
     let state = archiver_api::AppState {
         storage,
@@ -1486,7 +1578,10 @@ async fn test_p2_change_type_for_pv_requires_pause() {
 
     // Pause then change → ok.
     let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=SIM:Sine");
-    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
     let req = get_request("/mgmt/bpl/changeTypeForPV?pv=SIM:Sine&newtype=2");
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1529,29 +1624,37 @@ async fn test_d_consolidate_pv_actually_moves_files() {
     // Write a sample to STS so consolidate has something to move.
     let now = std::time::SystemTime::now();
     let sample = ArchiverSample::new(now, ArchiverValue::ScalarDouble(1.0));
-    sts.append_event_with_meta("PV:Move", ArchDbType::ScalarDouble, &sample, &AppendMeta::default())
-        .await
-        .unwrap();
+    sts.append_event_with_meta(
+        "PV:Move",
+        ArchDbType::ScalarDouble,
+        &sample,
+        &AppendMeta::default(),
+    )
+    .await
+    .unwrap();
     sts.flush_writes().await.unwrap();
 
-    let executor = archiver_core::etl::executor::EtlExecutor::new(
-        sts.clone(),
-        mts.clone(),
-        3600,
-        5,
-        3,
-    );
+    let executor =
+        archiver_core::etl::executor::EtlExecutor::new(sts.clone(), mts.clone(), 3600, 5, 3);
     let moved = executor.consolidate_pv("PV:Move").await.unwrap();
     assert_eq!(moved, 1);
 
     // STS empty, MTS has the sample.
     let sts_streams = sts
-        .get_data("PV:Move", now - std::time::Duration::from_secs(60), now + std::time::Duration::from_secs(60))
+        .get_data(
+            "PV:Move",
+            now - std::time::Duration::from_secs(60),
+            now + std::time::Duration::from_secs(60),
+        )
         .await
         .unwrap();
     assert!(sts_streams.is_empty());
     let mts_streams = mts
-        .get_data("PV:Move", now - std::time::Duration::from_secs(60), now + std::time::Duration::from_secs(60))
+        .get_data(
+            "PV:Move",
+            now - std::time::Duration::from_secs(60),
+            now + std::time::Duration::from_secs(60),
+        )
         .await
         .unwrap();
     assert_eq!(mts_streams.len(), 1);
@@ -1577,9 +1680,17 @@ async fn test_d_get_data_at_time_stage_2_walkback() {
     // Two samples: t=10 and t=100.
     let base = std::time::SystemTime::now() - std::time::Duration::from_secs(200);
     for (offset, val) in [(10u64, 1.0), (100u64, 2.0)] {
-        let s = ArchiverSample::new(base + std::time::Duration::from_secs(offset), ArchiverValue::ScalarDouble(val));
+        let s = ArchiverSample::new(
+            base + std::time::Duration::from_secs(offset),
+            ArchiverValue::ScalarDouble(val),
+        );
         storage
-            .append_event_with_meta("PV:Walk", ArchDbType::ScalarDouble, &s, &AppendMeta::default())
+            .append_event_with_meta(
+                "PV:Walk",
+                ArchDbType::ScalarDouble,
+                &s,
+                &AppendMeta::default(),
+            )
             .await
             .unwrap();
     }
@@ -1615,7 +1726,10 @@ async fn test_d_get_data_at_time_stage_2_walkback() {
     let body = serde_json::json!(["PV:Walk"]).to_string();
     let req = Request::builder()
         .method("POST")
-        .uri(format!("/retrieval/data/getDataAtTime?at={}", urlencoding::encode(&target_iso)))
+        .uri(format!(
+            "/retrieval/data/getDataAtTime?at={}",
+            urlencoding::encode(&target_iso)
+        ))
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap();
@@ -1647,7 +1761,9 @@ async fn test_d_update_archive_fields_concurrent_no_duplicate_tasks() {
             dir.path().to_path_buf(),
             archiver_core::storage::partition::PartitionGranularity::Hour,
         ));
-        let (cm, _rx) = ChannelManager::new(storage, registry.clone(), None).await.unwrap();
+        let (cm, _rx) = ChannelManager::new(storage, registry.clone(), None)
+            .await
+            .unwrap();
         cm
     });
 

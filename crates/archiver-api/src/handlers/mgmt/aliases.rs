@@ -2,8 +2,8 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 
-use crate::errors::ApiError;
 use crate::AppState;
+use crate::errors::ApiError;
 
 #[derive(Deserialize)]
 pub struct AliasParams {
@@ -90,9 +90,7 @@ pub async fn remove_alias(
 
 /// `GET /mgmt/bpl/getAllAliases`
 /// Returns: `[{"aliasName": ..., "srcPVName": ...}, ...]`
-pub async fn get_all_aliases(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, ApiError> {
+pub async fn get_all_aliases(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let pairs = state.pv_query.all_aliases().map_err(ApiError::internal)?;
     let json: Vec<serde_json::Value> = pairs
         .into_iter()

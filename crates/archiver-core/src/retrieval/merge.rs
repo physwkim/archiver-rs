@@ -170,8 +170,10 @@ mod tests {
     fn merge_interleaves_two_streams() {
         let a = VecStream::new(vec![s(1, 1.0), s(3, 3.0), s(5, 5.0)]);
         let b = VecStream::new(vec![s(2, 2.0), s(4, 4.0), s(6, 6.0)]);
-        let merged: Box<dyn EventStream> =
-            Box::new(MergedEventStream::new(a.desc.clone(), vec![Box::new(a), Box::new(b)]));
+        let merged: Box<dyn EventStream> = Box::new(MergedEventStream::new(
+            a.desc.clone(),
+            vec![Box::new(a), Box::new(b)],
+        ));
         assert_eq!(drain(merged), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 

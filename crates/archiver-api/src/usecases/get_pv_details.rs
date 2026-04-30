@@ -37,10 +37,7 @@ pub fn get_pv_details(
     let mut detail =
         serde_json::to_value(record_to_type_info_with_name(&record, Some(pv))).unwrap_or_default();
     if let Some(obj) = detail.as_object_mut() {
-        obj.insert(
-            "isConnected".to_string(),
-            serde_json::json!(is_connected),
-        );
+        obj.insert("isConnected".to_string(), serde_json::json!(is_connected));
         obj.insert(
             "connectedSince".to_string(),
             serde_json::json!(connected_since),
@@ -53,9 +50,7 @@ pub fn get_pv_details(
         }
         // Java parity (5aabb60): include the list of aliases that point at
         // this PV so operators can audit the reverse mapping.
-        let aliases = pv_query
-            .aliases_for(&record.pv_name)
-            .unwrap_or_default();
+        let aliases = pv_query.aliases_for(&record.pv_name).unwrap_or_default();
         if !aliases.is_empty() {
             obj.insert(
                 "aliasNamesForRealName".to_string(),

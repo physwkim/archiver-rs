@@ -3,9 +3,9 @@ use axum::response::{IntoResponse, Response};
 
 use archiver_core::registry::{PvStatus, SampleMode};
 
+use crate::AppState;
 use crate::dto::mgmt::*;
 use crate::errors::ApiError;
-use crate::AppState;
 
 pub async fn get_all_pvs(
     State(state): State<AppState>,
@@ -34,16 +34,17 @@ pub async fn get_all_pvs(
     }
 
     if cp.cluster.unwrap_or(false)
-        && let Some(ref cluster) = state.cluster {
-            // Java parity (9b78b21 piggyback): forward the resolved limit so each
-            // peer caps its own reply rather than the aggregator pulling
-            // peer_default × peers names off the wire.
-            let peer_limit = cp.limit.map(|n| n as i64);
-            let remote = cluster.aggregate_all_pvs_limited(peer_limit).await;
-            let mut all: std::collections::BTreeSet<String> = pvs.into_iter().collect();
-            all.extend(remote);
-            pvs = all.into_iter().collect();
-        }
+        && let Some(ref cluster) = state.cluster
+    {
+        // Java parity (9b78b21 piggyback): forward the resolved limit so each
+        // peer caps its own reply rather than the aggregator pulling
+        // peer_default × peers names off the wire.
+        let peer_limit = cp.limit.map(|n| n as i64);
+        let remote = cluster.aggregate_all_pvs_limited(peer_limit).await;
+        let mut all: std::collections::BTreeSet<String> = pvs.into_iter().collect();
+        all.extend(remote);
+        pvs = all.into_iter().collect();
+    }
 
     if let Some(n) = limit {
         pvs.sort();
@@ -104,7 +105,7 @@ pub async fn get_matching_pvs(
     // panicked when the result was shorter than limit; guard against the
     // same here even though Vec::truncate is forgiving.
     let limit = match params.limit {
-        Some(n) if n < 0 => None,                     // -1 = unlimited
+        Some(n) if n < 0 => None, // -1 = unlimited
         Some(n) => Some(n as usize),
         None => Some(DEFAULT_MATCHING_PVS_LIMIT),
     };
@@ -119,16 +120,19 @@ pub async fn get_matching_pvs(
     }
 
     if params.cluster.unwrap_or(false)
-        && let Some(ref cluster) = state.cluster {
-            // Java parity (9b78b21): forward the resolved limit so each
-            // peer caps its own reply rather than the aggregator pulling
-            // peer_default × peers names off the wire.
-            let peer_limit = params.limit.map(|n| n as i64);
-            let remote = cluster.aggregate_matching_pvs_limited(&params.pv, peer_limit).await;
-            let mut all: std::collections::BTreeSet<String> = pvs.into_iter().collect();
-            all.extend(remote);
-            pvs = all.into_iter().collect();
-        }
+        && let Some(ref cluster) = state.cluster
+    {
+        // Java parity (9b78b21): forward the resolved limit so each
+        // peer caps its own reply rather than the aggregator pulling
+        // peer_default × peers names off the wire.
+        let peer_limit = params.limit.map(|n| n as i64);
+        let remote = cluster
+            .aggregate_matching_pvs_limited(&params.pv, peer_limit)
+            .await;
+        let mut all: std::collections::BTreeSet<String> = pvs.into_iter().collect();
+        all.extend(remote);
+        pvs = all.into_iter().collect();
+    }
 
     if let Some(n) = limit {
         pvs.sort();
@@ -193,15 +197,13 @@ async fn resolve_pv_status(
 
     // Java parity (c2d9f9e): unreachable peer surfaces as "Appliance
     // Down" rather than masquerading as "Not being archived".
-    if cluster_enabled
-        && let Some(ref cluster) = state.cluster
-    {
+    if cluster_enabled && let Some(ref cluster) = state.cluster {
         use crate::services::traits::RemoteStatusOutcomeDto;
         match cluster.remote_pv_status_detailed(&canonical).await {
             RemoteStatusOutcomeDto::Found(remote_status) => {
-                if let Ok(parsed) = serde_json::from_value::<PvStatusResponse>(
-                    remote_status.clone(),
-                ) {
+                if let Ok(parsed) =
+                    serde_json::from_value::<PvStatusResponse>(remote_status.clone())
+                {
                     return PvStatusResponse {
                         pv_name: requested.to_string(),
                         ..parsed
@@ -236,8 +238,7 @@ pub async fn get_pv_status(
     State(state): State<AppState>,
     Query(params): Query<PvStatusParams>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let resp =
-        resolve_pv_status(&state, &params.pv, params.cluster.unwrap_or(false)).await;
+    let resp = resolve_pv_status(&state, &params.pv, params.cluster.unwrap_or(false)).await;
     Ok(axum::Json(resp).into_response())
 }
 
@@ -276,22 +277,30 @@ pub async fn get_pv_status_post(
                         let (_, body) = resp.into_parts();
                         const PEER_BODY_MAX: usize = 64 * 1024 * 1024;
                         match axum::body::to_bytes(body, PEER_BODY_MAX).await {
-                            Ok(bytes) => match serde_json::from_slice::<Vec<PvStatusResponse>>(&bytes) {
-                                Ok(arr) => out.extend(arr),
-                                Err(e) => {
-                                    tracing::warn!(peer = mgmt_url, "getPVStatus peer parse failed: {e}");
-                                    out.extend(batch.iter().map(|pv| PvStatusResponse {
-                                        pv_name: pv.clone(),
-                                        status: "Appliance Down".to_string(),
-                                        dbr_type: None,
-                                        sample_mode: None,
-                                        element_count: None,
-                                        last_event_timestamp: None,
-                                    }));
+                            Ok(bytes) => {
+                                match serde_json::from_slice::<Vec<PvStatusResponse>>(&bytes) {
+                                    Ok(arr) => out.extend(arr),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            peer = mgmt_url,
+                                            "getPVStatus peer parse failed: {e}"
+                                        );
+                                        out.extend(batch.iter().map(|pv| PvStatusResponse {
+                                            pv_name: pv.clone(),
+                                            status: "Appliance Down".to_string(),
+                                            dbr_type: None,
+                                            sample_mode: None,
+                                            element_count: None,
+                                            last_event_timestamp: None,
+                                        }));
+                                    }
                                 }
-                            },
+                            }
                             Err(e) => {
-                                tracing::warn!(peer = mgmt_url, "getPVStatus peer body read failed: {e}");
+                                tracing::warn!(
+                                    peer = mgmt_url,
+                                    "getPVStatus peer body read failed: {e}"
+                                );
                                 out.extend(batch.iter().map(|pv| PvStatusResponse {
                                     pv_name: pv.clone(),
                                     status: "Appliance Down".to_string(),
@@ -340,15 +349,16 @@ pub async fn get_pv_count(
 
     let mut failed_peers = None;
     if cp.cluster.unwrap_or(false)
-        && let Some(ref cluster) = state.cluster {
-            let (rt, ra, rp, failed) = cluster.aggregate_pv_count().await;
-            total += rt;
-            active += ra;
-            paused += rp;
-            if failed > 0 {
-                failed_peers = Some(failed);
-            }
+        && let Some(ref cluster) = state.cluster
+    {
+        let (rt, ra, rp, failed) = cluster.aggregate_pv_count().await;
+        total += rt;
+        active += ra;
+        paused += rp;
+        if failed > 0 {
+            failed_peers = Some(failed);
         }
+    }
 
     let resp = PvCountResponse {
         total,
@@ -372,9 +382,10 @@ pub async fn get_pv_type_info(
         .get_pv(&canonical)
         .map_err(ApiError::internal)?
     {
-        Some(record) => Ok(axum::Json(
-            crate::dto::mgmt::record_to_type_info_with_name(&record, Some(&params.pv)),
-        )),
+        Some(record) => Ok(axum::Json(crate::dto::mgmt::record_to_type_info_with_name(
+            &record,
+            Some(&params.pv),
+        ))),
         None => Err(ApiError::NotFound(format!("PV {} not found", params.pv))),
     }
 }

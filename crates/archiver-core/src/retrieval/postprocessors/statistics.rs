@@ -83,11 +83,7 @@ impl StatStream {
                 .iter()
                 .cloned()
                 .fold(f64::NEG_INFINITY, f64::max),
-            StatOp::Min => self
-                .buffer
-                .iter()
-                .cloned()
-                .fold(f64::INFINITY, f64::min),
+            StatOp::Min => self.buffer.iter().cloned().fold(f64::INFINITY, f64::min),
             StatOp::Std => sample_std(&self.buffer),
             StatOp::Variance => {
                 if self.buffer.len() < 2 {
@@ -145,10 +141,7 @@ impl EventStream for StatStream {
         loop {
             match self.input.next_event()? {
                 Some(sample) => {
-                    let bin = crate::etl::decimation::bin_of(
-                        sample.timestamp,
-                        self.interval_secs,
-                    );
+                    let bin = crate::etl::decimation::bin_of(sample.timestamp, self.interval_secs);
 
                     if let Some(prev_bin) = self.current_bin
                         && bin != prev_bin
@@ -265,8 +258,9 @@ mod tests {
     fn variance_sample_formula() {
         // values 2,4,4,4,5,5,7,9 → mean 5, sample variance = 32/7 ≈ 4.571
         let pp: Box<dyn PostProcessor> = Box::new(VariancePostProcessor::new(100));
-        let items: Vec<(u64, f64)> =
-            (0u64..8).zip([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]).collect();
+        let items: Vec<(u64, f64)> = (0u64..8)
+            .zip([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0])
+            .collect();
         let out = drain(pp, items);
         assert_eq!(out.len(), 1);
         assert!((out[0] - (32.0 / 7.0)).abs() < 1e-9);

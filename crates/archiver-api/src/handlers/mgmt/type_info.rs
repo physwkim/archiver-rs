@@ -5,9 +5,9 @@ use serde::Deserialize;
 
 use archiver_core::registry::{PvStatus, SampleMode};
 
-use crate::dto::mgmt::{record_to_type_info, ClusterParam, PvNameParam};
-use crate::errors::ApiError;
 use crate::AppState;
+use crate::dto::mgmt::{ClusterParam, PvNameParam, record_to_type_info};
+use crate::errors::ApiError;
 
 /// `GET /mgmt/bpl/modifyMetaFields?pv=<name>&command=add,HIHI,LOLO&command=remove,FOO`
 ///
@@ -25,7 +25,9 @@ pub async fn modify_meta_fields(
     let mut commands: Vec<String> = Vec::new();
     for pair in raw.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        let key = urlencoding::decode(k).unwrap_or_else(|_| k.into()).into_owned();
+        let key = urlencoding::decode(k)
+            .unwrap_or_else(|_| k.into())
+            .into_owned();
         let value = urlencoding::decode(&v.replace('+', " "))
             .unwrap_or_else(|_| v.into())
             .into_owned();
@@ -39,10 +41,8 @@ pub async fn modify_meta_fields(
         return ApiError::BadRequest("pv is required".to_string()).into_response();
     }
     if commands.is_empty() {
-        return ApiError::BadRequest(
-            "at least one command parameter is required".to_string(),
-        )
-        .into_response();
+        return ApiError::BadRequest("at least one command parameter is required".to_string())
+            .into_response();
     }
 
     let canonical = match state.pv_query.canonical_name(&pv) {
@@ -201,15 +201,9 @@ pub async fn put_pv_type_info(
         if allow_override { "true" } else { "false" },
         if allow_create { "true" } else { "false" },
     );
-    if let Some(resp) = super::try_mgmt_dispatch_post(
-        &state,
-        &q.pv,
-        "putPVTypeInfo",
-        &qs,
-        body.clone(),
-        &headers,
-    )
-    .await
+    if let Some(resp) =
+        super::try_mgmt_dispatch_post(&state, &q.pv, "putPVTypeInfo", &qs, body.clone(), &headers)
+            .await
     {
         return Ok(resp);
     }
@@ -262,7 +256,9 @@ pub async fn put_pv_type_info(
     let dbr_type_i = parsed
         .dbr_type
         .or_else(|| existing.as_ref().map(|r| r.dbr_type as i32))
-        .ok_or_else(|| ApiError::BadRequest("DBRType required when creating a new PV".to_string()))?;
+        .ok_or_else(|| {
+            ApiError::BadRequest("DBRType required when creating a new PV".to_string())
+        })?;
     let dbr_type = archiver_core::types::ArchDbType::from_i32(dbr_type_i)
         .ok_or_else(|| ApiError::BadRequest(format!("invalid DBRType: {dbr_type_i}")))?;
 
@@ -474,9 +470,7 @@ pub async fn rename_pv(
         urlencoding::encode(&q.pv),
         urlencoding::encode(&q.newname),
     );
-    if let Some(resp) =
-        super::try_mgmt_dispatch(&state, &q.pv, "renamePV", &qs, &headers).await
-    {
+    if let Some(resp) = super::try_mgmt_dispatch(&state, &q.pv, "renamePV", &qs, &headers).await {
         return resp;
     }
 
@@ -501,11 +495,8 @@ pub async fn rename_pv(
     }
     match state.pv_query.get_pv(&q.newname) {
         Ok(Some(_)) => {
-            return ApiError::Conflict(format!(
-                "destination '{}' already exists",
-                q.newname
-            ))
-            .into_response();
+            return ApiError::Conflict(format!("destination '{}' already exists", q.newname))
+                .into_response();
         }
         Ok(None) => {}
         Err(e) => return ApiError::internal(e).into_response(),
@@ -587,7 +578,10 @@ mod tests {
         assert_eq!(decoded.pv_name.as_deref(), Some("PV:Test"));
         assert_eq!(decoded.dbr_type, Some(ArchDbType::ScalarDouble as i32));
         assert_eq!(decoded.sampling_method.as_deref(), Some("Monitor"));
-        assert_eq!(decoded.archive_fields.as_deref(), Some(&["HIHI".to_string()][..]));
+        assert_eq!(
+            decoded.archive_fields.as_deref(),
+            Some(&["HIHI".to_string()][..])
+        );
         assert_eq!(decoded.policy_name.as_deref(), Some("ring"));
     }
 }

@@ -83,8 +83,7 @@ impl EventStream for MeanDecimationStream {
                         && bin != prev_bin
                         && !self.buffer.is_empty()
                     {
-                        let mean =
-                            self.buffer.iter().sum::<f64>() / self.buffer.len() as f64;
+                        let mean = self.buffer.iter().sum::<f64>() / self.buffer.len() as f64;
                         let result = ArchiverSample::new(
                             bin_start(prev_bin, self.interval_secs),
                             ArchiverValue::ScalarDouble(mean),
@@ -107,8 +106,7 @@ impl EventStream for MeanDecimationStream {
                     if let Some(prev_bin) = self.current_bin
                         && !self.buffer.is_empty()
                     {
-                        let mean =
-                            self.buffer.iter().sum::<f64>() / self.buffer.len() as f64;
+                        let mean = self.buffer.iter().sum::<f64>() / self.buffer.len() as f64;
                         let result = ArchiverSample::new(
                             bin_start(prev_bin, self.interval_secs),
                             ArchiverValue::ScalarDouble(mean),

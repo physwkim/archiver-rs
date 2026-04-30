@@ -5,9 +5,9 @@ use axum::response::IntoResponse;
 
 use archiver_core::registry::PvStatus;
 
+use crate::AppState;
 use crate::dto::mgmt::*;
 use crate::errors::ApiError;
-use crate::AppState;
 
 pub async fn get_paused_pvs_report(
     State(state): State<AppState>,
@@ -21,9 +21,9 @@ pub async fn get_paused_pvs_report(
         .map(|r| ReportEntry {
             pv_name: r.pv_name,
             status: Some("Paused".to_string()),
-            last_event: r.last_timestamp.map(|ts| {
-                chrono::DateTime::<chrono::Utc>::from(ts).to_rfc3339()
-            }),
+            last_event: r
+                .last_timestamp
+                .map(|ts| chrono::DateTime::<chrono::Utc>::from(ts).to_rfc3339()),
         })
         .collect();
     Ok(axum::Json(entries))
@@ -255,14 +255,8 @@ pub async fn get_mgmt_metrics(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let total = state.pv_query.count(None).unwrap_or(0);
-    let active = state
-        .pv_query
-        .count(Some(PvStatus::Active))
-        .unwrap_or(0);
-    let paused = state
-        .pv_query
-        .count(Some(PvStatus::Paused))
-        .unwrap_or(0);
+    let active = state.pv_query.count(Some(PvStatus::Active)).unwrap_or(0);
+    let paused = state.pv_query.count(Some(PvStatus::Paused)).unwrap_or(0);
     Ok(axum::Json(serde_json::json!({
         "pvCount": { "total": total, "active": active, "paused": paused },
         "version": env!("CARGO_PKG_VERSION"),

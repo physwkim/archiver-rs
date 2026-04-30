@@ -4,14 +4,16 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
+use archiver_api::cluster::ClusterClient;
+use archiver_api::services::impls::{
+    ChannelArchiverControl, ClusterClientRouter, RegistryRepository,
+};
+use archiver_api::{AppState, build_router};
 use archiver_core::config::{ApplianceIdentity, ClusterConfig, PeerConfig, SecurityConfig};
 use archiver_core::registry::{PvRegistry, SampleMode};
 use archiver_core::storage::partition::PartitionGranularity;
 use archiver_core::storage::plainpb::PlainPbStoragePlugin;
 use archiver_engine::channel_manager::ChannelManager;
-use archiver_api::cluster::ClusterClient;
-use archiver_api::{build_router, AppState};
-use archiver_api::services::impls::{ChannelArchiverControl, ClusterClientRouter, RegistryRepository};
 
 /// Start a mock peer appliance on a random port.
 /// Returns (base_url, JoinHandle).
@@ -56,9 +58,10 @@ async fn build_cluster_test_app(
     local_storage: Arc<PlainPbStoragePlugin>,
     peer_url: &str,
 ) -> axum::Router {
-    let (channel_mgr, _rx) = ChannelManager::new(local_storage.clone(), local_registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) =
+        ChannelManager::new(local_storage.clone(), local_registry.clone(), None)
+            .await
+            .unwrap();
     let channel_mgr = Arc::new(channel_mgr);
 
     let cluster_config = ClusterConfig {
@@ -89,7 +92,9 @@ async fn build_cluster_test_app(
         pv_cmd: repo,
         archiver_query: archiver.clone(),
         archiver_cmd: archiver,
-        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
+        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(
+            ClusterClient::new(&cluster_config),
+        )))),
         api_keys: None,
         cluster_api_key: None,
         metrics_handle: None,
@@ -103,10 +108,7 @@ async fn build_cluster_test_app(
 }
 
 fn get_request(uri: &str) -> Request<Body> {
-    Request::builder()
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap()
+    Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
 fn get_request_with_header(uri: &str, header: &str, value: &str) -> Request<Body> {
@@ -127,7 +129,11 @@ async fn body_to_string(body: Body) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
-fn new_registry_and_storage() -> (Arc<PvRegistry>, Arc<PlainPbStoragePlugin>, tempfile::TempDir) {
+fn new_registry_and_storage() -> (
+    Arc<PvRegistry>,
+    Arc<PlainPbStoragePlugin>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(PlainPbStoragePlugin::new(
         "sts",
@@ -144,7 +150,12 @@ fn new_registry_and_storage() -> (Arc<PvRegistry>, Arc<PlainPbStoragePlugin>, te
 async fn test_resolve_peer_finds_remote_pv() {
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("REMOTE:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "REMOTE:PV",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer(peer_reg, peer_storage).await;
 
@@ -153,7 +164,9 @@ async fn test_resolve_peer_finds_remote_pv() {
 
     // getPVStatus with cluster=true should find the remote PV.
     let resp = app
-        .oneshot(get_request("/mgmt/bpl/getPVStatus?pv=REMOTE:PV&cluster=true"))
+        .oneshot(get_request(
+            "/mgmt/bpl/getPVStatus?pv=REMOTE:PV&cluster=true",
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -170,7 +183,9 @@ async fn test_resolve_peer_returns_none_unknown() {
     let app = build_cluster_test_app(local_reg, local_storage, &peer_url).await;
 
     let resp = app
-        .oneshot(get_request("/mgmt/bpl/getPVStatus?pv=UNKNOWN:PV&cluster=true"))
+        .oneshot(get_request(
+            "/mgmt/bpl/getPVStatus?pv=UNKNOWN:PV&cluster=true",
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -182,13 +197,23 @@ async fn test_resolve_peer_returns_none_unknown() {
 async fn test_resolve_peer_prefers_local() {
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("SHARED:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "SHARED:PV",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer(peer_reg, peer_storage).await;
 
     let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
     local_reg
-        .register_pv("SHARED:PV", archiver_core::types::ArchDbType::ScalarInt, &SampleMode::Scan { period_secs: 2.0 }, 1)
+        .register_pv(
+            "SHARED:PV",
+            archiver_core::types::ArchDbType::ScalarInt,
+            &SampleMode::Scan { period_secs: 2.0 },
+            1,
+        )
         .unwrap();
     let app = build_cluster_test_app(local_reg, local_storage, &peer_url).await;
 
@@ -208,16 +233,31 @@ async fn test_resolve_peer_prefers_local() {
 async fn test_get_all_pvs_cluster_aggregation() {
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("PEER:PV1", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "PEER:PV1",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     peer_reg
-        .register_pv("PEER:PV2", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "PEER:PV2",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer(peer_reg, peer_storage).await;
 
     let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
     local_reg
-        .register_pv("LOCAL:PV1", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "LOCAL:PV1",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let app = build_cluster_test_app(local_reg, local_storage, &peer_url).await;
 
@@ -239,21 +279,38 @@ async fn test_get_all_pvs_cluster_aggregation() {
 async fn test_get_matching_pvs_cluster() {
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("SIM:Remote", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "SIM:Remote",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     peer_reg
-        .register_pv("OTHER:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "OTHER:PV",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer(peer_reg, peer_storage).await;
 
     let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
     local_reg
-        .register_pv("SIM:Local", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "SIM:Local",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let app = build_cluster_test_app(local_reg, local_storage, &peer_url).await;
 
     let resp = app
-        .oneshot(get_request("/mgmt/bpl/getMatchingPVs?pv=SIM:*&cluster=true"))
+        .oneshot(get_request(
+            "/mgmt/bpl/getMatchingPVs?pv=SIM:*&cluster=true",
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -269,7 +326,12 @@ async fn test_get_matching_pvs_cluster() {
 async fn test_get_pv_status_cluster_remote() {
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("ONLY:OnPeer", archiver_core::types::ArchDbType::ScalarFloat, &SampleMode::Monitor, 1)
+        .register_pv(
+            "ONLY:OnPeer",
+            archiver_core::types::ArchDbType::ScalarFloat,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer(peer_reg, peer_storage).await;
 
@@ -277,7 +339,9 @@ async fn test_get_pv_status_cluster_remote() {
     let app = build_cluster_test_app(local_reg, local_storage, &peer_url).await;
 
     let resp = app
-        .oneshot(get_request("/mgmt/bpl/getPVStatus?pv=ONLY:OnPeer&cluster=true"))
+        .oneshot(get_request(
+            "/mgmt/bpl/getPVStatus?pv=ONLY:OnPeer&cluster=true",
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -290,16 +354,31 @@ async fn test_get_pv_status_cluster_remote() {
 async fn test_get_pv_count_cluster() {
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("P:A", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "P:A",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     peer_reg
-        .register_pv("P:B", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "P:B",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer(peer_reg, peer_storage).await;
 
     let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
     local_reg
-        .register_pv("L:A", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "L:A",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let app = build_cluster_test_app(local_reg, local_storage, &peer_url).await;
 
@@ -318,7 +397,12 @@ async fn test_get_pv_count_cluster() {
 async fn test_pause_dispatches_to_peer() {
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("PEER:Pause", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "PEER:Pause",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer(peer_reg.clone(), peer_storage).await;
 
@@ -338,7 +422,12 @@ async fn test_pause_dispatches_to_peer() {
 async fn test_delete_dispatches_to_peer() {
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("PEER:Del", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "PEER:Del",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer(peer_reg.clone(), peer_storage).await;
 
@@ -384,13 +473,18 @@ async fn test_x_archiver_proxied_prevents_loop() {
 
 #[tokio::test]
 async fn test_retrieval_proxies_to_peer() {
-    use std::time::{Duration, SystemTime};
-    use archiver_core::types::{ArchiverSample, ArchiverValue};
     use archiver_core::storage::traits::StoragePlugin;
+    use archiver_core::types::{ArchiverSample, ArchiverValue};
+    use std::time::{Duration, SystemTime};
 
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("PEER:Data", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "PEER:Data",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
 
     // Write some data on the peer.
@@ -399,7 +493,11 @@ async fn test_retrieval_proxies_to_peer() {
         let ts = base_time + Duration::from_secs(i);
         let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(i as f64));
         peer_storage
-            .append_event("PEER:Data", archiver_core::types::ArchDbType::ScalarDouble, &sample)
+            .append_event(
+                "PEER:Data",
+                archiver_core::types::ArchDbType::ScalarDouble,
+                &sample,
+            )
             .await
             .unwrap();
     }
@@ -445,13 +543,23 @@ async fn test_retrieval_proxies_to_peer() {
 async fn test_bulk_pause_splits_by_peer() {
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("REMOTE:A", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "REMOTE:A",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer(peer_reg.clone(), peer_storage).await;
 
     let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
     local_reg
-        .register_pv("LOCAL:A", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "LOCAL:A",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let app = build_cluster_test_app(local_reg.clone(), local_storage, &peer_url).await;
 
@@ -513,7 +621,12 @@ async fn test_archive_pv_forwards_to_appliance() {
 async fn test_archive_pv_rejects_duplicate() {
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("DUP:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "DUP:PV",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer(peer_reg, peer_storage).await;
 
@@ -546,9 +659,10 @@ async fn build_cluster_test_app_with_auth(
     local_storage: Arc<PlainPbStoragePlugin>,
     peer_url: &str,
 ) -> axum::Router {
-    let (channel_mgr, _rx) = ChannelManager::new(local_storage.clone(), local_registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) =
+        ChannelManager::new(local_storage.clone(), local_registry.clone(), None)
+            .await
+            .unwrap();
     let channel_mgr = Arc::new(channel_mgr);
 
     let cluster_config = ClusterConfig {
@@ -580,7 +694,9 @@ async fn build_cluster_test_app_with_auth(
         pv_cmd: repo,
         archiver_query: archiver.clone(),
         archiver_cmd: archiver,
-        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
+        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(
+            ClusterClient::new(&cluster_config),
+        )))),
         api_keys: Some(vec!["test-cluster-key".to_string()]),
         cluster_api_key: Some(CLUSTER_INTERNAL_KEY.to_string()),
         metrics_handle: None,
@@ -635,7 +751,12 @@ async fn test_cluster_proxy_authenticates_with_internal_key() {
     // Peer has auth enabled — proxied requests authenticate via the shared cluster api_key.
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("AUTH:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "AUTH:PV",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer_with_auth(peer_reg.clone(), peer_storage).await;
 
@@ -688,7 +809,12 @@ async fn test_cluster_auth_rejects_unauthenticated_caller() {
     // Even with cluster mode, the *caller* must authenticate.
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("AUTH:PV2", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "AUTH:PV2",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer(peer_reg, peer_storage).await;
 
@@ -708,13 +834,23 @@ async fn test_bulk_pause_cluster_with_auth() {
     // Bulk pause with auth: should correctly forward to auth-enabled peer.
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("REMOTE:BulkAuth", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "REMOTE:BulkAuth",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let (peer_url, _handle) = start_mock_peer_with_auth(peer_reg.clone(), peer_storage).await;
 
     let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
     local_reg
-        .register_pv("LOCAL:BulkAuth", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "LOCAL:BulkAuth",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
     let app = build_cluster_test_app_with_auth(local_reg.clone(), local_storage, &peer_url).await;
 
@@ -790,9 +926,15 @@ async fn test_cluster_proxy_authenticates_with_per_peer_key() {
     // Local appliance has no cluster.api_key fallback — only the per-peer key.
     let (peer_reg, peer_storage, _peer_dir) = new_registry_and_storage();
     peer_reg
-        .register_pv("PPEER:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "PPEER:PV",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
-    let (peer_url, _handle) = start_mock_peer_with_own_key(peer_reg.clone(), peer_storage, PEER_SPECIFIC_KEY).await;
+    let (peer_url, _handle) =
+        start_mock_peer_with_own_key(peer_reg.clone(), peer_storage, PEER_SPECIFIC_KEY).await;
 
     let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
     let (channel_mgr, _rx) = ChannelManager::new(local_storage.clone(), local_reg.clone(), None)
@@ -828,7 +970,9 @@ async fn test_cluster_proxy_authenticates_with_per_peer_key() {
         pv_cmd: repo,
         archiver_query: archiver.clone(),
         archiver_cmd: archiver,
-        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
+        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(
+            ClusterClient::new(&cluster_config),
+        )))),
         api_keys: Some(vec!["caller-key".to_string()]),
         cluster_api_key: None,
         metrics_handle: None,
@@ -866,15 +1010,27 @@ async fn test_different_peers_get_different_keys() {
     // Two peers, each with their own inbound key.
     let (peer0_reg, peer0_storage, _peer0_dir) = new_registry_and_storage();
     peer0_reg
-        .register_pv("P0:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "P0:PV",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
-    let (peer0_url, _h0) = start_mock_peer_with_own_key(peer0_reg.clone(), peer0_storage, PEER0_KEY).await;
+    let (peer0_url, _h0) =
+        start_mock_peer_with_own_key(peer0_reg.clone(), peer0_storage, PEER0_KEY).await;
 
     let (peer1_reg, peer1_storage, _peer1_dir) = new_registry_and_storage();
     peer1_reg
-        .register_pv("P1:PV", archiver_core::types::ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "P1:PV",
+            archiver_core::types::ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
-    let (peer1_url, _h1) = start_mock_peer_with_own_key(peer1_reg.clone(), peer1_storage, PEER1_KEY).await;
+    let (peer1_url, _h1) =
+        start_mock_peer_with_own_key(peer1_reg.clone(), peer1_storage, PEER1_KEY).await;
 
     let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
     let (channel_mgr, _rx) = ChannelManager::new(local_storage.clone(), local_reg.clone(), None)
@@ -918,7 +1074,9 @@ async fn test_different_peers_get_different_keys() {
         pv_cmd: repo,
         archiver_query: archiver.clone(),
         archiver_cmd: archiver,
-        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(ClusterClient::new(&cluster_config))))),
+        cluster: Some(Arc::new(ClusterClientRouter::new(Arc::new(
+            ClusterClient::new(&cluster_config),
+        )))),
         api_keys: Some(vec!["caller-key".to_string()]),
         cluster_api_key: None,
         metrics_handle: None,

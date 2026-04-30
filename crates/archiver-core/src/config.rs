@@ -263,7 +263,11 @@ impl ArchiverConfig {
 
     /// Validate configuration values that TOML deserialization alone cannot check.
     pub fn validate(&self) -> anyhow::Result<()> {
-        for (name, tier) in [("sts", &self.storage.sts), ("mts", &self.storage.mts), ("lts", &self.storage.lts)] {
+        for (name, tier) in [
+            ("sts", &self.storage.sts),
+            ("mts", &self.storage.mts),
+            ("lts", &self.storage.lts),
+        ] {
             if tier.gather >= tier.hold {
                 anyhow::bail!(
                     "{name}: gather ({}) must be less than hold ({})",
@@ -295,10 +299,16 @@ impl ArchiverConfig {
             }
             for (i, peer) in cluster.peers.iter().enumerate() {
                 if !peer.mgmt_url.starts_with("http://") && !peer.mgmt_url.starts_with("https://") {
-                    anyhow::bail!("cluster.peers[{i}].mgmt_url must start with http:// or https://");
+                    anyhow::bail!(
+                        "cluster.peers[{i}].mgmt_url must start with http:// or https://"
+                    );
                 }
-                if !peer.retrieval_url.starts_with("http://") && !peer.retrieval_url.starts_with("https://") {
-                    anyhow::bail!("cluster.peers[{i}].retrieval_url must start with http:// or https://");
+                if !peer.retrieval_url.starts_with("http://")
+                    && !peer.retrieval_url.starts_with("https://")
+                {
+                    anyhow::bail!(
+                        "cluster.peers[{i}].retrieval_url must start with http:// or https://"
+                    );
                 }
             }
         }
@@ -396,7 +406,10 @@ retrieval_url = "http://host1:17665/retrieval"
 "#;
         let config = ArchiverConfig::from_toml(toml).unwrap();
         let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("has no api_key and no cluster.api_key fallback"));
+        assert!(
+            err.to_string()
+                .contains("has no api_key and no cluster.api_key fallback")
+        );
     }
 
     #[test]
