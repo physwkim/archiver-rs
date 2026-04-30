@@ -26,6 +26,18 @@ pub struct ClusterParam {
 }
 
 #[derive(Deserialize)]
+pub struct AllPvsParams {
+    #[serde(default)]
+    pub cluster: Option<bool>,
+    /// Optional cap on the response. Java parity (5ebf1e1): default is
+    /// `DEFAULT_MATCHING_PVS_LIMIT` so a viewer can't OOM the JSON
+    /// encoder on a 100k-PV cluster. `-1` opts out of the cap; internal
+    /// callers that genuinely need every name pass it explicitly.
+    #[serde(default)]
+    pub limit: Option<i32>,
+}
+
+#[derive(Deserialize)]
 pub struct MatchingPvsParams {
     pub pv: String,
     #[serde(default)]
@@ -45,17 +57,22 @@ pub struct PvStatusParams {
     pub cluster: Option<bool>,
 }
 
-#[derive(Serialize)]
+// Java parity: wire field names are camelCase (`pvName`, `dbrType`, ...).
+// Without these explicit renames a peer running the original Java archiver
+// would send `pvName` while we'd try to deserialize `pv_name`, silently
+// producing an all-`None` status entry on cluster lookups.
+#[derive(Serialize, Deserialize)]
 pub struct PvStatusResponse {
+    #[serde(rename = "pvName")]
     pub pv_name: String,
     pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default, rename = "dbrType")]
     pub dbr_type: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default, rename = "samplingMethod")]
     pub sample_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default, rename = "elementCount")]
     pub element_count: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default, rename = "lastEvent")]
     pub last_event_timestamp: Option<String>,
 }
 

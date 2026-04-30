@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::cluster::ClusterClient;
-use crate::services::traits::{ApplianceIdentityDto, ClusterRouter, PeerDto, ResolvedPeerDto};
+use crate::cluster::{ClusterClient, RemoteStatusOutcome};
+use crate::services::traits::{
+    ApplianceIdentityDto, ClusterRouter, PeerDto, RemoteStatusOutcomeDto, ResolvedPeerDto,
+};
 
 pub struct ClusterClientRouter {
     inner: Arc<ClusterClient>,
@@ -67,8 +69,20 @@ impl ClusterRouter for ClusterClientRouter {
         self.inner.aggregate_all_pvs().await
     }
 
+    async fn aggregate_all_pvs_limited(&self, limit: Option<i64>) -> Vec<String> {
+        self.inner.aggregate_all_pvs_limited(limit).await
+    }
+
     async fn aggregate_matching_pvs(&self, pattern: &str) -> Vec<String> {
         self.inner.aggregate_matching_pvs(pattern).await
+    }
+
+    async fn aggregate_matching_pvs_limited(
+        &self,
+        pattern: &str,
+        limit: Option<i64>,
+    ) -> Vec<String> {
+        self.inner.aggregate_matching_pvs_limited(pattern, limit).await
     }
 
     async fn aggregate_pv_count(&self) -> (u64, u64, u64, usize) {
@@ -79,7 +93,24 @@ impl ClusterRouter for ClusterClientRouter {
         self.inner.remote_pv_status(pv).await
     }
 
+    async fn remote_pv_status_detailed(&self, pv: &str) -> RemoteStatusOutcomeDto {
+        match self.inner.remote_pv_status_detailed(pv).await {
+            RemoteStatusOutcome::Found(v) => RemoteStatusOutcomeDto::Found(v),
+            RemoteStatusOutcome::NotArchived => RemoteStatusOutcomeDto::NotArchived,
+            RemoteStatusOutcome::ApplianceDown => RemoteStatusOutcomeDto::ApplianceDown,
+        }
+    }
+
     async fn proxy_retrieval(&self, peer_retrieval_url: &str, path: &str, query_string: &str) -> anyhow::Result<axum::response::Response> {
         self.inner.proxy_retrieval(peer_retrieval_url, path, query_string).await
+    }
+
+    async fn proxy_data_at_time(
+        &self,
+        peer_retrieval_url: &str,
+        at: Option<&str>,
+        pvs: &[String],
+    ) -> anyhow::Result<serde_json::Value> {
+        self.inner.proxy_data_at_time(peer_retrieval_url, at, pvs).await
     }
 }

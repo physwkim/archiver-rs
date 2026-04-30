@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::response::Response;
 
-use crate::services::traits::{ApplianceIdentityDto, ClusterRouter, PeerDto, ResolvedPeerDto};
+use crate::services::traits::{
+    ApplianceIdentityDto, ClusterRouter, PeerDto, RemoteStatusOutcomeDto, ResolvedPeerDto,
+};
 
 pub struct FakeClusterRouter {
     identity: ApplianceIdentityDto,
@@ -71,7 +73,19 @@ impl ClusterRouter for FakeClusterRouter {
         Vec::new()
     }
 
+    async fn aggregate_all_pvs_limited(&self, _limit: Option<i64>) -> Vec<String> {
+        Vec::new()
+    }
+
     async fn aggregate_matching_pvs(&self, _pattern: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    async fn aggregate_matching_pvs_limited(
+        &self,
+        _pattern: &str,
+        _limit: Option<i64>,
+    ) -> Vec<String> {
         Vec::new()
     }
 
@@ -83,6 +97,10 @@ impl ClusterRouter for FakeClusterRouter {
         None
     }
 
+    async fn remote_pv_status_detailed(&self, _pv: &str) -> RemoteStatusOutcomeDto {
+        RemoteStatusOutcomeDto::NotArchived
+    }
+
     async fn proxy_retrieval(
         &self,
         _peer_retrieval_url: &str,
@@ -90,6 +108,15 @@ impl ClusterRouter for FakeClusterRouter {
         _query_string: &str,
     ) -> anyhow::Result<Response> {
         Ok(axum::Json(serde_json::json!([])).into_response())
+    }
+
+    async fn proxy_data_at_time(
+        &self,
+        _peer_retrieval_url: &str,
+        _at: Option<&str>,
+        _pvs: &[String],
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({}))
     }
 }
 

@@ -44,12 +44,22 @@ pub struct LiveTimeoutParam {
 /// fetch so the live read hits the canonical IOC PV.
 pub async fn get_engine_data(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(p): Query<LiveTimeoutParam>,
     PvListInput(pvs): PvListInput,
 ) -> Response {
     let timeout = p.timeout.unwrap_or(DEFAULT_LIVE_TIMEOUT_SECS);
+    let qs = p
+        .timeout
+        .map(|t| format!("timeout={t}"))
+        .unwrap_or_default();
+    let (local_pvs, remote_results) =
+        dispatch_engine_pvs(&state, &headers, "getEngineDataAction", &qs, pvs).await;
     let mut out = serde_json::Map::new();
-    for pv in pvs {
+    for (k, v) in remote_results {
+        out.insert(k, v);
+    }
+    for pv in local_pvs {
         let canonical = state
             .pv_query
             .canonical_name(&pv)
@@ -64,6 +74,114 @@ pub async fn get_engine_data(
     axum::Json(serde_json::Value::Object(out)).into_response()
 }
 
+/// Java parity (26124b6): split a multi-PV engine BPL request into local
+/// vs per-peer batches, forward each remote batch, and return a tuple of
+/// `(local_pvs_to_handle_here, merged_remote_response_map)`. The
+/// `X-Archiver-Proxied` guard prevents loops.
+async fn dispatch_engine_pvs(
+    state: &AppState,
+    headers: &HeaderMap,
+    endpoint: &str,
+    qs: &str,
+    pvs: Vec<String>,
+) -> (Vec<String>, Vec<(String, serde_json::Value)>) {
+    let is_proxied = headers.get("X-Archiver-Proxied").is_some();
+    let mut remote_results: Vec<(String, serde_json::Value)> = Vec::new();
+    if is_proxied || state.cluster.is_none() {
+        return (pvs, remote_results);
+    }
+    let cluster = state.cluster.as_ref().unwrap().clone();
+    // Pre-fetch local registry state once (Java parity 26124b6 + perf):
+    // 2 queries instead of 2N per-PV sqlite hits, same pattern as
+    // `route_pvs` in mgmt/mod.rs.
+    let local_set: std::collections::HashSet<String> = state
+        .pv_query
+        .all_pv_names()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let alias_map: std::collections::HashMap<String, String> = state
+        .pv_query
+        .all_aliases()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let mut local_pvs: Vec<String> = Vec::new();
+    let mut by_peer: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for pv in pvs {
+        let canonical = alias_map.get(&pv).cloned().unwrap_or_else(|| pv.clone());
+        if local_set.contains(&canonical) {
+            local_pvs.push(pv);
+            continue;
+        }
+        match cluster.resolve_peer(&canonical).await {
+            Some(resolved) => by_peer.entry(resolved.mgmt_url).or_default().push(pv),
+            None => local_pvs.push(pv),
+        }
+    }
+    let endpoint_with_qs = if qs.is_empty() {
+        endpoint.to_string()
+    } else {
+        format!("{endpoint}?{qs}")
+    };
+    for (peer_mgmt_url, batch) in by_peer {
+        let body = serde_json::to_vec(&batch).unwrap_or_default();
+        match cluster
+            .proxy_mgmt_post(&peer_mgmt_url, &endpoint_with_qs, body.into())
+            .await
+        {
+            Ok(resp) => {
+                let (_, body) = resp.into_parts();
+                // 64 MB cap on peer responses — engine BPL replies are
+                // bounded by `pvs.len() * O(KB)` in practice (~1 MB for
+                // a 1000-PV batch). The bound prevents a buggy or
+                // malicious peer from streaming an unbounded body and
+                // OOM-ing this appliance.
+                const PEER_BODY_MAX: usize = 64 * 1024 * 1024;
+                let bytes = match axum::body::to_bytes(body, PEER_BODY_MAX).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(peer = peer_mgmt_url, "engine peer body read failed: {e}");
+                        for pv in &batch {
+                            remote_results.push((
+                                pv.clone(),
+                                serde_json::json!({"error": "peer body read failed"}),
+                            ));
+                        }
+                        continue;
+                    }
+                };
+                match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(serde_json::Value::Object(map)) => {
+                        for (k, v) in map {
+                            remote_results.push((k, v));
+                        }
+                    }
+                    _ => {
+                        for pv in &batch {
+                            remote_results.push((
+                                pv.clone(),
+                                serde_json::json!({"error": "peer returned non-object"}),
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(peer = peer_mgmt_url, "engine peer dispatch failed: {e}");
+                for pv in &batch {
+                    remote_results.push((
+                        pv.clone(),
+                        serde_json::json!({"error": format!("peer unreachable: {e}")}),
+                    ));
+                }
+            }
+        }
+    }
+    (local_pvs, remote_results)
+}
+
 /// `POST /mgmt/bpl/getDataAtTimeEngine[?timeout=<secs>]`
 /// Same body+query shape as getEngineDataAction; the response also
 /// carries the registry's `lastEvent` timestamp so a Phoebus client can
@@ -71,12 +189,22 @@ pub async fn get_engine_data(
 /// when the PV has never been written.
 pub async fn get_data_at_time_engine(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(p): Query<LiveTimeoutParam>,
     PvListInput(pvs): PvListInput,
 ) -> Response {
     let timeout = p.timeout.unwrap_or(DEFAULT_LIVE_TIMEOUT_SECS);
+    let qs = p
+        .timeout
+        .map(|t| format!("timeout={t}"))
+        .unwrap_or_default();
+    let (local_pvs, remote_results) =
+        dispatch_engine_pvs(&state, &headers, "getDataAtTimeEngine", &qs, pvs).await;
     let mut out = serde_json::Map::new();
-    for pv in pvs {
+    for (k, v) in remote_results {
+        out.insert(k, v);
+    }
+    for pv in local_pvs {
         let canonical = state
             .pv_query
             .canonical_name(&pv)
@@ -104,7 +232,10 @@ pub async fn get_data_at_time_engine(
             serde_json::to_value(last_event).unwrap_or(serde_json::Value::Null),
         );
         if let Some(v) = value {
-            entry.insert("value".into(), v);
+            // Java parity (36e06e6): use the same "val" key as the
+            // retrieval-side getDataAtTime so clients can parse both
+            // responses with one schema.
+            entry.insert("val".into(), v);
         }
         if let Some(e) = error {
             entry.insert("error".into(), serde_json::Value::String(e));

@@ -63,6 +63,7 @@ async fn build_retrieval_app() -> (axum::Router, SystemTime, SystemTime, tempfil
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     (build_router(state, &SecurityConfig::default()), data_start, data_end, dir)
 }

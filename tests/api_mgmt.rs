@@ -42,6 +42,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     (build_router(state, &SecurityConfig::default()), dir)
 }
@@ -86,6 +87,7 @@ async fn build_test_app_with_pvs() -> (axum::Router, Arc<PvRegistry>, tempfile::
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     (build_router(state, &SecurityConfig::default()), registry, dir)
 }
@@ -170,10 +172,10 @@ async fn test_get_pv_status_found() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_to_json(resp.into_body()).await;
-    assert_eq!(json["pv_name"], "SIM:Sine");
+    assert_eq!(json["pvName"], "SIM:Sine");
     assert_eq!(json["status"], "Being archived");
-    assert!(json["dbr_type"].is_number());
-    assert!(json["sample_mode"].is_string());
+    assert!(json["dbrType"].is_number());
+    assert!(json["samplingMethod"].is_string());
 }
 
 #[tokio::test]
@@ -385,14 +387,20 @@ async fn test_abort_archiving_pv() {
     assert_eq!(record.status, archiver_core::registry::PvStatus::Inactive);
 }
 
+/// Java parity (0687be1): abort proceeds regardless of registry status —
+/// the previous "reject active PVs" guard recreated the typeinfo-stuck
+/// bug by forcing operators to pause or delete PVs whose CA channel
+/// never connected.
 #[tokio::test]
-async fn test_abort_archiving_rejects_active() {
-    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+async fn test_abort_archiving_active_succeeds() {
+    let (app, reg, _dir) = build_test_app_with_pvs().await;
     let resp = app
         .oneshot(get_request("/mgmt/bpl/abortArchivingPV?pv=SIM:Sine"))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let record = reg.get_pv("SIM:Sine").unwrap().unwrap();
+    assert_eq!(record.status, archiver_core::registry::PvStatus::Inactive);
 }
 
 #[tokio::test]
@@ -488,6 +496,7 @@ async fn test_export_import_preserves_status() {
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     let app2 = build_router(state2, &SecurityConfig::default());
 
@@ -561,6 +570,7 @@ async fn build_test_app_with_auth() -> (axum::Router, tempfile::TempDir) {
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     (build_router(state, &SecurityConfig::default()), dir)
 }
@@ -697,6 +707,7 @@ async fn test_rate_limiter_blocks_excess_requests() {
         trust_proxy_headers: true,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     let app = build_router(state, &SecurityConfig::default());
 
@@ -758,6 +769,7 @@ async fn test_rate_limiter_isolates_by_ip() {
         trust_proxy_headers: true,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     let app = build_router(state, &SecurityConfig::default());
 
@@ -857,7 +869,7 @@ async fn test_get_pv_status_resolves_alias() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_to_json(resp.into_body()).await;
-    assert_eq!(body["pv_name"], "DEV:Foo");
+    assert_eq!(body["pvName"], "DEV:Foo");
     assert_eq!(body["status"], "Being archived");
 }
 
@@ -1290,6 +1302,7 @@ async fn test_consolidate_forwards_to_peer_for_remote_pv() {
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     let app = archiver_api::build_router(state, &archiver_core::config::SecurityConfig::default());
 
@@ -1592,6 +1605,7 @@ async fn test_d_get_data_at_time_stage_2_walkback() {
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     let app = build_router(state, &SecurityConfig::default());
 

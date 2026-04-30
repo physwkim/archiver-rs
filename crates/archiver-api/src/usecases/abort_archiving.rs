@@ -1,24 +1,17 @@
-use archiver_core::registry::PvStatus;
-
 use crate::errors::ApiError;
-use crate::services::traits::{ArchiverCommand, PvQueryRepository};
+use crate::services::traits::ArchiverCommand;
 
 pub async fn abort_archiving(
-    pv_query: &dyn PvQueryRepository,
     archiver_cmd: &dyn ArchiverCommand,
     pv: &str,
 ) -> Result<String, ApiError> {
-    match pv_query.get_pv(pv).map_err(ApiError::internal)? {
-        Some(record) => {
-            if record.status == PvStatus::Active {
-                return Err(ApiError::BadRequest(
-                    "PV is actively archiving; pause first or use deletePV".to_string(),
-                ));
-            }
-        }
-        None => return Err(ApiError::NotFound(format!("PV {pv} not found"))),
-    }
-
+    // Java parity (0687be1): abort must succeed unconditionally —
+    // including for PVs that never produced a registry entry (CA channel
+    // never connected). Java's `AbortArchiveRequest` removed the
+    // typeinfo guard entirely so operators are never told a stuck pending
+    // archive cannot be aborted. `stop_pv` is itself idempotent on
+    // unknown PV names, so this delegate does the right thing whether
+    // or not a registry record exists.
     archiver_cmd
         .stop_pv(pv)
         .await

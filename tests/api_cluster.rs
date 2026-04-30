@@ -39,6 +39,7 @@ async fn start_mock_peer(
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     let app = build_router(state, &SecurityConfig::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -77,6 +78,7 @@ async fn build_cluster_test_app(
             api_key: None,
         }],
         api_key: None,
+        reassign_appliance_enabled: false,
     };
 
     let repo = Arc::new(RegistryRepository::new(local_registry));
@@ -95,6 +97,7 @@ async fn build_cluster_test_app(
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     build_router(state, &SecurityConfig::default())
 }
@@ -197,8 +200,8 @@ async fn test_resolve_peer_prefers_local() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_to_json(resp.into_body()).await;
     assert_eq!(json["status"], "Being archived");
-    assert_eq!(json["dbr_type"], 5); // ScalarInt
-    assert_eq!(json["sample_mode"], "Scan @ 2s");
+    assert_eq!(json["dbrType"], 5); // ScalarInt
+    assert_eq!(json["samplingMethod"], "Scan @ 2s");
 }
 
 #[tokio::test]
@@ -280,7 +283,7 @@ async fn test_get_pv_status_cluster_remote() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_to_json(resp.into_body()).await;
     assert_eq!(json["status"], "Being archived");
-    assert_eq!(json["pv_name"], "ONLY:OnPeer");
+    assert_eq!(json["pvName"], "ONLY:OnPeer");
 }
 
 #[tokio::test]
@@ -414,11 +417,28 @@ async fn test_retrieval_proxies_to_peer() {
         .to_string();
     let uri = format!("/retrieval/data/getData.json?pv=PEER:Data&from={from}&to={to}");
 
-    let resp = app.oneshot(get_request(&uri)).await.unwrap();
+    // Java parity (d1d436d): default behavior is now to redirect rather
+    // than proxy. Send `redirect: false` to opt back into the legacy
+    // buffer-and-stream path that this test was written against.
+    let req = Request::builder()
+        .method("GET")
+        .uri(&uri)
+        .header("redirect", "false")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_to_json(resp.into_body()).await;
     let data = json[0]["data"].as_array().unwrap();
     assert_eq!(data.len(), 5);
+
+    // Default (no redirect header) should issue a 302 to the peer
+    // (Java parity d1d436d — `resp.sendRedirect` emits 302 Found).
+    let resp = app.oneshot(get_request(&uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(location.contains("/retrieval/data/getData.json"));
+    assert!(location.contains("PEER%3AData") || location.contains("PEER:Data"));
 }
 
 #[tokio::test]
@@ -548,6 +568,7 @@ async fn build_cluster_test_app_with_auth(
             api_key: None,
         }],
         api_key: Some(CLUSTER_INTERNAL_KEY.to_string()),
+        reassign_appliance_enabled: false,
     };
 
     let repo = Arc::new(RegistryRepository::new(local_registry));
@@ -567,6 +588,7 @@ async fn build_cluster_test_app_with_auth(
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     build_router(state, &SecurityConfig::default())
 }
@@ -597,6 +619,7 @@ async fn start_mock_peer_with_auth(
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     let app = build_router(state, &SecurityConfig::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -750,6 +773,7 @@ async fn start_mock_peer_with_own_key(
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     let app = build_router(state, &SecurityConfig::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -793,6 +817,7 @@ async fn test_cluster_proxy_authenticates_with_per_peer_key() {
             api_key: Some(PEER_SPECIFIC_KEY.to_string()),
         }],
         api_key: None, // no fallback
+        reassign_appliance_enabled: false,
     };
 
     let repo = Arc::new(RegistryRepository::new(local_reg));
@@ -811,6 +836,7 @@ async fn test_cluster_proxy_authenticates_with_per_peer_key() {
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     let app = build_router(state, &SecurityConfig::default());
 
@@ -881,6 +907,7 @@ async fn test_different_peers_get_different_keys() {
             },
         ],
         api_key: None,
+        reassign_appliance_enabled: false,
     };
 
     let repo = Arc::new(RegistryRepository::new(local_reg));
@@ -899,6 +926,7 @@ async fn test_different_peers_get_different_keys() {
         trust_proxy_headers: false,
         failover: None,
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
     let app = build_router(state, &SecurityConfig::default());
 

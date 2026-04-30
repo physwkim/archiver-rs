@@ -22,8 +22,14 @@ use crate::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/mgmt/bpl/getAllPVs", get(pv_query::get_all_pvs))
-        .route("/mgmt/bpl/getMatchingPVs", get(pv_query::get_matching_pvs))
-        .route("/mgmt/bpl/getPVStatus", get(pv_query::get_pv_status))
+        .route(
+            "/mgmt/bpl/getMatchingPVs",
+            get(pv_query::get_matching_pvs).post(pv_query::get_matching_pvs_post),
+        )
+        .route(
+            "/mgmt/bpl/getPVStatus",
+            get(pv_query::get_pv_status).post(pv_query::get_pv_status_post),
+        )
         .route("/mgmt/bpl/archivePV", post(pv_control::archive_pv))
         .route("/mgmt/bpl/pauseArchivingPV", get(pv_control::pause_archiving_pv).post(pv_control::bulk_pause_archiving_pv))
         .route("/mgmt/bpl/resumeArchivingPV", get(pv_control::resume_archiving_pv).post(pv_control::bulk_resume_archiving_pv))
@@ -287,9 +293,42 @@ pub(super) async fn try_mgmt_dispatch(
         .ok()
 }
 
+/// POST counterpart of [`try_mgmt_dispatch`] — forwards the body so
+/// endpoints like `putPVTypeInfo` (Java parity cce2b1c) reach the
+/// appliance that owns the PV instead of writing to the local registry.
+pub(super) async fn try_mgmt_dispatch_post(
+    state: &AppState,
+    pv: &str,
+    endpoint: &str,
+    qs: &str,
+    body: axum::body::Bytes,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    if headers.get("X-Archiver-Proxied").is_some() {
+        return None;
+    }
+    let cluster = state.cluster.as_ref()?;
+    let canonical = state.pv_query.canonical_name(pv).ok()?;
+    if let Ok(Some(rec)) = state.pv_query.get_pv(&canonical)
+        && rec.alias_for.is_none()
+    {
+        return None;
+    }
+    let resolved = cluster.resolve_peer(&canonical).await?;
+    let endpoint_with_qs = if qs.is_empty() {
+        endpoint.to_string()
+    } else {
+        format!("{endpoint}?{qs}")
+    };
+    cluster
+        .proxy_mgmt_post(&resolved.mgmt_url, &endpoint_with_qs, body)
+        .await
+        .ok()
+}
+
 /// Route PVs to local vs remote batches based on cluster ownership.
 /// Returns (local_pvs, remote_batches_by_mgmt_url).
-async fn route_pvs(
+pub(super) async fn route_pvs(
     state: &AppState,
     pvs: &[String],
     is_proxied: bool,
@@ -341,7 +380,7 @@ async fn route_pvs(
 }
 
 /// Forward all remote PV batches to their respective peers and collect results.
-async fn forward_all_peer_batches(
+pub(super) async fn forward_all_peer_batches(
     cluster: &dyn ClusterRouter,
     batches: std::collections::HashMap<String, Vec<String>>,
     endpoint: &str,

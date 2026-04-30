@@ -190,6 +190,13 @@ pub struct ClusterConfig {
     /// Also serves as the inbound key this appliance accepts from peers.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Java parity (59f0758): explicit opt-in for the destructive
+    /// `reassignAppliance` live-migration endpoint. Default `false` so
+    /// having cluster mode enabled doesn't on its own permit the
+    /// migration — operators must validate destination data stores
+    /// before flipping this on.
+    #[serde(default)]
+    pub reassign_appliance_enabled: bool,
 }
 
 fn default_cache_ttl() -> u64 {

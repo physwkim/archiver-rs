@@ -47,6 +47,26 @@ async fn try_cluster_proxy(
     let resolved = cluster.resolve_peer(pv_name).await?;
     let qs = uri.query().unwrap_or("");
 
+    // Java parity (d1d436d): default to a 302 Found redirect to the
+    // owning peer rather than buffer-and-stream proxying. Java's
+    // `resp.sendRedirect(url)` emits exactly 302 — we match that wire
+    // shape so cross-version cluster behaviour is identical. Clients
+    // that explicitly opt out via `redirect: false` (or query
+    // `redirect=false`) keep the legacy proxy path.
+    let prefer_redirect = !redirect_disabled(headers, uri);
+    if prefer_redirect {
+        let mut location = format!("{}/{}", resolved.retrieval_url.trim_end_matches('/'), path.trim_start_matches('/'));
+        if !qs.is_empty() {
+            location.push('?');
+            location.push_str(qs);
+        }
+        return axum::http::Response::builder()
+            .status(axum::http::StatusCode::FOUND)
+            .header(axum::http::header::LOCATION, location)
+            .body(axum::body::Body::empty())
+            .ok();
+    }
+
     match cluster.proxy_retrieval(&resolved.retrieval_url, path, qs).await {
         Ok(resp) => Some(resp),
         Err(e) => {
@@ -54,6 +74,29 @@ async fn try_cluster_proxy(
             None
         }
     }
+}
+
+/// True iff the caller opted out of the 302 redirect path. Accepted
+/// signals: header `redirect: false` (case-insensitive) or query
+/// parameter `redirect=false`. Anything else preserves the redirect.
+fn redirect_disabled(headers: &HeaderMap, uri: &axum::http::Uri) -> bool {
+    if let Some(v) = headers.get("redirect")
+        && let Ok(s) = v.to_str()
+        && s.eq_ignore_ascii_case("false")
+    {
+        return true;
+    }
+    if let Some(qs) = uri.query() {
+        for pair in qs.split('&') {
+            if let Some((k, v)) = pair.split_once('=')
+                && k.eq_ignore_ascii_case("redirect")
+                && v.eq_ignore_ascii_case("false")
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn routes() -> Router<AppState> {
@@ -81,6 +124,7 @@ struct GetDataAtTimeParams {
 
 async fn get_data_at_time(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Query(p): axum::extract::Query<GetDataAtTimeParams>,
     crate::pv_input::PvListInput(pvs): crate::pv_input::PvListInput,
 ) -> Response {
@@ -91,7 +135,73 @@ async fn get_data_at_time(
         .unwrap_or_else(SystemTime::now);
 
     let mut out = serde_json::Map::new();
-    for pv in pvs {
+
+    // Java parity (26124b6): group PVs by owning peer so a multi-PV
+    // request whose names span appliances fans out one POST per peer
+    // instead of silently returning null for non-local names. Local
+    // PVs continue through the storage path below. The proxy guard
+    // (`X-Archiver-Proxied`) prevents loops between cluster peers.
+    let is_proxied = headers.get("X-Archiver-Proxied").is_some();
+    let mut local_pvs: Vec<String> = Vec::new();
+    if is_proxied || state.cluster.is_none() {
+        local_pvs = pvs;
+    } else if let Some(ref cluster) = state.cluster {
+        // Pre-fetch local registry state in two queries instead of 2N
+        // per-PV sqlite hits — same pattern as `route_pvs`.
+        let local_set: std::collections::HashSet<String> = state
+            .pv_query
+            .all_pv_names()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let alias_map: std::collections::HashMap<String, String> = state
+            .pv_query
+            .all_aliases()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let mut by_peer: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for pv in pvs {
+            let canonical = alias_map.get(&pv).cloned().unwrap_or_else(|| pv.clone());
+            if local_set.contains(&canonical) {
+                local_pvs.push(pv);
+                continue;
+            }
+            match cluster.resolve_peer(&canonical).await {
+                Some(resolved) => by_peer.entry(resolved.retrieval_url).or_default().push(pv),
+                None => local_pvs.push(pv),
+            }
+        }
+        for (peer_url, batch) in by_peer {
+            match cluster
+                .proxy_data_at_time(&peer_url, p.at.as_deref(), &batch)
+                .await
+            {
+                Ok(serde_json::Value::Object(map)) => {
+                    for (k, v) in map {
+                        out.insert(k, v);
+                    }
+                }
+                Ok(_) => {
+                    // Peer responded with a non-object (shouldn't
+                    // happen). Fall back to nulls so the response shape
+                    // is preserved.
+                    for pv in &batch {
+                        out.insert(pv.clone(), serde_json::Value::Null);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(peer = peer_url, "getDataAtTime peer dispatch failed: {e}");
+                    for pv in &batch {
+                        out.insert(pv.clone(), serde_json::Value::Null);
+                    }
+                }
+            }
+        }
+    }
+
+    for pv in local_pvs {
         let canonical = state
             .pv_query
             .canonical_name(&pv)
@@ -127,7 +237,15 @@ async fn get_data_at_time(
         let entry = match pick {
             Some(s) => {
                 let (year, secs, nanos) = s.decompose_timestamp();
-                let val = sample_value_to_json(&s.value);
+                let val = archiver_value_to_json(&s.value);
+                // Java parity (9b55268): include a "meta" object carrying the
+                // PB field values (EGU, PREC, cnxlost markers, etc.) so
+                // Phoebus and save-restore clients can interpret the value.
+                let meta: serde_json::Map<String, serde_json::Value> = s
+                    .field_values
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
                 serde_json::json!({
                     "secs": SystemTime::from(
                         chrono::DateTime::<chrono::Utc>::from(s.timestamp)
@@ -141,6 +259,7 @@ async fn get_data_at_time(
                     "val": val,
                     "severity": s.severity,
                     "status": s.status,
+                    "meta": meta,
                 })
             }
             None => serde_json::Value::Null,
@@ -154,30 +273,7 @@ async fn get_data_at_time(
     axum::Json(serde_json::Value::Object(out)).into_response()
 }
 
-fn sample_value_to_json(v: &ArchiverValue) -> serde_json::Value {
-    use serde_json::Value;
-    match v {
-        ArchiverValue::ScalarString(s) => Value::String(s.clone()),
-        ArchiverValue::ScalarShort(n) => (*n).into(),
-        ArchiverValue::ScalarInt(n) => (*n).into(),
-        ArchiverValue::ScalarEnum(n) => (*n).into(),
-        ArchiverValue::ScalarFloat(f) => (*f as f64).into(),
-        ArchiverValue::ScalarDouble(f) => (*f).into(),
-        ArchiverValue::ScalarByte(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorString(arr) => {
-            Value::Array(arr.iter().map(|s| Value::String(s.clone())).collect())
-        }
-        ArchiverValue::VectorChar(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorShort(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorInt(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorEnum(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorFloat(arr) => {
-            Value::Array(arr.iter().map(|x| (*x as f64).into()).collect())
-        }
-        ArchiverValue::VectorDouble(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::V4GenericBytes(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
-    }
-}
+use archiver_core::types::archiver_value_to_json;
 
 #[derive(Debug, Deserialize)]
 struct GetDataParams {
@@ -377,9 +473,14 @@ fn parse_retrieval_params(params: &GetDataParams) -> RetrievalParams {
         .usereduced
         .as_deref()
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    // Java parity (3f2ea60): strip protocol prefix (`ca://`, `pva://`) and
+    // trailing `.VAL` from the lookup name so a Phoebus / CSS request with
+    // a protocol-qualified name resolves to the bare-name registry entry.
+    // The original requested name is preserved for response echo.
+    let lookup_name = archiver_core::registry::normalize_pv_name(&pv_name).to_string();
     RetrievalParams {
-        requested_name: pv_name.clone(),
-        pv_name,
+        requested_name: pv_name,
+        pv_name: lookup_name,
         pp_spec,
         use_reduced,
         start,
@@ -412,32 +513,13 @@ fn resolve_post_processor(
     None
 }
 
-fn sample_to_json_value(value: &ArchiverValue) -> serde_json::Value {
-    match value {
-        ArchiverValue::ScalarString(v) => serde_json::Value::String(v.clone()),
-        ArchiverValue::ScalarByte(v) => serde_json::json!(v),
-        ArchiverValue::ScalarShort(v) => serde_json::json!(v),
-        ArchiverValue::ScalarInt(v) => serde_json::json!(v),
-        ArchiverValue::ScalarEnum(v) => serde_json::json!(v),
-        ArchiverValue::ScalarFloat(v) => serde_json::json!(v),
-        ArchiverValue::ScalarDouble(v) => serde_json::json!(v),
-        ArchiverValue::VectorString(v) => serde_json::json!(v),
-        ArchiverValue::VectorChar(v) => serde_json::json!(v),
-        ArchiverValue::VectorShort(v) => serde_json::json!(v),
-        ArchiverValue::VectorInt(v) => serde_json::json!(v),
-        ArchiverValue::VectorEnum(v) => serde_json::json!(v),
-        ArchiverValue::VectorFloat(v) => serde_json::json!(v),
-        ArchiverValue::VectorDouble(v) => serde_json::json!(v),
-        ArchiverValue::V4GenericBytes(v) => serde_json::json!(v),
-    }
-}
 
 fn sample_to_json(s: &ArchiverSample) -> JsonSample {
     let dt = DateTime::<Utc>::from(s.timestamp);
     JsonSample {
         secs: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
-        val: sample_to_json_value(&s.value),
+        val: archiver_value_to_json(&s.value),
         severity: s.severity,
         status: s.status,
     }

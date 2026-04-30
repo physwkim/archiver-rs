@@ -230,6 +230,18 @@ pub async fn reassign_appliance(
     State(state): State<AppState>,
     Query(q): Query<ReassignQuery>,
 ) -> Response {
+    // Java parity (59f0758): refuse unless the operator has explicitly
+    // opted in. Cluster mode being available is not the same as having
+    // validated destination data stores for safe reassignment.
+    if !state.reassign_appliance_enabled {
+        return ApiError::BadRequest(
+            "This installation has not been configured to support dynamic \
+             reassignment of PVs to appliances (set \
+             cluster.reassign_appliance_enabled = true to opt in)"
+                .to_string(),
+        )
+        .into_response();
+    }
     let cluster = match state.cluster.as_ref() {
         Some(c) => c,
         None => {
@@ -562,34 +574,7 @@ pub async fn receive_pv_migration(
     .into_response()
 }
 
-/// Source-side: ArchiverValue → JSON. Mirrors the converter the
-/// retrieval handlers use; kept local to keep this module self-
-/// contained.
-fn archiver_value_to_json(v: &archiver_core::types::ArchiverValue) -> serde_json::Value {
-    use archiver_core::types::ArchiverValue;
-    use serde_json::Value;
-    match v {
-        ArchiverValue::ScalarString(s) => Value::String(s.clone()),
-        ArchiverValue::ScalarShort(n) => (*n).into(),
-        ArchiverValue::ScalarInt(n) => (*n).into(),
-        ArchiverValue::ScalarEnum(n) => (*n).into(),
-        ArchiverValue::ScalarFloat(f) => (*f as f64).into(),
-        ArchiverValue::ScalarDouble(f) => (*f).into(),
-        ArchiverValue::ScalarByte(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorString(arr) => {
-            Value::Array(arr.iter().map(|s| Value::String(s.clone())).collect())
-        }
-        ArchiverValue::VectorChar(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorShort(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorInt(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorEnum(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorFloat(arr) => {
-            Value::Array(arr.iter().map(|x| (*x as f64).into()).collect())
-        }
-        ArchiverValue::VectorDouble(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::V4GenericBytes(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
-    }
-}
+use archiver_core::types::archiver_value_to_json;
 
 /// Dest-side: JSON → ArchiverValue. Uses `dbr_type` to choose the
 /// right variant, since the JSON shape (number / string / array)
@@ -850,15 +835,26 @@ pub async fn dropped_events_timestamp_report(State(state): State<AppState>) -> R
 }
 
 pub async fn dropped_events_type_change_report(State(state): State<AppState>) -> Response {
+    // Java parity (9f2234f): expose the latest CA-reported DBR alongside
+    // the registry-archived type so operators can diagnose what the IOC
+    // is now sending vs what the archiver expected.
     let entries: Vec<serde_json::Value> = state
         .archiver_query
         .all_pv_counters()
         .into_iter()
         .filter(|(_, c)| c.type_change_drops > 0)
         .map(|(pv, c)| {
+            let archived_dbr = state
+                .pv_query
+                .get_pv(&pv)
+                .ok()
+                .flatten()
+                .map(|r| r.dbr_type as i32);
             serde_json::json!({
                 "pvName": pv,
                 "drops": c.type_change_drops,
+                "archivedDbrType": archived_dbr,
+                "latestCaDbrType": c.latest_observed_dbr,
             })
         })
         .collect();

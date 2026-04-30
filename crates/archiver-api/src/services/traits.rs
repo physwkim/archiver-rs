@@ -94,6 +94,10 @@ pub struct PvCountersDto {
     pub type_change_drops: u64,
     pub disconnect_count: u64,
     pub last_disconnect_unix_secs: Option<i64>,
+    pub transient_error_count: u64,
+    /// Latest CA-reported DBR type when it differed from the archived
+    /// type (Java parity 9f2234f). `None` if no mismatch ever observed.
+    pub latest_observed_dbr: Option<i32>,
 }
 
 // --- ArchiverCommand (async — write operations on archiver engine) ---
@@ -119,6 +123,9 @@ pub struct ConnectionInfoDto {
     pub connected_since: Option<SystemTime>,
     pub last_event_time: Option<SystemTime>,
     pub is_connected: bool,
+    /// Discrete connection state (Java parity dea7acb): Idle, Connecting,
+    /// Connected, Disconnected. `None` when the PV has no engine handle.
+    pub connection_state: Option<&'static str>,
 }
 
 // --- ClusterRouter (async — HTTP-based, mixed read/write) ---
@@ -155,8 +162,41 @@ pub trait ClusterRouter: Send + Sync {
     async fn proxy_mgmt_get(&self, mgmt_url: &str, endpoint: &str, qs: &str) -> anyhow::Result<axum::response::Response>;
     async fn proxy_mgmt_post(&self, mgmt_url: &str, endpoint: &str, body: axum::body::Bytes) -> anyhow::Result<axum::response::Response>;
     async fn aggregate_all_pvs(&self) -> Vec<String>;
+    /// Java parity (5ebf1e1 + 9b78b21): forward `&limit=N` to peers so a
+    /// `?cluster=true&limit=500` against a 100k-PV deployment doesn't
+    /// pull every name off every peer just to truncate locally.
+    async fn aggregate_all_pvs_limited(&self, limit: Option<i64>) -> Vec<String>;
     async fn aggregate_matching_pvs(&self, pattern: &str) -> Vec<String>;
+    /// Java parity (9b78b21): forward `&limit=N` to peers so the
+    /// aggregator doesn't pull `peer_default × peers` names just to
+    /// truncate locally. `None` keeps peer defaults.
+    async fn aggregate_matching_pvs_limited(
+        &self,
+        pattern: &str,
+        limit: Option<i64>,
+    ) -> Vec<String>;
     async fn aggregate_pv_count(&self) -> (u64, u64, u64, usize);
     async fn remote_pv_status(&self, pv: &str) -> Option<serde_json::Value>;
+    /// Like `remote_pv_status` but distinguishes "all peers responded
+    /// negatively" from "at least one peer was unreachable" so callers
+    /// can surface `Appliance Down` for the latter (Java parity c2d9f9e).
+    async fn remote_pv_status_detailed(&self, pv: &str) -> RemoteStatusOutcomeDto;
     async fn proxy_retrieval(&self, peer_retrieval_url: &str, path: &str, query_string: &str) -> anyhow::Result<axum::response::Response>;
+    /// Java parity (26124b6): POST `pvs` to the peer's
+    /// `/retrieval/data/getDataAtTime` and return the parsed JSON
+    /// response so multi-PV requests can fan out across appliances.
+    async fn proxy_data_at_time(
+        &self,
+        peer_retrieval_url: &str,
+        at: Option<&str>,
+        pvs: &[String],
+    ) -> anyhow::Result<serde_json::Value>;
+}
+
+/// Service-layer mirror of `cluster::RemoteStatusOutcome` so handlers can
+/// stay decoupled from the concrete `cluster` module.
+pub enum RemoteStatusOutcomeDto {
+    Found(serde_json::Value),
+    NotArchived,
+    ApplianceDown,
 }

@@ -170,6 +170,7 @@ async fn failover_merges_and_dedupes_peer_samples() {
             timeout: Duration::from_secs(5),
         })),
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
 
     let app = build_router(state, &SecurityConfig::default());
@@ -245,6 +246,7 @@ async fn failover_tolerates_unreachable_peer() {
             timeout: Duration::from_secs(1),
         })),
         etl_chain: Vec::new(),
+        reassign_appliance_enabled: false,
     };
 
     let app = build_router(state, &SecurityConfig::default());

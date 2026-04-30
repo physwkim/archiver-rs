@@ -238,6 +238,11 @@ async fn main() -> anyhow::Result<()> {
         })
     });
 
+    let reassign_appliance_enabled = config
+        .cluster
+        .as_ref()
+        .map(|c| c.reassign_appliance_enabled)
+        .unwrap_or(false);
     let app_state = AppState {
         storage: storage.clone(),
         pv_query: repo.clone(),
@@ -252,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
         trust_proxy_headers: config.security.trust_proxy_headers,
         failover: failover_state,
         etl_chain,
+        reassign_appliance_enabled,
     };
     // Optional PVA retrieval RPC server. Starts before the HTTP listener
     // so a startup failure surfaces while logs are still attached. The

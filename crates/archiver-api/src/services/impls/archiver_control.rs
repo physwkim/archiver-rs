@@ -24,6 +24,7 @@ impl ArchiverQuery for ChannelArchiverControl {
             connected_since: c.connected_since,
             last_event_time: c.last_event_time,
             is_connected: c.is_connected,
+            connection_state: Some(c.state.as_str()),
         })
     }
 
@@ -51,6 +52,8 @@ impl ArchiverQuery for ChannelArchiverControl {
                         type_change_drops: c.type_change_drops,
                         disconnect_count: c.disconnect_count,
                         last_disconnect_unix_secs: c.last_disconnect_unix_secs,
+                        transient_error_count: c.transient_error_count,
+                        latest_observed_dbr: c.latest_observed_dbr,
                     },
                 )
             })
@@ -75,31 +78,7 @@ impl ArchiverQuery for ChannelArchiverControl {
     }
 }
 
-fn archiver_value_to_json(v: &archiver_core::types::ArchiverValue) -> serde_json::Value {
-    use archiver_core::types::ArchiverValue;
-    use serde_json::Value;
-    match v {
-        ArchiverValue::ScalarString(s) => Value::String(s.clone()),
-        ArchiverValue::ScalarShort(n) => (*n).into(),
-        ArchiverValue::ScalarInt(n) => (*n).into(),
-        ArchiverValue::ScalarEnum(n) => (*n).into(),
-        ArchiverValue::ScalarFloat(f) => (*f as f64).into(),
-        ArchiverValue::ScalarDouble(f) => (*f).into(),
-        ArchiverValue::ScalarByte(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorString(arr) => {
-            Value::Array(arr.iter().map(|s| Value::String(s.clone())).collect())
-        }
-        ArchiverValue::VectorChar(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorShort(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorInt(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorEnum(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::VectorFloat(arr) => {
-            Value::Array(arr.iter().map(|x| (*x as f64).into()).collect())
-        }
-        ArchiverValue::VectorDouble(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
-        ArchiverValue::V4GenericBytes(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
-    }
-}
+use archiver_core::types::archiver_value_to_json;
 
 #[async_trait]
 impl ArchiverCommand for ChannelArchiverControl {

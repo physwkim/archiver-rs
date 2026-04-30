@@ -44,6 +44,9 @@ pub struct AppState {
     /// `consolidateDataForPV` chains them to force-move a PV's data toward
     /// the requested tier.
     pub etl_chain: Vec<Arc<EtlExecutor>>,
+    /// Java parity (59f0758): operator-opt-in flag for the destructive
+    /// `reassignAppliance` live-migration endpoint.
+    pub reassign_appliance_enabled: bool,
 }
 
 /// Middleware that records HTTP request metrics.

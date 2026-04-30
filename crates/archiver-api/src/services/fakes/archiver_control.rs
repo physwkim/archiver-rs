@@ -44,6 +44,11 @@ impl ArchiverQuery for FakeArchiverControl {
                 connected_since: Some(std::time::SystemTime::now()),
                 last_event_time: None,
                 is_connected: !state.paused.contains(pv),
+                connection_state: Some(if state.paused.contains(pv) {
+                    "Disconnected"
+                } else {
+                    "Connected"
+                }),
             })
         } else {
             None
@@ -96,6 +101,8 @@ impl ArchiverQuery for FakeArchiverControl {
                         type_change_drops: 0,
                         disconnect_count: 0,
                         last_disconnect_unix_secs: None,
+                        transient_error_count: 0,
+                        latest_observed_dbr: None,
                     },
                 )
             })

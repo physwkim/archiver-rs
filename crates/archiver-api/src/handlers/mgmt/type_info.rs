@@ -177,8 +177,9 @@ pub struct PutTypeInfoBody {
 pub async fn put_pv_type_info(
     State(state): State<AppState>,
     Query(q): Query<PutTypeInfoQuery>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     if q.pv.is_empty() {
         return Err(ApiError::BadRequest("pv parameter is required".to_string()));
     }
@@ -188,6 +189,29 @@ pub async fn put_pv_type_info(
         return Err(ApiError::BadRequest(
             "must specify at least one of override or createnew".to_string(),
         ));
+    }
+
+    // Java parity (cce2b1c): forward the write to the appliance that
+    // owns the PV identity instead of always writing locally. Without
+    // this, a `putPVTypeInfo` for a PV belonging to a peer would create
+    // a divergent local registry row.
+    let qs = format!(
+        "pv={}&override={}&createnew={}",
+        urlencoding::encode(&q.pv),
+        if allow_override { "true" } else { "false" },
+        if allow_create { "true" } else { "false" },
+    );
+    if let Some(resp) = super::try_mgmt_dispatch_post(
+        &state,
+        &q.pv,
+        "putPVTypeInfo",
+        &qs,
+        body.clone(),
+        &headers,
+    )
+    .await
+    {
+        return Ok(resp);
     }
 
     let parsed: PutTypeInfoBody = serde_json::from_slice(&body)
@@ -275,12 +299,13 @@ pub async fn put_pv_type_info(
         .or_else(|| existing.as_ref().map(|r| r.element_count))
         .unwrap_or(1);
 
-    let status = parsed
-        .status
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| existing.as_ref().map(|r| r.status))
-        .unwrap_or(PvStatus::Paused);
+    // Java parity (cce2b1c): every PUT — both create and update — is
+    // forced to Paused regardless of what the body claims. Java's
+    // `readInNewTypeInfo` calls `setPaused(true)` unconditionally so
+    // a script that PUTs a typeinfo blob to override a running PV
+    // can't accidentally resume archiving without an explicit
+    // `resumeArchivingPV` follow-up.
+    let status = PvStatus::Paused;
 
     let prec = parsed
         .prec
@@ -321,12 +346,29 @@ pub async fn put_pv_type_info(
         )
         .map_err(ApiError::internal)?;
 
+    // Java parity (cce2b1c): the registry write above sets the record to
+    // Paused. If a CA channel was already running for this PV, the engine
+    // task is still live — flipping the registry alone leaves the engine
+    // and registry diverged until process restart. Stop the channel so
+    // both sides agree (idempotent on PVs that aren't currently active).
+    //
+    // Skip alias rows: aliases are routing entries, not archive subjects,
+    // and have no live channel. Calling pause_pv on an alias name lookups
+    // a non-existent handle, harmless but noisy in the debug log.
+    if alias_for.is_none()
+        && let Err(e) = state.archiver_cmd.pause_pv(&q.pv).await
+    {
+        // Best-effort: a missing engine handle is fine, anything else is
+        // logged but non-fatal — the registry write already succeeded.
+        tracing::debug!(pv = q.pv, "pause_pv after putPVTypeInfo: {e}");
+    }
+
     let record = state
         .pv_query
         .get_pv(&q.pv)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::internal(anyhow::anyhow!("vanished after write")))?;
-    Ok(axum::Json(record_to_type_info(&record)))
+    Ok(axum::Json(record_to_type_info(&record)).into_response())
 }
 
 /// `GET /mgmt/bpl/getPVTypeInfoKeys?cluster=true`

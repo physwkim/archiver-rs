@@ -281,6 +281,14 @@ pub async fn pause_archiving_pv(
     headers: HeaderMap,
     Query(params): Query<PausePvParams>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Java parity (289c603): a `?pv=` value containing `,`, `*`, or `?`
+    // is multi-PV — expand against the registry and dispatch through the
+    // cluster-aware bulk path so peer-owned PVs in the result are
+    // forwarded rather than silently no-op'd.
+    if has_multi_pv_chars(&params.pv) {
+        let pvs = expand_pv_spec(&state, &params.pv).await;
+        return Ok(pause_pvs_bulk(&state, &headers, pvs).await);
+    }
     let canonical = super::resolve_canonical(&state, &params.pv);
     let qs = format!("pv={}", urlencoding::encode(&canonical));
     if let Some(resp) = try_mgmt_dispatch(&state, &canonical, "pauseArchivingPV", &qs, &headers).await {
@@ -291,7 +299,121 @@ pub async fn pause_archiving_pv(
         .pause_pv(&canonical)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to pause PV {canonical}: {e}")))?;
+    // Java parity (92db337): consolidate STS/MTS into LTS so the paused
+    // PV's data isn't stranded mid-tier with no further migrations.
+    consolidate_on_pause(&state, &canonical).await;
     Ok(format!("Successfully paused PV {canonical}").into_response())
+}
+
+/// Java parity (289c603): the GET pause/resume entry treats `?pv=` as
+/// a list when it carries comma or glob metacharacters.
+fn has_multi_pv_chars(s: &str) -> bool {
+    s.contains([',', '*', '?'])
+}
+
+/// Expand a comma-separated, optionally-globbed `pv=` value into a
+/// concrete list of PV names. When cluster mode is on, glob tokens
+/// also probe peers via `aggregate_matching_pvs` so an operator
+/// typing `?pv=PREFIX:*` against the cluster sees every matching PV
+/// — `pause_pvs_bulk` then routes each name to its owning appliance.
+async fn expand_pv_spec(state: &AppState, spec: &str) -> Vec<String> {
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for tok in spec.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if tok.contains(['*', '?']) {
+            if let Ok(matches) = state.pv_query.matching_pvs_expanded(tok) {
+                out.extend(matches);
+            }
+            if let Some(ref cluster) = state.cluster {
+                out.extend(cluster.aggregate_matching_pvs(tok).await);
+            }
+        } else {
+            out.insert(tok.to_string());
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Cluster-aware bulk pause used by both the GET-with-glob entry and
+/// the POST bulk handler. Routes through `route_pvs` so peer-owned PVs
+/// in the input are forwarded to their owning appliance instead of
+/// being silently no-op'd locally.
+async fn pause_pvs_bulk(
+    state: &AppState,
+    headers: &HeaderMap,
+    pvs: Vec<String>,
+) -> Response {
+    let is_proxied = headers.get("X-Archiver-Proxied").is_some();
+    let (local_pvs, remote_batches) = super::route_pvs(state, &pvs, is_proxied).await;
+    let mut results = Vec::with_capacity(pvs.len());
+    if let Some(ref cluster) = state.cluster {
+        results.extend(
+            super::forward_all_peer_batches(cluster.as_ref(), remote_batches, "pauseArchivingPV")
+                .await,
+        );
+    }
+    for pv in &local_pvs {
+        let status = match state.archiver_cmd.pause_pv(pv).await {
+            Ok(()) => {
+                consolidate_on_pause(state, pv).await;
+                "Successfully paused".to_string()
+            }
+            Err(e) => {
+                tracing::warn!(pv, "Failed to pause: {e}");
+                format!("Failed to pause: {e}")
+            }
+        };
+        results.push(BulkResult {
+            pv_name: pv.clone(),
+            status,
+        });
+    }
+    axum::Json(results).into_response()
+}
+
+async fn resume_pvs_bulk(
+    state: &AppState,
+    headers: &HeaderMap,
+    pvs: Vec<String>,
+) -> Response {
+    let is_proxied = headers.get("X-Archiver-Proxied").is_some();
+    let (local_pvs, remote_batches) = super::route_pvs(state, &pvs, is_proxied).await;
+    let mut results = Vec::with_capacity(pvs.len());
+    if let Some(ref cluster) = state.cluster {
+        results.extend(
+            super::forward_all_peer_batches(cluster.as_ref(), remote_batches, "resumeArchivingPV")
+                .await,
+        );
+    }
+    for pv in &local_pvs {
+        let status = match state.archiver_cmd.resume_pv(pv).await {
+            Ok(()) => "Successfully resumed".to_string(),
+            Err(e) => {
+                tracing::warn!(pv, "Failed to resume: {e}");
+                format!("Failed to resume: {e}")
+            }
+        };
+        results.push(BulkResult {
+            pv_name: pv.clone(),
+            status,
+        });
+    }
+    axum::Json(results).into_response()
+}
+
+/// Drain every ETL tier for `pv` so its current data lands at the bottom
+/// tier before the engine task is gone (matches Java's
+/// `consolidateOnShutdown`, 92db337). Failures are logged, not surfaced —
+/// the pause itself already succeeded by the time we get here.
+async fn consolidate_on_pause(state: &AppState, pv: &str) {
+    for tier in &state.etl_chain {
+        if let Err(e) = tier.consolidate_pv(pv).await {
+            tracing::warn!(pv, "consolidate_on_pause failed for tier: {e}");
+        }
+    }
 }
 
 pub async fn resume_archiving_pv(
@@ -299,6 +421,11 @@ pub async fn resume_archiving_pv(
     headers: HeaderMap,
     Query(params): Query<PausePvParams>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Java parity (289c603): glob/comma → cluster-aware bulk dispatch.
+    if has_multi_pv_chars(&params.pv) {
+        let pvs = expand_pv_spec(&state, &params.pv).await;
+        return Ok(resume_pvs_bulk(&state, &headers, pvs).await);
+    }
     let canonical = super::resolve_canonical(&state, &params.pv);
     let qs = format!("pv={}", urlencoding::encode(&canonical));
     if let Some(resp) = try_mgmt_dispatch(&state, &canonical, "resumeArchivingPV", &qs, &headers).await {
@@ -319,32 +446,7 @@ pub async fn bulk_pause_archiving_pv(
     headers: HeaderMap,
     PvListInput(pvs): PvListInput,
 ) -> Response {
-    let is_proxied = headers.get("X-Archiver-Proxied").is_some();
-    let (local_pvs, remote_batches) = route_pvs(&state, &pvs, is_proxied).await;
-
-    let mut results = Vec::with_capacity(pvs.len());
-
-    if let Some(ref cluster) = state.cluster {
-        results.extend(
-            forward_all_peer_batches(cluster.as_ref(), remote_batches, "pauseArchivingPV").await,
-        );
-    }
-
-    for pv in &local_pvs {
-        let status = match state.archiver_cmd.pause_pv(pv).await {
-            Ok(()) => "Successfully paused".to_string(),
-            Err(e) => {
-                tracing::warn!(pv, "Failed to pause: {e}");
-                format!("Failed to pause: {e}")
-            }
-        };
-        results.push(BulkResult {
-            pv_name: pv.clone(),
-            status,
-        });
-    }
-
-    axum::Json(results).into_response()
+    pause_pvs_bulk(&state, &headers, pvs).await
 }
 
 pub async fn bulk_resume_archiving_pv(
@@ -352,32 +454,7 @@ pub async fn bulk_resume_archiving_pv(
     headers: HeaderMap,
     PvListInput(pvs): PvListInput,
 ) -> Response {
-    let is_proxied = headers.get("X-Archiver-Proxied").is_some();
-    let (local_pvs, remote_batches) = route_pvs(&state, &pvs, is_proxied).await;
-
-    let mut results = Vec::with_capacity(pvs.len());
-
-    if let Some(ref cluster) = state.cluster {
-        results.extend(
-            forward_all_peer_batches(cluster.as_ref(), remote_batches, "resumeArchivingPV").await,
-        );
-    }
-
-    for pv in &local_pvs {
-        let status = match state.archiver_cmd.resume_pv(pv).await {
-            Ok(()) => "Successfully resumed".to_string(),
-            Err(e) => {
-                tracing::warn!(pv, "Failed to resume: {e}");
-                format!("Failed to resume: {e}")
-            }
-        };
-        results.push(BulkResult {
-            pv_name: pv.clone(),
-            status,
-        });
-    }
-
-    axum::Json(results).into_response()
+    resume_pvs_bulk(&state, &headers, pvs).await
 }
 
 // --- Delete PV ---
@@ -513,7 +590,6 @@ pub async fn abort_archiving_pv(
     }
 
     let msg = crate::usecases::abort_archiving::abort_archiving(
-        state.pv_query.as_ref(),
         state.archiver_cmd.as_ref(),
         &canonical,
     )
