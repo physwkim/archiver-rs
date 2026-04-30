@@ -174,7 +174,32 @@ impl PlainPbStoragePlugin {
 
 /// Convert PV name to file path key.
 /// `SIM:Sine` → `SIM/Sine`
+///
+/// Defensive: an attacker-supplied PV name like `../../etc/passwd` would
+/// otherwise pass straight through and let `Path::join` escape the
+/// storage root. Registry-side validation already rejects these at
+/// register_pv / import_pv / add_alias time, but we re-validate here so
+/// any code path that bypasses the registry (e.g. retrieval of a PV
+/// name read directly from a PB file's PayloadInfo) still fails closed.
+/// Returns a sanitized fallback rather than panicking so retrieval
+/// errors stay diagnosable.
 fn pv_name_to_key(pv: &str) -> String {
+    if !crate::registry::is_valid_pv_name(pv) {
+        // Strip every disallowed character so path joins stay anchored
+        // at the storage root. Use a marker prefix so an audit can spot
+        // these: we never write to such paths in normal operation.
+        let mut sanitized = String::with_capacity(pv.len() + 16);
+        sanitized.push_str("__invalid__/");
+        for c in pv.chars() {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                sanitized.push(c);
+            } else {
+                sanitized.push('_');
+            }
+        }
+        tracing::warn!(pv, "PV name rejected by validator; sanitized to {sanitized}");
+        return sanitized;
+    }
     pv.replace(':', "/")
 }
 

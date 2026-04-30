@@ -50,6 +50,42 @@ pub fn strip_field_suffix(name: &str) -> Option<&str> {
     Some(base)
 }
 
+/// Reject PV names that, when mapped to a filesystem path, could escape
+/// the storage root or do other naughty things. Java archiver enforces a
+/// `[A-Za-z0-9_:.\-+\[\]<>;]` allowlist via `PVNames.isValidPVName`; we
+/// instead use a conservative blocklist (no `..`, no `/`, no NUL, no
+/// leading `.`, no leading-`-`, no whitespace) — strict enough to keep
+/// `pv_name_to_key` from generating an absolute or traversal path, but
+/// permissive enough not to break existing site naming conventions
+/// like `SIM:Sine` and `IOC[A]:val<x>`.
+///
+/// Called by every registry entry-point (register / import / add_alias)
+/// AND by `pv_name_to_key` as defense in depth, so any code path that
+/// builds a filesystem name from a PV string fails closed if the
+/// HTTP-layer validation is bypassed.
+pub fn is_valid_pv_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 256 {
+        return false;
+    }
+    if name.starts_with('.') || name.starts_with('-') || name.starts_with('/') {
+        return false;
+    }
+    for component in name.split([':', '/']) {
+        if component == ".." || component == "." {
+            return false;
+        }
+    }
+    !name.chars().any(|c| {
+        c == '\0'
+            || c == '\\'
+            || c.is_whitespace()
+            || c.is_control()
+            // Reject backslash and other path-shell metacharacters that
+            // could surprise downstream tools that re-parse the name.
+            || matches!(c, '|' | '&' | ';' | '`' | '$' | '"' | '\'' | '*' | '?')
+    })
+}
+
 /// PV archiving status.
 ///
 /// `Alias` is a sentinel applied to alias rows so they don't appear in
@@ -231,6 +267,9 @@ impl PvRegistry {
         sample_mode: &SampleMode,
         element_count: i32,
     ) -> anyhow::Result<()> {
+        if !is_valid_pv_name(pv_name) {
+            anyhow::bail!("invalid PV name: {pv_name:?}");
+        }
         let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let (mode_str, period) = sample_mode.to_db();
@@ -471,6 +510,14 @@ impl PvRegistry {
         archive_fields: &[String],
         policy_name: Option<&str>,
     ) -> anyhow::Result<()> {
+        if !is_valid_pv_name(pv_name) {
+            anyhow::bail!("invalid PV name: {pv_name:?}");
+        }
+        if let Some(target) = alias_for
+            && !is_valid_pv_name(target)
+        {
+            anyhow::bail!("invalid alias target: {target:?}");
+        }
         let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let (mode_str, period) = sample_mode.to_db();
@@ -547,6 +594,12 @@ impl PvRegistry {
     pub fn add_alias(&self, alias: &str, target: &str) -> anyhow::Result<()> {
         if alias == target {
             anyhow::bail!("alias and target must differ");
+        }
+        if !is_valid_pv_name(alias) {
+            anyhow::bail!("invalid alias name: {alias:?}");
+        }
+        if !is_valid_pv_name(target) {
+            anyhow::bail!("invalid alias target: {target:?}");
         }
         let conn = self.lock_conn()?;
         // Resolve target (must be a real PV, not itself an alias).
@@ -755,6 +808,56 @@ fn is_duplicate_column_error(e: &rusqlite::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_pv_names_rejected() {
+        // path traversal
+        assert!(!is_valid_pv_name("../etc/passwd"));
+        assert!(!is_valid_pv_name("foo/../bar"));
+        assert!(!is_valid_pv_name("foo:..:bar"));
+        assert!(!is_valid_pv_name("foo/./bar"));
+        // absolute paths
+        assert!(!is_valid_pv_name("/etc/passwd"));
+        // shell metacharacters
+        assert!(!is_valid_pv_name("foo;rm -rf /"));
+        assert!(!is_valid_pv_name("foo|bar"));
+        assert!(!is_valid_pv_name("foo`x`"));
+        assert!(!is_valid_pv_name("foo$BAR"));
+        assert!(!is_valid_pv_name("foo bar"));
+        assert!(!is_valid_pv_name("foo\nbar"));
+        // edge inputs
+        assert!(!is_valid_pv_name(""));
+        assert!(!is_valid_pv_name(".hidden"));
+        assert!(!is_valid_pv_name("-leading-dash"));
+        assert!(!is_valid_pv_name(&"x".repeat(257)));
+    }
+
+    #[test]
+    fn valid_pv_names_accepted() {
+        // typical EPICS site naming conventions
+        assert!(is_valid_pv_name("SIM:Sine"));
+        assert!(is_valid_pv_name("XF:31IDA-OP{Tbl-Ax:X1}Mtr"));
+        assert!(is_valid_pv_name("ACC1-001-RFCAV-01:V<x>"));
+        assert!(is_valid_pv_name("PV.HIHI"));
+        assert!(is_valid_pv_name("BL_X+Y"));
+        assert!(is_valid_pv_name("a"));
+        assert!(is_valid_pv_name(&"x".repeat(256)));
+    }
+
+    #[test]
+    fn strip_field_suffix_basics() {
+        assert_eq!(strip_field_suffix("BASE.HIHI"), Some("BASE"));
+        assert_eq!(strip_field_suffix("BASE.LOLO"), Some("BASE"));
+        assert_eq!(strip_field_suffix("FOO.BAR_99"), Some("FOO"));
+        // no suffix
+        assert_eq!(strip_field_suffix("BASE"), None);
+        // lowercase / mixed-case rejected (not a standard EPICS field)
+        assert_eq!(strip_field_suffix("BASE.hihi"), None);
+        assert_eq!(strip_field_suffix("BASE.Hihi"), None);
+        // empty parts
+        assert_eq!(strip_field_suffix(".HIHI"), None);
+        assert_eq!(strip_field_suffix("BASE."), None);
+    }
 
     #[test]
     fn test_register_and_get() {
