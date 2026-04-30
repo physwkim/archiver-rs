@@ -66,10 +66,12 @@ pub async fn query_data(
 }
 
 /// One-shot stream that yields a single pre-built sample. Used to prepend
-/// the prior-partition continuity sample to a query's results.
-struct SingleSampleStream {
-    sample: Option<ArchiverSample>,
-    desc: EventStreamDesc,
+/// the prior-partition continuity sample to a query's results, and (via
+/// the crate-public re-export) by the storage layer's stale-file
+/// short-circuit (Java parity 88c7601).
+pub(crate) struct SingleSampleStream {
+    pub(crate) sample: Option<ArchiverSample>,
+    pub(crate) desc: EventStreamDesc,
 }
 
 impl EventStream for SingleSampleStream {

@@ -1,5 +1,5 @@
 use crate::storage::traits::{EventStream, PostProcessor};
-use crate::types::{ArchiverSample, ArchiverValue, EventStreamDesc};
+use crate::types::{ArchDbType, ArchiverSample, ArchiverValue, EventStreamDesc};
 
 /// Generate a `PostProcessor` impl backed by `StatStream` for one `StatOp`.
 macro_rules! stat_processor {
@@ -48,6 +48,9 @@ enum StatOp {
 
 struct StatStream {
     input: Box<dyn EventStream>,
+    // Java parity (9a5f7a0): stat operators always emit ScalarDouble values;
+    // the descriptor must reflect this even if the input PV is an integer type.
+    desc: EventStreamDesc,
     interval_secs: u64,
     op: StatOp,
     buffer: Vec<f64>,
@@ -60,7 +63,10 @@ struct StatStream {
 
 impl StatStream {
     fn new(input: Box<dyn EventStream>, interval_secs: u64, op: StatOp) -> Self {
+        let mut desc = input.description().clone();
+        desc.db_type = ArchDbType::ScalarDouble;
         Self {
+            desc,
             input,
             interval_secs,
             op,
@@ -128,7 +134,7 @@ fn sample_std(values: &[f64]) -> f64 {
 
 impl EventStream for StatStream {
     fn description(&self) -> &EventStreamDesc {
-        self.input.description()
+        &self.desc
     }
 
     fn next_event(&mut self) -> anyhow::Result<Option<ArchiverSample>> {

@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::storage::traits::{EventStream, PostProcessor};
-use crate::types::{ArchiverSample, ArchiverValue, EventStreamDesc};
+use crate::types::{ArchDbType, ArchiverSample, ArchiverValue, EventStreamDesc};
 
 /// Compute the bin number that a timestamp falls into for a given interval.
 /// Mirrors Java's `epochSeconds / intervalSecs`. Two PVs aggregating with
@@ -38,7 +38,12 @@ impl PostProcessor for MeanDecimation {
     }
 
     fn process(&self, input: Box<dyn EventStream>) -> Box<dyn EventStream> {
+        let mut desc = input.description().clone();
+        // Java parity (9a5f7a0): mean always emits ScalarDouble; the
+        // descriptor must say so even when the input PV is an integer type.
+        desc.db_type = ArchDbType::ScalarDouble;
         Box::new(MeanDecimationStream {
+            desc,
             input,
             interval_secs: self.interval_secs,
             buffer: Vec::new(),
@@ -50,6 +55,7 @@ impl PostProcessor for MeanDecimation {
 
 struct MeanDecimationStream {
     input: Box<dyn EventStream>,
+    desc: EventStreamDesc,
     interval_secs: u64,
     buffer: Vec<f64>,
     current_bin: Option<u64>,
@@ -58,7 +64,7 @@ struct MeanDecimationStream {
 
 impl EventStream for MeanDecimationStream {
     fn description(&self) -> &EventStreamDesc {
-        self.input.description()
+        &self.desc
     }
 
     fn next_event(&mut self) -> anyhow::Result<Option<ArchiverSample>> {

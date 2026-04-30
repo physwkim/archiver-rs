@@ -206,3 +206,47 @@ impl EventStreamDesc {
         }
     }
 }
+
+/// Render an [`ArchiverValue`] as JSON.
+///
+/// Java parity (d4b783a): non-finite floats (`NaN`, `±Inf`) serialize
+/// to `null` rather than panicking inside `serde_json::Number::from_f64`'s
+/// finite-only contract. Centralised here so every callsite (retrieval,
+/// management migration, archiver_control snapshot) stays in lockstep
+/// when the rendering rules evolve.
+pub fn archiver_value_to_json(v: &ArchiverValue) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        ArchiverValue::ScalarString(s) => Value::String(s.clone()),
+        ArchiverValue::ScalarShort(n) => (*n).into(),
+        ArchiverValue::ScalarInt(n) => (*n).into(),
+        ArchiverValue::ScalarEnum(n) => (*n).into(),
+        ArchiverValue::ScalarFloat(f) => finite_or_null(*f as f64),
+        ArchiverValue::ScalarDouble(f) => finite_or_null(*f),
+        ArchiverValue::ScalarByte(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorString(arr) => {
+            Value::Array(arr.iter().map(|s| Value::String(s.clone())).collect())
+        }
+        ArchiverValue::VectorChar(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorShort(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorInt(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorEnum(arr) => Value::Array(arr.iter().map(|x| (*x).into()).collect()),
+        ArchiverValue::VectorFloat(arr) => {
+            Value::Array(arr.iter().map(|x| finite_or_null(*x as f64)).collect())
+        }
+        ArchiverValue::VectorDouble(arr) => {
+            Value::Array(arr.iter().map(|x| finite_or_null(*x)).collect())
+        }
+        ArchiverValue::V4GenericBytes(b) => Value::Array(b.iter().map(|x| (*x).into()).collect()),
+    }
+}
+
+/// Map a finite f64 to `Number(n)` or, for `NaN` / `±Inf`, to JSON `null`.
+/// Java parity (d4b783a).
+pub fn finite_or_null(f: f64) -> serde_json::Value {
+    if f.is_finite() {
+        f.into()
+    } else {
+        serde_json::Value::Null
+    }
+}

@@ -25,6 +25,58 @@ struct CachedWriter {
     writer: BufWriter<std::fs::File>,
 }
 
+/// Wraps a `PbFileReader` and clamps emitted samples to `[start, end]`.
+///
+/// Java parity (e3b4471 + 88c7601): `binary_search_pb_file` returns
+/// `None` when every sample in the file is older than `start`, leaving
+/// the reader at the data section start. Without a lower-bound filter
+/// the wrapper would leak the entire file's stale contents into the
+/// retrieval merge. The upper bound covers files included by partition
+/// name whose actual sample timestamps spill past `end`.
+struct BoundedReader {
+    inner: PbFileReader,
+    start: SystemTime,
+    end: SystemTime,
+    done: bool,
+}
+
+impl BoundedReader {
+    fn new(inner: PbFileReader, start: SystemTime, end: SystemTime) -> Self {
+        Self { inner, start, end, done: false }
+    }
+}
+
+impl crate::storage::traits::EventStream for BoundedReader {
+    fn description(&self) -> &crate::types::EventStreamDesc {
+        self.inner.description()
+    }
+
+    fn next_event(&mut self) -> anyhow::Result<Option<crate::types::ArchiverSample>> {
+        if self.done {
+            return Ok(None);
+        }
+        loop {
+            match self.inner.next_event()? {
+                None => {
+                    self.done = true;
+                    return Ok(None);
+                }
+                // Below `start` or above `end`: drop and continue. PB
+                // partition files are append-ordered but timestamps
+                // within one file aren't strictly monotonic — clock
+                // backsteps and late backfills exist — so a single
+                // out-of-window sample must NOT terminate the stream
+                // (Java's reader keeps consuming until EOF).
+                Some(s) if s.timestamp < self.start => continue,
+                Some(s) if s.timestamp > self.end => continue,
+                Some(s) => return Ok(Some(s)),
+            }
+        }
+    }
+}
+
+use crate::retrieval::query::SingleSampleStream;
+
 /// PlainPB storage plugin — binary-compatible with Java EPICS Archiver Appliance.
 pub struct PlainPbStoragePlugin {
     plugin_name: String,
@@ -183,7 +235,7 @@ impl PlainPbStoragePlugin {
 /// name read directly from a PB file's PayloadInfo) still fails closed.
 /// Returns a sanitized fallback rather than panicking so retrieval
 /// errors stay diagnosable.
-fn pv_name_to_key(pv: &str) -> String {
+pub(crate) fn pv_name_to_key(pv: &str) -> String {
     if !crate::registry::is_valid_pv_name(pv) {
         // Strip every disallowed character so path joins stay anchored
         // at the storage root. Use a marker prefix so an audit can spot
@@ -382,10 +434,38 @@ impl StoragePlugin for PlainPbStoragePlugin {
         self.flush_writes().await?;
 
         let files = self.list_files_for_range(pv, start, end);
+
+        // Java parity (88c7601): single-file short-circuit. When the only
+        // matching file's last sample is older than `start`, return that
+        // single event in a tiny stream rather than opening a full reader
+        // that the lower-bound filter would just discard. Equivalent to
+        // Java's `CallableEventStream.makeOneEventCallable(...)` branch.
+        // Java parity (88c7601): Java compares `lastEventEpochSeconds <= startTime`,
+        // so a file whose final sample lands exactly on `start` still
+        // short-circuits. `<` would force a full reader open at the
+        // boundary and emit the same single sample after a wasted seek.
+        if files.len() == 1
+            && let Some(last) = read_last_sample_from_file(&files[0])?
+            && last.timestamp <= start
+        {
+            let reader = PbFileReader::open(&files[0])?;
+            let desc = reader.description().clone();
+            return Ok(vec![Box::new(SingleSampleStream {
+                desc,
+                sample: Some(last),
+            })]);
+        }
+
         let mut streams: Vec<Box<dyn EventStream>> = Vec::new();
         for file in files {
             let reader = PbFileReader::open_seeked(&file, start)?;
-            streams.push(Box::new(reader));
+            // Java parity (e3b4471 + 88c7601): clamp output at both
+            // ends. Without the upper bound, files whose partition name
+            // overlaps the query but whose late-arriving samples spill
+            // past `end` leak stale tail data. Without the lower bound,
+            // a binary-search miss leaves the reader at data-start and
+            // emits every pre-`start` sample in the file.
+            streams.push(Box::new(BoundedReader::new(reader, start, end)));
         }
         Ok(streams)
     }

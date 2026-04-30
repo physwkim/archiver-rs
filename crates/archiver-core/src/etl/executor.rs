@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,6 +6,11 @@ use std::time::Duration;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
+// Java parity (3daedae): f.get() without a timeout hung indefinitely on
+// slow NFS. Use 24 h as the default, matching Java's chosen bound.
+const DEFAULT_MOVE_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+
+use crate::registry::{PvRegistry, PvStatus};
 use crate::storage::plainpb::reader::PbFileReader;
 use crate::storage::plainpb::PlainPbStoragePlugin;
 use crate::storage::traits::{EventStream, StoragePlugin};
@@ -20,6 +25,11 @@ pub struct EtlExecutor {
     hold: u32,
     /// Number of partitions to gather (move out) at once.
     gather: u32,
+    /// Per-file move timeout (Java parity 3daedae).
+    move_timeout: Duration,
+    /// Optional PV registry — when present, paused PVs are skipped
+    /// (Java parity 92db337).
+    pv_registry: Option<Arc<PvRegistry>>,
 }
 
 impl EtlExecutor {
@@ -36,7 +46,19 @@ impl EtlExecutor {
             period_secs,
             hold,
             gather,
+            move_timeout: DEFAULT_MOVE_TIMEOUT,
+            pv_registry: None,
         }
+    }
+
+    /// Wire a PV registry so the executor can skip paused PVs in
+    /// `run_once`. Java parity (92db337): without this, PB files for a
+    /// paused PV continue to migrate out of the STS, which surprises
+    /// operators who expect the data to stay accessible there until the
+    /// PV resumes.
+    pub fn with_pv_registry(mut self, registry: Arc<PvRegistry>) -> Self {
+        self.pv_registry = Some(registry);
+        self
     }
 
     /// Run the ETL loop. Call this as a spawned task.
@@ -103,7 +125,29 @@ impl EtlExecutor {
         let files_subset: Vec<PathBuf> = pb_files.into_iter().take(files_to_move).collect();
         let grouped = group_files_by_pv(&files_subset);
 
+        // Java parity (92db337): skip files whose owning PV is paused.
+        // Compute the set of paused-PV file keys once per tick instead of
+        // per-file to keep the registry lookup off the hot path.
+        let paused_keys: HashSet<String> = match self.pv_registry.as_ref() {
+            Some(reg) => reg
+                .pvs_by_status(PvStatus::Paused)
+                .map(|recs| {
+                    recs.into_iter()
+                        .map(|r| crate::storage::plainpb::pv_name_to_key(&r.pv_name))
+                        .collect()
+                })
+                .unwrap_or_else(|e| {
+                    warn!("ETL: failed to read paused PVs from registry: {e}");
+                    HashSet::new()
+                }),
+            None => HashSet::new(),
+        };
+
         for (pv_key, files) in &grouped {
+            if paused_keys.contains(pv_key) {
+                debug!(pv = pv_key, "ETL skipping paused PV");
+                continue;
+            }
             debug!(pv = pv_key, count = files.len(), "ETL processing PV group");
             for file in files {
                 info!(?file, dest = self.dest.name(), "ETL moving file");
@@ -169,28 +213,44 @@ impl EtlExecutor {
             return Ok(());
         }
 
-        let mut reader = PbFileReader::open(source_path)?;
-        let desc = reader.description().clone();
-        let dbr_type = desc.db_type;
+        // Java parity (3daedae): wrap the copy+delete in a timeout so a
+        // hung NFS mount doesn't block the ETL loop indefinitely.
+        let timeout = self.move_timeout;
+        let source_path = source_path.to_path_buf();
+        let source_path_disp = source_path.clone();
+        let dest = self.dest.clone();
+        let source_name = self.source.name().to_string();
+        let dest_name = self.dest.name().to_string();
 
-        // Copy all samples to destination.
-        while let Some(sample) = reader.next_event()? {
-            self.dest
-                .append_event(&desc.pv_name, dbr_type, &sample)
-                .await?;
-        }
+        tokio::time::timeout(timeout, async move {
+            let mut reader = PbFileReader::open(&source_path)?;
+            let desc = reader.description().clone();
+            let dbr_type = desc.db_type;
 
-        // Write marker before deleting source — if we crash here, next run
-        // will see the marker and skip re-copy (preventing duplicate data).
-        tokio::fs::write(&marker, b"").await?;
-        tokio::fs::remove_file(source_path).await?;
-        tokio::fs::remove_file(&marker).await.ok();
-        metrics::counter!(
-            "archiver_etl_files_moved_total",
-            "source" => self.source.name().to_string(),
-            "dest" => self.dest.name().to_string(),
-        )
-        .increment(1);
+            // Copy all samples to destination.
+            while let Some(sample) = reader.next_event()? {
+                dest.append_event(&desc.pv_name, dbr_type, &sample).await?;
+            }
+
+            // Write marker before deleting source — if we crash here, next run
+            // will see the marker and skip re-copy (preventing duplicate data).
+            let marker = source_path.with_extension("pb.etl_done");
+            tokio::fs::write(&marker, b"").await?;
+            tokio::fs::remove_file(&source_path).await?;
+            tokio::fs::remove_file(&marker).await.ok();
+            metrics::counter!(
+                "archiver_etl_files_moved_total",
+                "source" => source_name,
+                "dest" => dest_name,
+            )
+            .increment(1);
+            anyhow::Ok(())
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("ETL move_file timed out after {timeout:?} for {source_path_disp:?}")
+        })??;
+
         Ok(())
     }
 }
