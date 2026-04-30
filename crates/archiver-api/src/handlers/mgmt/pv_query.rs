@@ -106,8 +106,11 @@ pub async fn get_pv_status(
             let last_ts = record.last_timestamp.map(|ts| {
                 chrono::DateTime::<chrono::Utc>::from(ts).to_rfc3339()
             });
+            // Echo the user-supplied name (Java parity, F-12 d54fbdc6 /
+            // 6ac139d0). Clients that match request → response by name
+            // would otherwise see the alias-resolved canonical and fail.
             let resp = PvStatusResponse {
-                pv_name: record.pv_name,
+                pv_name: params.pv.clone(),
                 status: status_str.to_string(),
                 dbr_type: Some(record.dbr_type as i32),
                 sample_mode: Some(sample_mode_str),
@@ -179,7 +182,9 @@ pub async fn get_pv_type_info(
         .get_pv(&canonical)
         .map_err(ApiError::internal)?
     {
-        Some(record) => Ok(axum::Json(record_to_type_info(&record))),
+        Some(record) => Ok(axum::Json(
+            crate::dto::mgmt::record_to_type_info_with_name(&record, Some(&params.pv)),
+        )),
         None => Err(ApiError::NotFound(format!("PV {} not found", params.pv))),
     }
 }

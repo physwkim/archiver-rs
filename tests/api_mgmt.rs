@@ -850,12 +850,14 @@ async fn test_get_pv_status_resolves_alias() {
     let req = get_request("/mgmt/bpl/addAlias?pv=SIM:Sine&aliasname=DEV:Foo");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    // Querying the alias returns the target's status.
+    // Querying the alias returns the target's status, but the response
+    // echoes the user-supplied alias name (Java parity, F-12) so clients
+    // can match request → response by name.
     let req = get_request("/mgmt/bpl/getPVStatus?pv=DEV:Foo");
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_to_json(resp.into_body()).await;
-    assert_eq!(body["pv_name"], "SIM:Sine");
+    assert_eq!(body["pv_name"], "DEV:Foo");
     assert_eq!(body["status"], "Being archived");
 }
 

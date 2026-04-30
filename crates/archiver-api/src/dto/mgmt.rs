@@ -197,6 +197,17 @@ pub fn record_to_report_entry(r: PvRecord) -> ReportEntry {
 }
 
 pub fn record_to_type_info(r: &PvRecord) -> PvTypeInfoResponse {
+    record_to_type_info_with_name(r, None)
+}
+
+/// Like `record_to_type_info` but echoes `requested_name` in the
+/// `pvName` field so an alias query carries the user-supplied name in
+/// the response (Java parity, F-12 d54fbdc6 / 6ac139d0). Pass `None` to
+/// fall back to the canonical name from the record.
+pub fn record_to_type_info_with_name(
+    r: &PvRecord,
+    requested_name: Option<&str>,
+) -> PvTypeInfoResponse {
     let (method, period) = match &r.sample_mode {
         SampleMode::Monitor => ("Monitor".to_string(), 0.0),
         SampleMode::Scan { period_secs } => ("Scan".to_string(), *period_secs),
@@ -209,7 +220,7 @@ pub fn record_to_type_info(r: &PvRecord) -> PvTypeInfoResponse {
         PvStatus::Alias => "Alias",
     };
     PvTypeInfoResponse {
-        pv_name: r.pv_name.clone(),
+        pv_name: requested_name.map(|s| s.to_string()).unwrap_or_else(|| r.pv_name.clone()),
         dbr_type: r.dbr_type as i32,
         sampling_method: method,
         sampling_period: period,

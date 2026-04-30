@@ -1,4 +1,4 @@
-use crate::dto::mgmt::record_to_type_info;
+use crate::dto::mgmt::record_to_type_info_with_name;
 use crate::errors::ApiError;
 use crate::services::traits::{ArchiverQuery, PvQueryRepository};
 
@@ -27,7 +27,8 @@ pub fn get_pv_details(
         .and_then(|c| c.connected_since)
         .map(|ts| chrono::DateTime::<chrono::Utc>::from(ts).to_rfc3339());
 
-    let mut detail = serde_json::to_value(record_to_type_info(&record)).unwrap_or_default();
+    let mut detail =
+        serde_json::to_value(record_to_type_info_with_name(&record, Some(pv))).unwrap_or_default();
     if let Some(obj) = detail.as_object_mut() {
         obj.insert(
             "isConnected".to_string(),
