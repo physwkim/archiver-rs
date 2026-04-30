@@ -67,11 +67,23 @@ pub fn is_valid_pv_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 256 {
         return false;
     }
-    if name.starts_with('.') || name.starts_with('-') || name.starts_with('/') {
+    // Leading separator → after pv_name_to_key the result begins with
+    // `/`, and `Path::join(root, "/abs/path")` ignores `root` entirely
+    // (Rust semantics) → escapes the storage root. Same for the `.` /
+    // `-` cases.
+    if name.starts_with('.')
+        || name.starts_with('-')
+        || name.starts_with('/')
+        || name.starts_with(':')
+    {
         return false;
     }
     for component in name.split([':', '/']) {
-        if component == ".." || component == "." {
+        // `..` / `.` are obvious traversal. An empty segment (`A::B`,
+        // `A//B`, trailing `:`/`/`) maps to a `//` in the filesystem
+        // path which most OSes collapse but some path-relative tools
+        // re-split, so just reject.
+        if component.is_empty() || component == ".." || component == "." {
             return false;
         }
     }
@@ -816,8 +828,16 @@ mod tests {
         assert!(!is_valid_pv_name("foo/../bar"));
         assert!(!is_valid_pv_name("foo:..:bar"));
         assert!(!is_valid_pv_name("foo/./bar"));
-        // absolute paths
+        // absolute paths via leading separator (round-10: leading ':'
+        // becomes '/' after pv_name_to_key and escapes the storage root)
         assert!(!is_valid_pv_name("/etc/passwd"));
+        assert!(!is_valid_pv_name(":SIM:foo"));
+        assert!(!is_valid_pv_name(":foo"));
+        // empty segments (collapse oddly when split on / or :)
+        assert!(!is_valid_pv_name("foo::bar"));
+        assert!(!is_valid_pv_name("foo//bar"));
+        assert!(!is_valid_pv_name("foo:"));
+        assert!(!is_valid_pv_name("foo/"));
         // shell metacharacters
         assert!(!is_valid_pv_name("foo;rm -rf /"));
         assert!(!is_valid_pv_name("foo|bar"));
