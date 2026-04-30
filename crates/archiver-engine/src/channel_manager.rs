@@ -757,6 +757,7 @@ async fn monitor_loop(
                     {
                         let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
                         ci.is_connected = false;
+                        ci.last_event_time = None;
                     }
                     // Subscribe BEFORE re-checking the current state. If we
                     // subscribed after a state check, a Connected event
@@ -897,10 +898,16 @@ async fn monitor_loop(
             }
         }
 
-        // Monitor ended (disconnect) — loop back to reconnect.
+        // Monitor ended (disconnect) — loop back to reconnect. Reset
+        // `last_event_time` so the first sample after reconnect is
+        // treated as `first_after_connect` and bypasses the drift
+        // filter; without this, an IOC that comes back with a
+        // legitimate backfill timestamp older than the 30 min window
+        // would be silently dropped.
         {
             let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
             ci.is_connected = false;
+            ci.last_event_time = None;
         }
         counters.disconnect_count.fetch_add(1, Ordering::Relaxed);
         counters
@@ -967,6 +974,7 @@ async fn scan_loop(
                 let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
                 let prev = ci.is_connected;
                 ci.is_connected = false;
+                ci.last_event_time = None;
                 prev
             };
             if was_connected {
