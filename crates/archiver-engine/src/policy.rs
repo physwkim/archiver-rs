@@ -10,6 +10,11 @@ use archiver_core::types::ArchDbType;
 pub struct PvPolicy {
     /// The PV name pattern (supports glob).
     pub pv: String,
+    /// Stable identifier persisted onto the matched PV's typeinfo so
+    /// audit / metrics paths know which policy governed the archive
+    /// (Java parity b30f1a6). Defaults to the pattern when omitted.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Sampling mode.
     #[serde(default = "default_sample_mode")]
     pub sample_mode: PolicySampleMode,
@@ -17,6 +22,13 @@ pub struct PvPolicy {
     pub dbr_type: Option<ArchDbType>,
     /// Sampling period in seconds (only for Scan mode).
     pub sampling_period: Option<f64>,
+}
+
+impl PvPolicy {
+    /// Return the policy's stable name, falling back to the pattern.
+    pub fn policy_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.pv)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

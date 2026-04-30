@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -22,12 +22,6 @@ const CA_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay before retrying a failed CA subscription.
 const CA_RETRY_DELAY: Duration = Duration::from_secs(5);
 
-/// Maximum allowed drift between the IOC-reported sample timestamp and
-/// the appliance's wall clock, in either direction. Java archiver default
-/// `org.epics.archiverappliance.engine.epics.SERVER_IOC_DRIFT_SECONDS`.
-/// A misconfigured IOC NTP would otherwise backfill years of bogus
-/// samples or stamp them in the future.
-const SERVER_IOC_DRIFT_SECS: u64 = 30 * 60;
 /// Hard floor on accepted timestamps. Mirrors Java's `PAST_CUTOFF_TIMESTAMP`
 /// of 1991-01-01 — earlier than that, the timestamp is almost certainly a
 /// stale uninitialised IOC clock or a sentinel.
@@ -37,10 +31,11 @@ const PAST_CUTOFF_UNIX_SECS: i64 = 662_688_000; // 1991-01-01 00:00:00 UTC
 /// the floor. Returns `Some(ts)` if accepted, `None` if it should be
 /// dropped (caller bumps `timestamp_drops`).
 ///
-/// `now` is the appliance wall-clock at the time the sample arrived;
+/// `drift_secs` is the configured `server_ioc_drift_secs` (Java parity
+/// 6538631), so per-site tuning doesn't require recompiling. `now` is
 /// passed in (rather than calling `SystemTime::now()` here) so the test
 /// suite can pin time deterministically.
-fn ioc_timestamp_in_window(ts: SystemTime, now: SystemTime) -> bool {
+fn ioc_timestamp_in_window(ts: SystemTime, now: SystemTime, drift_secs: u64) -> bool {
     let unix = ts
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -48,13 +43,44 @@ fn ioc_timestamp_in_window(ts: SystemTime, now: SystemTime) -> bool {
     if unix < PAST_CUTOFF_UNIX_SECS {
         return false;
     }
-    // Within ±SERVER_IOC_DRIFT_SECS of `now`?
+    // Within ±drift_secs of `now`?
     let now_unix = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let delta = (unix - now_unix).unsigned_abs();
-    delta <= SERVER_IOC_DRIFT_SECS
+    delta <= drift_secs
+}
+
+/// Discrete connection state for `getPVDetails` (Java parity dea7acb).
+/// Distinguishes never-connected from connecting from confirmed-down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PvConnectionState {
+    /// No connection attempt has been made (or none has progressed
+    /// past `wait_connected` yet).
+    #[default]
+    Idle,
+    /// Currently waiting on `wait_connected` for the first time on
+    /// this channel handle.
+    Connecting,
+    /// Channel has reported a successful connect; samples are flowing
+    /// or the channel is otherwise live.
+    Connected,
+    /// Channel reported connect at least once but the monitor loop has
+    /// since dropped — distinct from `Idle` so operators can spot a
+    /// regression vs a never-resolved name.
+    Disconnected,
+}
+
+impl PvConnectionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Connecting => "Connecting",
+            Self::Connected => "Connected",
+            Self::Disconnected => "Disconnected",
+        }
+    }
 }
 
 /// Connection state tracked per PV.
@@ -63,6 +89,10 @@ pub struct ConnectionInfo {
     pub connected_since: Option<SystemTime>,
     pub last_event_time: Option<SystemTime>,
     pub is_connected: bool,
+    /// Java parity (dea7acb): discrete connection state for the
+    /// PVDetails report. Operators can distinguish never-connected,
+    /// currently-connecting, and previously-connected-now-down.
+    pub state: PvConnectionState,
 }
 
 /// Per-PV diagnostic counters for the BPL drop / rate / connection
@@ -71,7 +101,7 @@ pub struct ConnectionInfo {
 ///
 /// Tracked here (not in ConnectionInfo) so they survive transient
 /// disconnects and are read lock-free from the report endpoints.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PvCounters {
     /// Total events produced by monitor/scan, including those that
     /// later got dropped before write.
@@ -98,6 +128,33 @@ pub struct PvCounters {
     pub disconnect_count: AtomicU64,
     /// Last unix-epoch seconds of disconnect transition.
     pub last_disconnect_unix_secs: AtomicI64,
+    /// Number of transient subscribe / monitor-recv / scan-read errors
+    /// (Java parity 8fe73eb). Distinct from `disconnect_count` —
+    /// these are recoverable per-attempt failures rather than confirmed
+    /// link drops.
+    pub transient_error_count: AtomicU64,
+    /// Latest DBR type observed from CA that did not match the
+    /// archive-time recorded type (Java parity 9f2234f). `-1` = no
+    /// mismatch ever seen.
+    pub latest_observed_dbr: AtomicI32,
+}
+
+impl Default for PvCounters {
+    fn default() -> Self {
+        Self {
+            events_received: AtomicU64::new(0),
+            events_stored: AtomicU64::new(0),
+            first_event_unix_secs: AtomicI64::new(0),
+            buffer_overflow_drops: AtomicU64::new(0),
+            timestamp_drops: AtomicU64::new(0),
+            type_change_drops: AtomicU64::new(0),
+            disconnect_count: AtomicU64::new(0),
+            last_disconnect_unix_secs: AtomicI64::new(0),
+            transient_error_count: AtomicU64::new(0),
+            // -1 sentinel = no type mismatch ever observed.
+            latest_observed_dbr: AtomicI32::new(-1),
+        }
+    }
 }
 
 /// Read-only snapshot of `PvCounters` — owned values so callers can
@@ -112,6 +169,10 @@ pub struct PvCountersSnapshot {
     pub type_change_drops: u64,
     pub disconnect_count: u64,
     pub last_disconnect_unix_secs: Option<i64>,
+    pub transient_error_count: u64,
+    /// `Some(dbr_type as i32)` if a type-change mismatch has been
+    /// observed; `None` otherwise (Java parity 9f2234f).
+    pub latest_observed_dbr: Option<i32>,
 }
 
 impl From<&PvCounters> for PvCountersSnapshot {
@@ -130,6 +191,11 @@ impl From<&PvCounters> for PvCountersSnapshot {
                 None
             } else {
                 Some(last_disc)
+            },
+            transient_error_count: c.transient_error_count.load(Ordering::Relaxed),
+            latest_observed_dbr: match c.latest_observed_dbr.load(Ordering::Relaxed) {
+                -1 => None,
+                v => Some(v),
             },
         }
     }
@@ -206,6 +272,8 @@ pub struct ChannelManager {
     sample_tx: mpsc::Sender<PvSample>,
     /// Optional policy configuration.
     policy: Option<PolicyConfig>,
+    /// Per-site IOC drift bound (Java parity 6538631).
+    server_ioc_drift_secs: u64,
 }
 
 /// A sample ready to be written to storage.
@@ -226,6 +294,18 @@ impl ChannelManager {
         registry: Arc<PvRegistry>,
         policy: Option<PolicyConfig>,
     ) -> anyhow::Result<(Self, mpsc::Receiver<PvSample>)> {
+        Self::new_with_drift(storage, registry, policy, 30 * 60).await
+    }
+
+    /// Construct with an explicit IOC drift bound. Java parity (6538631):
+    /// keeps tests + sites that don't surface `EngineConfig` on the
+    /// existing default while letting the daemon plumb a configured value.
+    pub async fn new_with_drift(
+        storage: Arc<dyn StoragePlugin>,
+        registry: Arc<PvRegistry>,
+        policy: Option<PolicyConfig>,
+        server_ioc_drift_secs: u64,
+    ) -> anyhow::Result<(Self, mpsc::Receiver<PvSample>)> {
         let ca_client = CaClient::new().await.map_err(|e| anyhow::anyhow!("{e}"))?;
         let (tx, rx) = mpsc::channel(SAMPLE_CHANNEL_CAPACITY);
 
@@ -238,6 +318,7 @@ impl ChannelManager {
             registry,
             sample_tx: tx,
             policy,
+            server_ioc_drift_secs,
         };
 
         Ok((mgr, rx))
@@ -332,14 +413,14 @@ impl ChannelManager {
         }
 
         // Check policy override.
-        let effective_mode = if let Some(ref policy) = self.policy {
+        let (effective_mode, matched_policy_name) = if let Some(ref policy) = self.policy {
             if let Some(p) = policy.find_policy(pv_name) {
-                p.to_sample_mode()
+                (p.to_sample_mode(), Some(p.policy_name().to_string()))
             } else {
-                sample_mode.clone()
+                (sample_mode.clone(), None)
             }
         } else {
-            sample_mode.clone()
+            (sample_mode.clone(), None)
         };
 
         // Connect to discover the native type.
@@ -358,6 +439,11 @@ impl ChannelManager {
         // Register in SQLite.
         self.registry
             .register_pv(pv_name, dbr_type, &effective_mode, element_count)?;
+        // Java parity (b30f1a6): persist the matched policy's stable name so
+        // audit / metrics paths know which policy governed this archive.
+        if let Some(ref name) = matched_policy_name {
+            self.registry.update_policy_name(pv_name, Some(name))?;
+        }
 
         let record = self.registry.get_pv(pv_name)?
             .ok_or_else(|| anyhow::anyhow!("PV {pv_name} not found in registry"))?;
@@ -413,6 +499,7 @@ impl ChannelManager {
                 field,
                 extras.clone(),
                 child,
+                counters.clone(),
             );
         }
         metrics::gauge!("archiver_extra_field_tasks").increment(record.archive_fields.len() as f64);
@@ -424,6 +511,7 @@ impl ChannelManager {
         let extras_for_loop = extras.clone();
         let counters_for_loop = counters.clone();
 
+        let drift = self.server_ioc_drift_secs;
         match &record.sample_mode {
             SampleMode::Monitor => {
                 tokio::spawn(async move {
@@ -437,6 +525,7 @@ impl ChannelManager {
                         ci,
                         extras_for_loop,
                         counters_for_loop,
+                        drift,
                     )
                     .await;
                 });
@@ -480,7 +569,7 @@ impl ChannelManager {
 
         // If the PV isn't currently active there's nothing more to do —
         // start_archiving_internal will pick up the new fields on resume.
-        let (parent_token, extras, field_tokens, update_lock) = {
+        let (parent_token, extras, field_tokens, update_lock, counters) = {
             let Some(handle) = self.channels.get(pv_name) else {
                 return Ok(());
             };
@@ -489,6 +578,7 @@ impl ChannelManager {
                 handle.extras.clone(),
                 handle.field_tokens.clone(),
                 handle.update_lock.clone(),
+                handle.counters.clone(),
             )
         };
 
@@ -527,6 +617,7 @@ impl ChannelManager {
                     f,
                     extras.clone(),
                     child,
+                    counters.clone(),
                 );
                 added_count += 1;
             }
@@ -747,6 +838,7 @@ async fn monitor_loop(
     conn_info: Arc<Mutex<ConnectionInfo>>,
     extras: Arc<ExtraFieldsCache>,
     counters: Arc<PvCounters>,
+    server_ioc_drift_secs: u64,
 ) {
     loop {
         // Wait for connection, respecting cancellation.
@@ -754,10 +846,31 @@ async fn monitor_loop(
             _ = cancel_token.cancelled() => return,
             result = channel.wait_connected(CA_RECONNECT_TIMEOUT) => {
                 if result.is_err() {
-                    {
+                    let was_connected = {
                         let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
+                        let prev_connected = ci.is_connected;
                         ci.is_connected = false;
                         ci.last_event_time = None;
+                        // Connecting if we've never seen a connect, otherwise
+                        // demote from Connected to Disconnected on a real loss.
+                        ci.state = match ci.state {
+                            PvConnectionState::Connected => PvConnectionState::Disconnected,
+                            PvConnectionState::Disconnected => PvConnectionState::Disconnected,
+                            _ => PvConnectionState::Connecting,
+                        };
+                        prev_connected
+                    };
+                    // A search-failure timeout that demotes us out of
+                    // Connected counts as a fresh disconnect — without
+                    // this, only the post-monitor `break` path bumps the
+                    // counters and a flapping PV silently under-reports
+                    // its drops while subsequent `attach_cnx_lost_headers`
+                    // calls carry a stale `cnxlostepsecs`.
+                    if was_connected {
+                        counters.disconnect_count.fetch_add(1, Ordering::Relaxed);
+                        counters
+                            .last_disconnect_unix_secs
+                            .store(unix_secs(SystemTime::now()), Ordering::Relaxed);
                     }
                     // Subscribe BEFORE re-checking the current state. If we
                     // subscribed after a state check, a Connected event
@@ -809,6 +922,7 @@ async fn monitor_loop(
         let mut monitor = match channel.subscribe().await {
             Ok(m) => m,
             Err(e) => {
+                counters.transient_error_count.fetch_add(1, Ordering::Relaxed);
                 warn!(pv = pv_name, "Subscribe failed: {e}, retrying...");
                 tokio::select! {
                     _ = cancel_token.cancelled() => return,
@@ -845,10 +959,15 @@ async fn monitor_loop(
                                 }
                                 ci.is_connected = true;
                                 ci.last_event_time = Some(now);
+                                ci.state = PvConnectionState::Connected;
                                 first
                             };
                             if !first_after_connect
-                                && !ioc_timestamp_in_window(snapshot.timestamp, now)
+                                && !ioc_timestamp_in_window(
+                                    snapshot.timestamp,
+                                    now,
+                                    server_ioc_drift_secs,
+                                )
                             {
                                 counters.timestamp_drops.fetch_add(1, Ordering::Relaxed);
                                 debug!(
@@ -871,6 +990,12 @@ async fn monitor_loop(
                             let archiver_val = epics_value_to_archiver(&snapshot.value);
                             let mut sample = ArchiverSample::new(snapshot.timestamp, archiver_val);
                             attach_extras(&extras, &mut sample);
+                            if first_after_connect {
+                                let lost_secs = counters
+                                    .last_disconnect_unix_secs
+                                    .load(Ordering::Relaxed);
+                                attach_cnx_lost_headers(&mut sample, lost_secs, now_secs);
+                            }
                             let pv_sample = PvSample {
                                 pv_name: pv_name.clone(),
                                 dbr_type,
@@ -890,6 +1015,7 @@ async fn monitor_loop(
                             }
                         }
                         Some(Err(e)) => {
+                            counters.transient_error_count.fetch_add(1, Ordering::Relaxed);
                             warn!(pv = pv_name, "Monitor error: {e}");
                         }
                         None => break, // Monitor ended, reconnect
@@ -908,6 +1034,7 @@ async fn monitor_loop(
             let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
             ci.is_connected = false;
             ci.last_event_time = None;
+            ci.state = PvConnectionState::Disconnected;
         }
         counters.disconnect_count.fetch_add(1, Ordering::Relaxed);
         counters
@@ -975,6 +1102,11 @@ async fn scan_loop(
                 let prev = ci.is_connected;
                 ci.is_connected = false;
                 ci.last_event_time = None;
+                ci.state = match ci.state {
+                    PvConnectionState::Connected => PvConnectionState::Disconnected,
+                    PvConnectionState::Disconnected => PvConnectionState::Disconnected,
+                    _ => PvConnectionState::Connecting,
+                };
                 prev
             };
             if was_connected {
@@ -989,14 +1121,17 @@ async fn scan_loop(
         match channel.get().await {
             Ok((_dbr_type, epics_val)) => {
                 let now = SystemTime::now();
-                {
+                let first_after_connect = {
                     let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
+                    let first = ci.last_event_time.is_none();
                     if ci.connected_since.is_none() {
                         ci.connected_since = Some(now);
                     }
                     ci.is_connected = true;
                     ci.last_event_time = Some(now);
-                }
+                    ci.state = PvConnectionState::Connected;
+                    first
+                };
                 counters.events_received.fetch_add(1, Ordering::Relaxed);
                 let now_secs = unix_secs(now);
                 let _ = counters.first_event_unix_secs.compare_exchange(
@@ -1008,6 +1143,12 @@ async fn scan_loop(
                 let archiver_val = epics_value_to_archiver(&epics_val);
                 let mut sample = ArchiverSample::new(now, archiver_val);
                 attach_extras(&extras, &mut sample);
+                if first_after_connect {
+                    let lost_secs = counters
+                        .last_disconnect_unix_secs
+                        .load(Ordering::Relaxed);
+                    attach_cnx_lost_headers(&mut sample, lost_secs, now_secs);
+                }
                 let pv_sample = PvSample {
                     pv_name: pv_name.clone(),
                     dbr_type,
@@ -1023,10 +1164,31 @@ async fn scan_loop(
                 }
             }
             Err(e) => {
+                counters.transient_error_count.fetch_add(1, Ordering::Relaxed);
                 debug!(pv = pv_name, "Scan read error: {e}");
             }
         }
     }
+}
+
+/// Java parity (ed07feb): tag the first sample after (re)connect with
+/// `cnxlostepsecs` / `cnxregainedepsecs` / `startup` so consumers can
+/// detect archiver restarts and PV resumes. Unconditional emission —
+/// on a clean startup `lost_secs` is 0, which is itself a valid value
+/// for downstream gap detection.
+fn attach_cnx_lost_headers(sample: &mut ArchiverSample, lost_secs: i64, now_secs: i64) {
+    sample.field_values.push((
+        "cnxlostepsecs".to_string(),
+        lost_secs.to_string(),
+    ));
+    sample.field_values.push((
+        "cnxregainedepsecs".to_string(),
+        now_secs.to_string(),
+    ));
+    sample.field_values.push((
+        "startup".to_string(),
+        "true".to_string(),
+    ));
 }
 
 /// Snapshot the extras cache into `sample.field_values`. We sort for stable
@@ -1075,6 +1237,7 @@ fn spawn_extra_field_monitor(
     field: &str,
     extras: Arc<ExtraFieldsCache>,
     parent_token: CancellationToken,
+    counters: Arc<PvCounters>,
 ) {
     let full_name = format!("{pv_name}.{field}");
     let channel = ca_client.create_channel(&full_name);
@@ -1095,6 +1258,7 @@ fn spawn_extra_field_monitor(
             field_owned,
             extras,
             parent_token,
+            counters,
         ));
         if let Err(payload) = futures::FutureExt::catch_unwind(body).await {
             let msg = panic_payload_msg(&payload);
@@ -1115,6 +1279,7 @@ async fn extra_field_monitor_body(
     field_owned: String,
     extras: Arc<ExtraFieldsCache>,
     parent_token: CancellationToken,
+    counters: Arc<PvCounters>,
 ) {
     // Initial connect attempt — failure here is non-fatal (the field may
     // not exist on every IOC; we just leave the cache empty).
@@ -1143,6 +1308,10 @@ async fn extra_field_monitor_body(
                 let mut monitor = match sub {
                     Ok(m) => m,
                     Err(e) => {
+                        // Java parity (8fe73eb): bump the transient
+                        // counter so a misconfigured `.HIHI` field
+                        // shows up in the rate / drop reports.
+                        counters.transient_error_count.fetch_add(1, Ordering::Relaxed);
                         debug!(
                             pv = pv_owned,
                             field = field_owned,
@@ -1181,6 +1350,7 @@ async fn extra_field_monitor_body(
                                 );
                             }
                             Some(Err(e)) => {
+                                counters.transient_error_count.fetch_add(1, Ordering::Relaxed);
                                 debug!(
                                     pv = pv_owned,
                                     field = field_owned,
@@ -1298,6 +1468,11 @@ pub async fn write_loop(
                 {
                     if let Some(ref c) = pv_sample.counters {
                         c.type_change_drops.fetch_add(1, Ordering::Relaxed);
+                        // Java parity (9f2234f): record the latest observed
+                        // DBR so the dropped-events report can show what
+                        // the IOC is now sending vs the archived type.
+                        c.latest_observed_dbr
+                            .store(pv_sample.dbr_type as i32, Ordering::Relaxed);
                     }
                     debug!(
                         pv = pv_sample.pv_name,

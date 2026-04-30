@@ -88,9 +88,15 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-    // Initialize channel manager + write loop.
-    let (channel_mgr, sample_rx) =
-        ChannelManager::new(storage.clone(), registry.clone(), policy).await?;
+    // Initialize channel manager + write loop. Drift bound is per-site
+    // configurable (Java parity 6538631).
+    let (channel_mgr, sample_rx) = ChannelManager::new_with_drift(
+        storage.clone(),
+        registry.clone(),
+        policy,
+        config.engine.server_ioc_drift_secs,
+    )
+    .await?;
     let channel_mgr = Arc::new(channel_mgr);
 
     // Restore PVs from registry.
@@ -119,20 +125,26 @@ async fn main() -> anyhow::Result<()> {
     let mts_period_secs = config.storage.mts.hold as u64
         * config.storage.mts.partition_granularity.approx_seconds();
 
-    let etl_sts_mts = Arc::new(EtlExecutor::new(
-        tiered.sts.clone(),
-        tiered.mts.clone(),
-        sts_period_secs,
-        config.storage.sts.hold,
-        config.storage.sts.gather,
-    ));
-    let etl_mts_lts = Arc::new(EtlExecutor::new(
-        tiered.mts.clone(),
-        tiered.lts.clone(),
-        mts_period_secs,
-        config.storage.mts.hold,
-        config.storage.mts.gather,
-    ));
+    let etl_sts_mts = Arc::new(
+        EtlExecutor::new(
+            tiered.sts.clone(),
+            tiered.mts.clone(),
+            sts_period_secs,
+            config.storage.sts.hold,
+            config.storage.sts.gather,
+        )
+        .with_pv_registry(registry.clone()),
+    );
+    let etl_mts_lts = Arc::new(
+        EtlExecutor::new(
+            tiered.mts.clone(),
+            tiered.lts.clone(),
+            mts_period_secs,
+            config.storage.mts.hold,
+            config.storage.mts.gather,
+        )
+        .with_pv_registry(registry.clone()),
+    );
     let etl_chain: Vec<Arc<EtlExecutor>> = vec![etl_sts_mts.clone(), etl_mts_lts.clone()];
 
     let etl1_shutdown = supervisor.shutdown_rx();

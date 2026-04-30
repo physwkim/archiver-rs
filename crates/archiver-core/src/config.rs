@@ -83,10 +83,21 @@ pub struct EngineConfig {
     pub write_period_secs: u64,
     /// Path to PV policy TOML file.
     pub policy_file: Option<PathBuf>,
+    /// Maximum allowed drift between IOC-reported sample timestamps and
+    /// the appliance's wall clock, in either direction (Java parity
+    /// 6538631 — `org.epics.archiverappliance.engine.epics.SERVER_IOC_DRIFT_SECONDS`).
+    /// Default 30 minutes; set higher for known-skewed sites without
+    /// recompiling.
+    #[serde(default = "default_server_ioc_drift_secs")]
+    pub server_ioc_drift_secs: u64,
 }
 
 fn default_write_period() -> u64 {
     10
+}
+
+fn default_server_ioc_drift_secs() -> u64 {
+    30 * 60
 }
 
 /// Security configuration.
