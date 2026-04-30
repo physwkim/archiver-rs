@@ -1253,6 +1253,7 @@ fn epics_value_to_field_string(val: &EpicsValue) -> String {
         EpicsValue::DoubleArray(v) => format!("{v:?}"),
         EpicsValue::LongArray(v) => format!("{v:?}"),
         EpicsValue::CharArray(v) => String::from_utf8_lossy(v).into_owned(),
+        EpicsValue::StringArray(v) => format!("{v:?}"),
     }
 }
 
@@ -1439,6 +1440,7 @@ fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
         EpicsValue::DoubleArray(v) => ArchiverValue::VectorDouble(v.clone()),
         EpicsValue::LongArray(v) => ArchiverValue::VectorInt(v.clone()),
         EpicsValue::CharArray(v) => ArchiverValue::VectorChar(v.clone()),
+        EpicsValue::StringArray(v) => ArchiverValue::VectorString(v.clone()),
     }
 }
 

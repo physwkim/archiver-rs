@@ -539,14 +539,16 @@ checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.10.5"
-source = "git+https://github.com/epics-rs/epics-rs#46b8734140395d8d1f7f8e5949fdbb218f8e8fb6"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f938ec95b839b4640201c6e55385a26951e827df2c56831cf22e5f94f5e595b8"
 dependencies = [
  "bytes",
  "chrono",
  "clap",
  "epics-macros-rs",
  "hostname",
+ "if-addrs",
  "parking_lot",
  "rustyline",
  "socket2 0.5.10",
@@ -557,8 +559,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.10.5"
-source = "git+https://github.com/epics-rs/epics-rs#46b8734140395d8d1f7f8e5949fdbb218f8e8fb6"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee887ca7351ecd873822a0fb1d64553427e5ab407dc5a39f82eebf11dedbe18e"
 dependencies = [
  "async-trait",
  "chrono",
@@ -574,8 +577,9 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.10.5"
-source = "git+https://github.com/epics-rs/epics-rs#46b8734140395d8d1f7f8e5949fdbb218f8e8fb6"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f351ca1207a0ca87cfe950db40764d0a48bdc7ccc1608502d69620fb43a2b2af"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -585,12 +589,15 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.10.5"
-source = "git+https://github.com/epics-rs/epics-rs#46b8734140395d8d1f7f8e5949fdbb218f8e8fb6"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d89810ab3d4009133b8ef12297400032d30f043e2c9ac665d31517855719879"
 dependencies = [
+ "bytes",
  "chrono",
  "clap",
  "epics-base-rs",
+ "epics-macros-rs",
  "hostname",
  "if-addrs",
  "libc",
@@ -609,8 +616,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
-version = "0.10.5"
-source = "git+https://github.com/epics-rs/epics-rs#46b8734140395d8d1f7f8e5949fdbb218f8e8fb6"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c8f4b01d83bd166423b7fa58926b67d3dfbe329d0a67fd363193589624f1c80"
 dependencies = [
  "epics-base-rs",
  "epics-ca-rs",

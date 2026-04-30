@@ -129,46 +129,51 @@ async fn pva_rpc_get_data_end_to_end() {
             }
         })
         .expect("value substructure");
-    let values_col = value_struct
+    // epics-pva-rs 0.13.0 added a typed-array form (`ScalarArrayTyped`)
+    // and the decoder may emit either variant. Accept both.
+    let values_doubles: Vec<f64> = value_struct
         .fields
         .iter()
         .find_map(|(n, f)| {
-            if n == "value" {
-                if let PvField::ScalarArray(a) = f {
-                    Some(a)
-                } else {
-                    None
-                }
-            } else {
-                None
+            if n != "value" {
+                return None;
+            }
+            match f {
+                PvField::ScalarArray(a) => Some(
+                    a.iter()
+                        .map(|v| match v {
+                            ScalarValue::Double(d) => *d,
+                            other => panic!("expected double in value column, got {other:?}"),
+                        })
+                        .collect(),
+                ),
+                PvField::ScalarArrayTyped(
+                    epics_rs::pva::pvdata::TypedScalarArray::Double(a),
+                ) => Some(a.to_vec()),
+                _ => None,
             }
         })
         .expect("value column");
-    assert_eq!(values_col.len(), 2);
-    if let (ScalarValue::Double(a), ScalarValue::Double(b)) = (&values_col[0], &values_col[1]) {
-        assert!((*a - 1.5).abs() < 1e-9);
-        assert!((*b - 2.5).abs() < 1e-9);
-    } else {
-        panic!("expected double values, got {:?}", values_col);
-    }
+    assert_eq!(values_doubles.len(), 2);
+    assert!((values_doubles[0] - 1.5).abs() < 1e-9);
+    assert!((values_doubles[1] - 2.5).abs() < 1e-9);
 
     // Sanity: secondsPastEpoch column also present and has 2 entries.
-    let secs_col = value_struct
+    let secs_len = value_struct
         .fields
         .iter()
         .find_map(|(n, f)| {
-            if n == "secondsPastEpoch" {
-                if let PvField::ScalarArray(a) = f {
-                    Some(a)
-                } else {
-                    None
-                }
-            } else {
-                None
+            if n != "secondsPastEpoch" {
+                return None;
+            }
+            match f {
+                PvField::ScalarArray(a) => Some(a.len()),
+                PvField::ScalarArrayTyped(t) => Some(t.len()),
+                _ => None,
             }
         })
         .expect("secondsPastEpoch column");
-    assert_eq!(secs_col.len(), 2);
+    assert_eq!(secs_len, 2);
 
     // Tear down so the test exits promptly.
     server.stop();
