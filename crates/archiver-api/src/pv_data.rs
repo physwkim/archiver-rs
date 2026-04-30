@@ -721,6 +721,12 @@ async fn get_data_raw(
     // Raw PB: stream header + samples from each partition file.
     let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
 
+    // Echo the user-supplied name in every PayloadInfo header (Java
+    // parity, F-12 d54fbdc6 / 6ac139d0). The file's stored desc carries
+    // the canonical name; clients querying via an alias would otherwise
+    // see the resolved name in the response and fail to match
+    // request → response.
+    let response_pv_name = rp.requested_name.clone();
     tokio::task::spawn_blocking(move || {
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(RETRIEVAL_DEADLINE_SECS);
@@ -729,7 +735,7 @@ async fn get_data_raw(
             let desc = stream.description().clone();
             let header = archiver_proto::epics_event::PayloadInfo {
                 r#type: desc.db_type as i32,
-                pvname: desc.pv_name.clone(),
+                pvname: response_pv_name.clone(),
                 year: desc.year,
                 element_count: desc.element_count,
                 unused00: None,
