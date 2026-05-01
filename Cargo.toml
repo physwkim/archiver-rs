@@ -13,6 +13,9 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
+repository = "https://github.com/physwkim/archiver-rs"
+authors = ["Sang Woo Kim"]
+readme = "README.md"
 
 [workspace.dependencies]
 # Protobuf
@@ -84,16 +87,21 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 # Internal crates
-archiver-proto = { path = "crates/archiver-proto" }
-archiver-core = { path = "crates/archiver-core" }
-archiver-engine = { path = "crates/archiver-engine" }
-
-archiver-api = { path = "crates/archiver-api" }
+archiver-proto = { path = "crates/archiver-proto", version = "0.2.0" }
+archiver-core = { path = "crates/archiver-core", version = "0.2.0" }
+archiver-engine = { path = "crates/archiver-engine", version = "0.2.0" }
+archiver-api = { path = "crates/archiver-api", version = "0.2.0" }
 
 [package]
 name = "archiver"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+# Root binary — not published to crates.io. The library crates
+# (archiver-proto, archiver-core, archiver-engine, archiver-api) are
+# the public surface; end users install the binary from the GitHub
+# release rather than `cargo install archiver`.
+publish = false
 
 [dependencies]
 archiver-core = { workspace = true }
