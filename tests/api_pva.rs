@@ -147,9 +147,9 @@ async fn pva_rpc_get_data_end_to_end() {
                         })
                         .collect(),
                 ),
-                PvField::ScalarArrayTyped(
-                    epics_rs::pva::pvdata::TypedScalarArray::Double(a),
-                ) => Some(a.to_vec()),
+                PvField::ScalarArrayTyped(epics_rs::pva::pvdata::TypedScalarArray::Double(a)) => {
+                    Some(a.to_vec())
+                }
                 _ => None,
             }
         })
