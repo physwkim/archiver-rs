@@ -1246,12 +1246,14 @@ fn epics_value_to_field_string(val: &EpicsValue) -> String {
         EpicsValue::Enum(v) => v.to_string(),
         EpicsValue::Char(v) => v.to_string(),
         EpicsValue::Long(v) => v.to_string(),
+        EpicsValue::Int64(v) => v.to_string(),
         EpicsValue::Double(v) => v.to_string(),
         EpicsValue::ShortArray(v) => format!("{v:?}"),
         EpicsValue::FloatArray(v) => format!("{v:?}"),
         EpicsValue::EnumArray(v) => format!("{v:?}"),
         EpicsValue::DoubleArray(v) => format!("{v:?}"),
         EpicsValue::LongArray(v) => format!("{v:?}"),
+        EpicsValue::Int64Array(v) => format!("{v:?}"),
         EpicsValue::CharArray(v) => String::from_utf8_lossy(v).into_owned(),
         EpicsValue::StringArray(v) => format!("{v:?}"),
     }
@@ -1416,6 +1418,9 @@ fn dbr_field_to_arch_type(field_type: DbFieldType) -> ArchDbType {
         DbFieldType::Enum => ArchDbType::ScalarEnum,
         DbFieldType::Char => ArchDbType::ScalarByte,
         DbFieldType::Long => ArchDbType::ScalarInt,
+        // PB PayloadType has no SCALAR_LONG (i64) — values outside i32 range
+        // are truncated by the i32 cast in epics_value_to_archiver.
+        DbFieldType::Int64 => ArchDbType::ScalarInt,
         DbFieldType::Double => ArchDbType::ScalarDouble,
     }
 }
@@ -1429,6 +1434,7 @@ fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
         EpicsValue::Enum(v) => ArchiverValue::ScalarEnum(*v as i32),
         EpicsValue::Char(v) => ArchiverValue::ScalarByte(vec![*v]),
         EpicsValue::Long(v) => ArchiverValue::ScalarInt(*v),
+        EpicsValue::Int64(v) => ArchiverValue::ScalarInt(*v as i32),
         EpicsValue::Double(v) => ArchiverValue::ScalarDouble(*v),
         EpicsValue::ShortArray(v) => {
             ArchiverValue::VectorShort(v.iter().map(|x| *x as i32).collect())
@@ -1439,6 +1445,9 @@ fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
         }
         EpicsValue::DoubleArray(v) => ArchiverValue::VectorDouble(v.clone()),
         EpicsValue::LongArray(v) => ArchiverValue::VectorInt(v.clone()),
+        EpicsValue::Int64Array(v) => {
+            ArchiverValue::VectorInt(v.iter().map(|x| *x as i32).collect())
+        }
         EpicsValue::CharArray(v) => ArchiverValue::VectorChar(v.clone()),
         EpicsValue::StringArray(v) => ArchiverValue::VectorString(v.clone()),
     }
