@@ -21,15 +21,26 @@ A high-performance EPICS Channel Access archiver written in Rust, compatible wit
 - **EPICS base** — `EPICS_CA_ADDR_LIST` must be set for Channel Access connectivity
 
 
-## Building
+## Installing
+
+The binary is published on crates.io as **`epics-archiver`** (the
+shorter `archiver` and `archiver-rs` names are taken by unrelated
+crates):
 
 ```bash
-git clone <repo-url>
-cd archiver
+cargo install epics-archiver
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/physwkim/archiver-rs.git
+cd archiver-rs
 cargo build --release
 ```
 
-The binary is produced at `target/release/archiver`.
+The binary is produced at `target/release/epics-archiver`. After
+`cargo install`, it lands in `~/.cargo/bin/epics-archiver`.
 
 ## Quick Start
 
@@ -77,23 +88,23 @@ export EPICS_CA_AUTO_ADDR_LIST=YES
 
 ```bash
 # Default: reads archiver.toml from current directory
-./target/release/archiver
+./target/release/epics-archiver
 
 # Or specify a config file path
-./target/release/archiver /etc/archiver/myconfig.toml
+./target/release/epics-archiver /etc/archiver/myconfig.toml
 ```
 
 The default log level is `info`. Use the `RUST_LOG` environment variable for more detail:
 
 ```bash
 # Enable debug logging for all archiver crates
-RUST_LOG=debug ./target/release/archiver
+RUST_LOG=debug ./target/release/epics-archiver
 
 # Debug only for the engine, info for everything else
-RUST_LOG=info,archiver_engine=debug ./target/release/archiver
+RUST_LOG=info,archiver_engine=debug ./target/release/epics-archiver
 
 # Suppress noisy storage writes, keep engine debug
-RUST_LOG=info,archiver_engine=debug,archiver_core::storage=warn ./target/release/archiver
+RUST_LOG=info,archiver_engine=debug,archiver_core::storage=warn ./target/release/epics-archiver
 ```
 
 ### 4. Archive a PV
@@ -435,13 +446,13 @@ retrieval_url = "http://app2-host:17665/retrieval"
 
    ```bash
    # On app0-host
-   EPICS_CA_ADDR_LIST="10.0.1.255" ./archiver appliance0.toml
+   EPICS_CA_ADDR_LIST="10.0.1.255" ./epics-archiver appliance0.toml
 
    # On app1-host
-   EPICS_CA_ADDR_LIST="10.0.2.255" ./archiver appliance1.toml
+   EPICS_CA_ADDR_LIST="10.0.2.255" ./epics-archiver appliance1.toml
 
    # On app2-host
-   EPICS_CA_ADDR_LIST="10.0.3.255" ./archiver appliance2.toml
+   EPICS_CA_ADDR_LIST="10.0.3.255" ./epics-archiver appliance2.toml
    ```
 
 5. **Archive PVs** on whichever appliance you choose — the PV is owned by the appliance that archives it:

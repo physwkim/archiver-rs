@@ -98,39 +98,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "archiver"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "archiver-api",
- "archiver-core",
- "archiver-engine",
- "archiver-proto",
- "async-trait",
- "axum",
- "axum-server",
- "chrono",
- "epics-rs",
- "futures",
- "hyper",
- "metrics-exporter-prometheus",
- "prost",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tower",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
-]
-
-[[package]]
 name = "archiver-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "archiver-core",
@@ -160,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "archiver-proto",
@@ -180,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "archiver-core",
@@ -200,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -537,6 +506,37 @@ name = "endian-type"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
+
+[[package]]
+name = "epics-archiver"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "archiver-api",
+ "archiver-core",
+ "archiver-engine",
+ "archiver-proto",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "chrono",
+ "epics-rs",
+ "futures",
+ "hyper",
+ "metrics-exporter-prometheus",
+ "prost",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+]
 
 [[package]]
 name = "epics-base-rs"

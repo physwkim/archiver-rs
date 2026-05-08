@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -87,21 +87,30 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 # Internal crates
-archiver-proto = { path = "crates/archiver-proto", version = "0.2.0" }
-archiver-core = { path = "crates/archiver-core", version = "0.2.0" }
-archiver-engine = { path = "crates/archiver-engine", version = "0.2.0" }
-archiver-api = { path = "crates/archiver-api", version = "0.2.0" }
+archiver-proto = { path = "crates/archiver-proto", version = "0.3.0" }
+archiver-core = { path = "crates/archiver-core", version = "0.3.0" }
+archiver-engine = { path = "crates/archiver-engine", version = "0.3.0" }
+archiver-api = { path = "crates/archiver-api", version = "0.3.0" }
 
 [package]
-name = "archiver"
+name = "epics-archiver"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# Root binary — not published to crates.io. The library crates
-# (archiver-proto, archiver-core, archiver-engine, archiver-api) are
-# the public surface; end users install the binary from the GitHub
-# release rather than `cargo install archiver`.
-publish = false
+repository.workspace = true
+authors.workspace = true
+readme.workspace = true
+description = "EPICS Archiver Appliance — Rust port. Channel-Access / pvAccess archiver with HTTP retrieval API and 3-tier PlainPB storage."
+# `archiver-rs` and `archiver` are both squatted on crates.io by
+# unrelated crates, so the binary ships under `epics-archiver`.
+# `cargo install epics-archiver` installs the `epics-archiver`
+# command. The library half of this workspace (archiver-proto,
+# archiver-core, archiver-engine, archiver-api) keeps the
+# `archiver-` prefix because those names were available.
+
+[[bin]]
+name = "epics-archiver"
+path = "src/main.rs"
 
 [dependencies]
 archiver-core = { workspace = true }
