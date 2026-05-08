@@ -623,25 +623,90 @@ impl PlainPbStoragePlugin {
     /// because `list_files_for_range` walks the directory). Safe no-op
     /// when nothing matches. Returns true if a writer was evicted.
     ///
-    /// **Definitive (principle 3 / eviction ownership):** snapshots
-    /// every slot Arc and BLOCKING-locks each one to read its
-    /// writer's path. The previous `try_lock` filter would silently
-    /// skip slots held by an in-flight append — leaving a ghost
-    /// writer that pointed at the just-deleted inode, which the
-    /// next flush would mistakenly count as healthy. Now any slot
-    /// pointing at `path` is evicted before this returns,
-    /// regardless of contention; a long in-flight append
-    /// momentarily blocks the eviction (bounded by the engine's
-    /// per-PV append timeout).
+    /// **Definitive (principle 3 / eviction ownership):** the slot
+    /// pointing at `path` (if any) is evicted before this returns.
+    /// Fast path uses the file path's deterministic encoding to
+    /// derive the PV name and look up exactly one slot, avoiding
+    /// the previous full-scan blocking-lock cost (where one stuck
+    /// unrelated slot could delay every ETL eviction). Falls back
+    /// to a scan only if the path's filename can't be parsed.
     ///
-    /// Sync method, blocking on per-slot mutexes — the ETL caller
-    /// wraps it in `tokio::task::spawn_blocking` so the runtime
-    /// worker isn't held during the wait.
+    /// Sync method, blocking on the target slot's mutex — the
+    /// ETL caller wraps it in `tokio::task::spawn_blocking` so
+    /// the runtime worker isn't held during the wait.
     pub fn evict_writer_for_path(&self, path: &Path) -> bool {
-        // Snapshot ALL slot Arcs (not just ones we can try_lock).
-        // Recovery from a poisoned outer mutex preserves the
-        // post-condition: after this returns, no slot's writer
-        // points at `path`.
+        // Fast path: the file path encodes the PV name (see
+        // `pv_name_to_key`), so we can derive it and look up
+        // exactly one slot. Avoids the previous full-scan
+        // behaviour where one stuck unrelated slot could delay
+        // every ETL eviction.
+        if let Some(pv) = self.pv_name_from_path(path) {
+            return self.evict_writer_for_pv_at_path(&pv, path);
+        }
+        // Fallback: file path didn't decode (caller passed a
+        // non-storage path, or the encoding scheme has drifted).
+        // Run the legacy scan so we don't miss a writer just
+        // because the filename was unusual.
+        self.evict_writer_for_path_scan(path)
+    }
+
+    /// Reverse the deterministic `pv_name_to_key` → file-path
+    /// encoding. Returns `Some(pv_name)` for any path under the
+    /// storage root whose filename matches the
+    /// `{pv_key}:{partition}.pb` layout.
+    fn pv_name_from_path(&self, path: &Path) -> Option<String> {
+        let rel = path.strip_prefix(&self.root_folder).ok()?;
+        let s = rel.to_str()?;
+        // Strip the trailing partition+extension (everything from
+        // the LAST `:` onward — the last colon is the separator
+        // because `pv_name_to_key` has already replaced any colon
+        // in the PV name with `/`).
+        let colon = s.rfind(':')?;
+        let pv_key = &s[..colon];
+        if pv_key.is_empty() {
+            return None;
+        }
+        Some(pv_key.replace('/', ":"))
+    }
+
+    /// Direct-lookup eviction: lock just one slot (the one keyed
+    /// by `pv`) and evict if its writer's path matches. Returns
+    /// `true` when a writer was evicted, `false` otherwise.
+    fn evict_writer_for_pv_at_path(&self, pv: &str, path: &Path) -> bool {
+        let slot_arc = {
+            let cache = self.write_cache.lock().unwrap_or_else(|e| {
+                tracing::warn!(?path, "write cache poisoned at evict_writer_for_path: {e}");
+                e.into_inner()
+            });
+            cache.get(pv).cloned()
+        };
+        let Some(arc) = slot_arc else {
+            return false;
+        };
+        let mut slot_guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+        let matches = slot_guard
+            .writer
+            .as_ref()
+            .map(|cw| cw.path == path)
+            .unwrap_or(false);
+        if !matches {
+            return false;
+        }
+        let Some(cached) = slot_guard.writer.take() else {
+            return false;
+        };
+        self.drop_writer_file_gone(pv, cached);
+        drop(slot_guard);
+        let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.remove(pv);
+        true
+    }
+
+    /// Fallback full-scan eviction for paths that don't decode
+    /// to a known PV name. Snapshots every slot Arc and blocking-
+    /// locks each — same correctness as the fast path, but with
+    /// the O(N) cost the fast path is designed to avoid.
+    fn evict_writer_for_path_scan(&self, path: &Path) -> bool {
         let snapshot: Vec<(String, Arc<Mutex<PvWriterSlot>>)> = {
             let cache = self.write_cache.lock().unwrap_or_else(|e| {
                 tracing::warn!(?path, "write cache poisoned at evict_writer_for_path: {e}");
@@ -656,11 +721,6 @@ impl PlainPbStoragePlugin {
         let mut removed = false;
         let mut to_remove = Vec::new();
         for (pv, slot_arc) in snapshot {
-            // BLOCKING lock — wait out any in-flight append on
-            // this slot. This is what makes the eviction
-            // definitive: a try_lock skip would leave the slot
-            // and its ghost writer in cache, and the next flush
-            // would falsely report it clean.
             let mut slot_guard = slot_arc.lock().unwrap_or_else(|e| e.into_inner());
             let matches = slot_guard
                 .writer
@@ -671,9 +731,6 @@ impl PlainPbStoragePlugin {
                 continue;
             }
             if let Some(cached) = slot_guard.writer.take() {
-                // Caller has already removed the file; flushing
-                // to a deleted inode is meaningless. file-gone
-                // path records loss for any dirty bytes.
                 self.drop_writer_file_gone(&pv, cached);
                 removed = true;
             }
@@ -1664,16 +1721,26 @@ impl StoragePlugin for PlainPbStoragePlugin {
         // legal. (If the operator was actively appending to `to`
         // at the moment of rename, they made a mistake; we don't
         // optimise for that case.)
-        {
+        //
+        // **Outer lock briefly, then release**: take the slot
+        // Arc out under the outer lock, drop the outer guard,
+        // THEN lock the slot and run drop_dirty_writer (which
+        // does sync flush I/O). Holding the outer lock across
+        // the flush would block every concurrent slot_for() —
+        // i.e., every shard's append — for the duration of the
+        // dest writer's flush, which on slow storage could stall
+        // the entire ingest path.
+        let dest_slot_arc = {
             let mut cache = self
                 .write_cache
                 .lock()
                 .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
-            if let Some(arc) = cache.remove(to) {
-                let mut slot = arc.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(cached) = slot.writer.take() {
-                    let _ = self.drop_dirty_writer(to, cached);
-                }
+            cache.remove(to)
+        };
+        if let Some(arc) = dest_slot_arc {
+            let mut slot = arc.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = slot.writer.take() {
+                let _ = self.drop_dirty_writer(to, cached);
             }
         }
 

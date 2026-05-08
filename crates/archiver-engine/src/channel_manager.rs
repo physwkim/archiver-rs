@@ -2964,20 +2964,29 @@ async fn run_flush_and_commit(
     });
     match tokio::time::timeout(flush_timeout, flush_join).await {
         Ok(Ok(Ok(IngestFlushResult { failed, deferred }))) => {
-            // Failed PVs: bytes lost. Remove from the shared map
-            // IF the current value still equals the snapshot's
-            // value (a concurrent shard may have advanced past
-            // the snapshot — in that case its newer bytes ARE on
-            // disk via a fresh writer, so we leave the entry).
+            // Failed PVs: bytes lost. Drop every failed PV's
+            // pending entry UNCONDITIONALLY — regardless of
+            // whether the snapshot's value still matches.
+            //
+            // The previous "remove only if matches snapshot"
+            // policy assumed a concurrent shard's post-snapshot
+            // report meant "newer bytes ARE on disk". That
+            // assumption fails for the eviction/loss-queue path:
+            // the loss queue records only PV names, so a loss
+            // event recorded between snapshot and flush-return
+            // has no way to communicate which writer generation
+            // (or timestamp horizon) it applies to. A
+            // post-snapshot pending entry could refer to bytes
+            // that ARE on disk (fresh writer after eviction) OR
+            // bytes that were also lost — we can't tell.
+            //
+            // Conservative drop is the safe choice: never
+            // commit a `last_event` for a PV the storage just
+            // told us had lost bytes, even at the cost of an
+            // occasional under-commit that the next sample
+            // resolves.
             if !failed.is_empty() {
-                let mut failed_committed: std::collections::HashMap<String, SystemTime> =
-                    std::collections::HashMap::new();
-                for pv in &failed {
-                    if let Some(&snap_ts) = snapshot.get(pv) {
-                        failed_committed.insert(pv.clone(), snap_ts);
-                    }
-                }
-                pending.remove_committed(&failed_committed);
+                pending.remove_failed(&failed);
                 error!(
                     "STS flush dropped {} PV(s) from timestamp commit \
                      (bytes never reached disk): {:?}",
@@ -3154,6 +3163,29 @@ impl PendingReports {
             // remove_if applies the predicate atomically inside
             // the DashMap shard lock.
             let _ = self.inner.remove_if(pv, |_, v| *v == committed_ts);
+        }
+    }
+
+    /// Unconditionally remove every failed PV's entry from the
+    /// pending map, regardless of its current timestamp.
+    ///
+    /// **Why unconditional.** The storage's loss queue carries
+    /// only PV names — it cannot tell us whether a concurrent
+    /// shard's post-snapshot report was for bytes that ARE on
+    /// disk (e.g., a fresh writer opened after eviction) versus
+    /// bytes that are also gone. The matching `remove_committed`
+    /// path can leave a post-snapshot entry behind, and the next
+    /// clean flush would commit it — turning a "PV's bytes were
+    /// lost" report into a `last_event` lie.
+    ///
+    /// The trade-off: a brand-new sample whose bytes truly DID
+    /// reach disk after the loss event gets dropped from this
+    /// commit cycle. Future samples re-populate `pending` and the
+    /// registry catches up. Under-commit is the safe direction;
+    /// over-commit is never acceptable.
+    pub fn remove_failed(&self, failed: &[String]) {
+        for pv in failed {
+            let _ = self.inner.remove(pv);
         }
     }
 

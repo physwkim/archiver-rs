@@ -672,6 +672,108 @@ async fn dispatcher_isolates_slow_shard() {
     let _ = tokio::time::timeout(Duration::from_secs(5), pool_join).await;
 }
 
+/// Failed-PV must drop the CURRENT pending entry, not just
+/// snapshot-matching ones. Bug timeline the test reproduces:
+///
+///   t0: ticker fires, snapshot S = {Y: t_y} taken (X not yet
+///       in pending). spawn_blocking flush_ingest_writes starts;
+///       fake hangs.
+///   t1: a sample for X arrives → pending.report(X, t_x) →
+///       pending = {Y: t_y, X: t_x}.
+///   t2: hang ends; fake returns failed=[X] (simulating that
+///       X had a loss-queue entry recorded between snapshot
+///       and flush-return).
+///   t3: owner gets failed=[X]. With the OLD policy
+///       (`failed_committed` = entries that were in snapshot),
+///       X is not in S, so failed_committed is empty for X →
+///       pending[X] survives. The next clean flush would commit
+///       X's stale ts despite the loss report.
+///
+/// With the conservative `pending.remove_failed(&failed)` policy,
+/// X is dropped unconditionally and the registry never gets the
+/// stale commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_pv_drops_post_snapshot_pending_entry() {
+    let cfg = WriteLoopConfig {
+        flush_period: Duration::from_millis(80),
+        append_timeout: Duration::from_millis(300),
+        flush_timeout: Duration::from_millis(500),
+        drain_per_sample_timeout: Duration::from_millis(300),
+        drain_total_budget: Duration::from_secs(2),
+        shutdown_flush_timeout: Duration::from_millis(500),
+    };
+
+    let storage = InjectingStorage::new();
+    // Hang the flush enough that we can inject a post-snapshot
+    // append for X before flush returns.
+    storage.set_flush_hang(Duration::from_millis(250));
+    // Every flush returns failed=["X"] — simulates a loss event
+    // for X that was queued at some point.
+    storage.set_flush_failed(vec!["X".to_string()]);
+
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    for pv in ["X", "Y"] {
+        registry
+            .register_pv(pv, ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+    }
+
+    let counters = Arc::new(PvCounters::default());
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry.clone(), cfg.clone());
+
+    // Step 1: pre-populate pending with Y so the ticker has
+    // something to snapshot. Wait for the ticker to fire and
+    // for the spawn_blocking to enter its hang.
+    let t_y = ts(100);
+    tx.send(pv_sample("Y", t_y, 1.0, &counters)).await.unwrap();
+    tokio::time::sleep(cfg.flush_period + Duration::from_millis(40)).await;
+    assert!(
+        storage.flush_ingest_call_count() >= 1,
+        "ticker flush should have started before we inject X"
+    );
+
+    // Step 2: inject the post-snapshot append for X. By this
+    // point the snapshot was already taken (without X) and the
+    // flush is mid-hang.
+    let t_x = ts(200);
+    tx.send(pv_sample("X", t_x, 9.0, &counters)).await.unwrap();
+    // Give the shard worker time to spawn_blocking + report.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Step 3: wait for the hang to end and the owner to apply
+    // the failed=[X] result.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Step 4: clear flush_failed so subsequent flushes don't
+    // keep flagging X. If the conservative drop is wrong, the
+    // next clean flush will commit X = t_x (from the leftover
+    // pending entry).
+    storage.set_flush_failed(Vec::new());
+
+    // Trigger more ticker cycles so any leftover pending entry
+    // would have a chance to commit.
+    for _ in 0..6 {
+        tokio::time::sleep(cfg.flush_period + Duration::from_millis(20)).await;
+    }
+
+    // Verify the final state.
+    let x_rec = registry.get_pv("X").unwrap().unwrap();
+    let y_rec = registry.get_pv("Y").unwrap().unwrap();
+    assert_eq!(
+        x_rec.last_timestamp, None,
+        "X's post-snapshot pending entry must be conservatively \
+         dropped — bytes were classified as lost via the loss \
+         queue, so the registry must NOT commit a stale t_x"
+    );
+    assert_eq!(
+        y_rec.last_timestamp,
+        Some(t_y),
+        "Y was in the snapshot and not in failed; it must commit"
+    );
+
+    shutdown(sd_tx, join).await;
+}
+
 /// Round 8 regression: shutdown's final flush must not be
 /// short-circuited by a still-running ticker flush. A previous
 /// design held `flush_in_flight` set across the shutdown
