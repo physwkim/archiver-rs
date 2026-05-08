@@ -724,6 +724,8 @@ impl ChannelManager {
         match &record.sample_mode {
             SampleMode::Monitor => {
                 let pv_name_loop = pv_name.clone();
+                let archive_fields_loop = record.archive_fields.clone();
+                let extras_for_loop = extras.clone();
                 tokio::spawn(async move {
                     monitor_loop_pva(
                         pv_name_loop,
@@ -735,6 +737,8 @@ impl ChannelManager {
                         ci,
                         counters_for_loop,
                         drift,
+                        archive_fields_loop,
+                        extras_for_loop,
                     )
                     .await;
                 });
@@ -742,6 +746,8 @@ impl ChannelManager {
             SampleMode::Scan { period_secs } => {
                 let period = *period_secs;
                 let pv_name_loop = pv_name.clone();
+                let archive_fields_loop = record.archive_fields.clone();
+                let extras_for_loop = extras.clone();
                 tokio::spawn(async move {
                     scan_loop_pva(
                         pv_name_loop,
@@ -753,6 +759,8 @@ impl ChannelManager {
                         ci,
                         counters_for_loop,
                         drift,
+                        archive_fields_loop,
+                        extras_for_loop,
                     )
                     .await;
                 });
@@ -1210,12 +1218,86 @@ async fn refresh_ctrl_metadata(
     }
 }
 
-/// PVA monitor loop: subscribes once via `pvmonitor_handle` (which
-/// internally auto-reconnects, so we don't need the CA monitor's
-/// outer reconnect loop) and parks until cancellation. Each
-/// fan-in event is decoded inline, packaged as a [`PvSample`], and
-/// non-blocking-pushed into the storage write_loop's channel —
+/// Body shared by the two PVA monitor callback variants
+/// (`pvmonitor_handle` takes `(FieldDesc, PvField)`,
+/// `pvmonitor_with_request` takes `(PvField)`). Lifted out so we
+/// can write the once-per-event logic in one place.
+#[allow(clippy::too_many_arguments)]
+fn pva_handle_event(
+    field: &PvField,
+    pv_name: &str,
+    dbr_type: ArchDbType,
+    tx: &mpsc::Sender<PvSample>,
+    conn_info: &Mutex<ConnectionInfo>,
+    counters: &Arc<PvCounters>,
+    extras: &ExtraFieldsCache,
+    extras_paths: &[(String, &'static str)],
+    drift_secs: u64,
+) {
+    let now = SystemTime::now();
+    let first_after_connect = {
+        let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
+        let first = ci.last_event_time.is_none();
+        if ci.connected_since.is_none() {
+            ci.connected_since = Some(now);
+        }
+        ci.is_connected = true;
+        ci.last_event_time = Some(now);
+        ci.state = PvConnectionState::Connected;
+        first
+    };
+    if first_after_connect {
+        counters
+            .first_event_unix_secs
+            .compare_exchange(0, unix_secs(now), Ordering::Relaxed, Ordering::Relaxed)
+            .ok();
+    }
+    counters.events_received.fetch_add(1, Ordering::Relaxed);
+
+    let Some(value) = pv_field_scalar_to_archiver(field) else {
+        counters.type_change_drops.fetch_add(1, Ordering::Relaxed);
+        debug!(pv = pv_name, "PVA event has non-scalar value; dropping");
+        return;
+    };
+
+    let ts = pv_field_extract_timestamp(field);
+    if !first_after_connect && !ioc_timestamp_in_window(ts, now, drift_secs) {
+        counters.timestamp_drops.fetch_add(1, Ordering::Relaxed);
+        debug!(pv = pv_name, ?ts, "Dropping PVA sample with out-of-window timestamp");
+        return;
+    }
+    let elem_count = match pv_field_element_count(field) {
+        0 => 1,
+        n => n,
+    };
+    for (field_name, path) in extras_paths {
+        if let Some(PvField::Scalar(s)) = pv_field_walk_path(field, path) {
+            extras.insert(field_name.clone(), scalar_value_to_string(s));
+        }
+    }
+    let mut sample = ArchiverSample::new(ts, value);
+    attach_extras(extras, &mut sample);
+    let pv_sample = PvSample {
+        pv_name: pv_name.to_string(),
+        dbr_type,
+        sample,
+        element_count: Some(elem_count),
+        counters: Some(counters.clone()),
+    };
+    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(pv_sample) {
+        counters.buffer_overflow_drops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// PVA monitor loop: subscribes once and parks until cancellation.
+/// Each fan-in event is decoded inline, packaged as a [`PvSample`],
+/// and non-blocking-pushed into the storage write_loop's channel —
 /// blocking would stall the pvAccess reactor thread.
+///
+/// When `archive_fields` is non-empty, the subscription requests an
+/// explicit pvRequest with the mapped sub-field paths so the IOC
+/// includes them in every monitor event; the callback then mirrors
+/// the CA path's "extras" cache by stringifying each requested field.
 #[allow(clippy::too_many_arguments)]
 async fn monitor_loop_pva(
     pv_name: String,
@@ -1227,6 +1309,8 @@ async fn monitor_loop_pva(
     conn_info: Arc<Mutex<ConnectionInfo>>,
     counters: Arc<PvCounters>,
     server_ioc_drift_secs: u64,
+    archive_fields: Vec<String>,
+    extras: Arc<ExtraFieldsCache>,
 ) {
     let drift_secs = server_ioc_drift_secs;
     // Static element_count is unused — each callback derives the
@@ -1234,120 +1318,121 @@ async fn monitor_loop_pva(
     // whose size changes between events still gets tagged correctly.
     let _ = element_count;
 
-    // Subscribe with retry. pvAccess monitors are sticky once
-    // established, so we only loop on the *initial* attempt.
-    let _handle = loop {
-        let pv_name_cb = pv_name.clone();
-        let dbr_type_cb = dbr_type;
-        let tx_cb = tx.clone();
-        let conn_info_cb = conn_info.clone();
-        let counters_cb = counters.clone();
-
-        let cb = move |_desc: &epics_rs::pva::pvdata::FieldDesc, field: &PvField| {
-            let now = SystemTime::now();
-
-            // Update connection bookkeeping. First-event semantics
-            // mirror the CA path — each delivered event re-affirms
-            // `Connected` state and refreshes `last_event_time`.
-            let first_after_connect = {
-                let mut ci = conn_info_cb.lock().unwrap_or_else(|e| e.into_inner());
-                let first = ci.last_event_time.is_none();
-                if ci.connected_since.is_none() {
-                    ci.connected_since = Some(now);
-                }
-                ci.is_connected = true;
-                ci.last_event_time = Some(now);
-                ci.state = PvConnectionState::Connected;
-                first
-            };
-            if first_after_connect {
-                counters_cb
-                    .first_event_unix_secs
-                    .compare_exchange(
-                        0,
-                        unix_secs(now),
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .ok();
-            }
-            counters_cb.events_received.fetch_add(1, Ordering::Relaxed);
-
-            let Some(value) = pv_field_scalar_to_archiver(field) else {
-                // Non-scalar — happens on schema mismatch (e.g. server
-                // started serving NTNDArray). Drop, count, log once
-                // per event for visibility.
-                counters_cb
-                    .type_change_drops
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    pv = pv_name_cb,
-                    "PVA event has non-scalar value; dropping"
-                );
-                return;
-            };
-
-            let ts = pv_field_extract_timestamp(field);
-            // IOC-drift filter parity with the CA monitor loop. First
-            // sample after connect is exempt (legitimate backfill on
-            // reconnect can include older timestamps).
-            if !first_after_connect && !ioc_timestamp_in_window(ts, now, drift_secs) {
-                counters_cb
-                    .timestamp_drops
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    pv = pv_name_cb,
-                    ?ts,
-                    "Dropping PVA sample with out-of-window timestamp"
-                );
-                return;
-            }
-            // Per-event element_count — handles NTScalarArrays that
-            // resize between samples. `0` (unsupported shape) shouldn't
-            // happen here since the callback returned earlier on
-            // non-scalar; treat as 1 defensively.
-            let elem_count = match pv_field_element_count(field) {
-                0 => 1,
-                n => n,
-            };
-            let sample = ArchiverSample::new(ts, value);
-            let pv_sample = PvSample {
-                pv_name: pv_name_cb.clone(),
-                dbr_type: dbr_type_cb,
-                sample,
-                element_count: Some(elem_count),
-                counters: Some(counters_cb.clone()),
-            };
-            // Non-blocking — the reactor thread can't await our mpsc
-            // backpressure. Saturation is rare (write_loop drains at
-            // ~10⁵ samples/s) and counted for operator visibility.
-            if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx_cb.try_send(pv_sample) {
-                counters_cb
-                    .buffer_overflow_drops
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        };
-
-        match pva_client.pvmonitor_handle(&pv_name, cb).await {
-            Ok(h) => break h,
-            Err(e) => {
-                counters
-                    .transient_error_count
-                    .fetch_add(1, Ordering::Relaxed);
-                warn!(pv = pv_name, "PVA pvmonitor failed: {e}; retrying");
-                tokio::select! {
-                    _ = cancel_token.cancelled() => return,
-                    _ = tokio::time::sleep(CA_RETRY_DELAY) => continue,
-                }
-            }
+    // Build the (CA name, PVA path) pairs once. Skip CA fields with
+    // no PVA equivalent so a misconfigured archive_fields list
+    // doesn't poison the pvRequest.
+    let extras_paths: Vec<(String, &'static str)> = archive_fields
+        .iter()
+        .filter_map(|f| ca_archive_field_to_pva_path(f).map(|p| (f.clone(), p)))
+        .collect();
+    let request_expr = if extras_paths.is_empty() {
+        None
+    } else {
+        let mut builder = epics_rs::pva::pv_request::PvRequestBuilder::new()
+            .field("value")
+            .field("alarm")
+            .field("timeStamp");
+        for (_, path) in &extras_paths {
+            builder = builder.field(*path);
         }
+        Some(builder.build())
     };
 
-    debug!(pv = pv_name, "PVA monitor active");
-    cancel_token.cancelled().await;
-    debug!(pv = pv_name, "PVA monitor cancelled; dropping subscription");
-    // `_handle` drops here, which tears down the subscription on the
-    // pvAccess client.
+    // Subscribe loop with retry. The custom-request path uses
+    // `pvmonitor_with_request` (no SubscriptionHandle) inside a
+    // tokio::select! so cancellation drops the future cleanly; the
+    // empty-request path keeps the original SubscriptionHandle form
+    // since that's the simpler path for the common case.
+    loop {
+        if let Some(ref req) = request_expr {
+            // Custom-request path: 1-arg callback. pvmonitor_with_request
+            // returns a future that runs to completion; race it against
+            // the cancel signal.
+            let pv_name_cb = pv_name.clone();
+            let tx_cb = tx.clone();
+            let conn_info_cb = conn_info.clone();
+            let counters_cb = counters.clone();
+            let extras_cb = extras.clone();
+            let extras_paths_cb = extras_paths.clone();
+            let cb = move |field: &PvField| {
+                pva_handle_event(
+                    field,
+                    &pv_name_cb,
+                    dbr_type,
+                    &tx_cb,
+                    &conn_info_cb,
+                    &counters_cb,
+                    &extras_cb,
+                    &extras_paths_cb,
+                    drift_secs,
+                );
+            };
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    debug!(pv = pv_name, "PVA monitor (custom request) cancelled");
+                    return;
+                }
+                res = pva_client.pvmonitor_with_request(&pv_name, req, cb) => {
+                    match res {
+                        Ok(()) => {
+                            debug!(pv = pv_name, "PVA pvmonitor_with_request returned Ok; resubscribing");
+                        }
+                        Err(e) => {
+                            counters
+                                .transient_error_count
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(pv = pv_name, "PVA pvmonitor_with_request failed: {e}; retrying");
+                        }
+                    }
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => return,
+                        _ = tokio::time::sleep(CA_RETRY_DELAY) => continue,
+                    }
+                }
+            }
+        } else {
+            // Empty-request fast path: 2-arg callback. Keep the
+            // SubscriptionHandle so the inner reactor task lives
+            // until our explicit drop.
+            let pv_name_cb = pv_name.clone();
+            let tx_cb = tx.clone();
+            let conn_info_cb = conn_info.clone();
+            let counters_cb = counters.clone();
+            let extras_cb = extras.clone();
+            let extras_paths_cb = extras_paths.clone();
+            let cb = move |_desc: &epics_rs::pva::pvdata::FieldDesc, field: &PvField| {
+                pva_handle_event(
+                    field,
+                    &pv_name_cb,
+                    dbr_type,
+                    &tx_cb,
+                    &conn_info_cb,
+                    &counters_cb,
+                    &extras_cb,
+                    &extras_paths_cb,
+                    drift_secs,
+                );
+            };
+            let handle = match pva_client.pvmonitor_handle(&pv_name, cb).await {
+                Ok(h) => h,
+                Err(e) => {
+                    counters
+                        .transient_error_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(pv = pv_name, "PVA pvmonitor failed: {e}; retrying");
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => return,
+                        _ = tokio::time::sleep(CA_RETRY_DELAY) => continue,
+                    }
+                }
+            };
+            debug!(pv = pv_name, "PVA monitor active");
+            cancel_token.cancelled().await;
+            debug!(pv = pv_name, "PVA monitor cancelled; dropping subscription");
+            drop(handle);
+            return;
+        }
+    }
 }
 
 /// PVA Scan loop: periodic `pvget` instead of streaming monitor.
@@ -1363,7 +1448,13 @@ async fn scan_loop_pva(
     conn_info: Arc<Mutex<ConnectionInfo>>,
     counters: Arc<PvCounters>,
     server_ioc_drift_secs: u64,
+    archive_fields: Vec<String>,
+    extras: Arc<ExtraFieldsCache>,
 ) {
+    let extras_paths: Vec<(String, &'static str)> = archive_fields
+        .iter()
+        .filter_map(|f| ca_archive_field_to_pva_path(f).map(|p| (f.clone(), p)))
+        .collect();
     let period = Duration::from_secs_f64(period_secs);
     let mut interval = tokio::time::interval(period);
     let drift_secs = server_ioc_drift_secs;
@@ -1447,7 +1538,16 @@ async fn scan_loop_pva(
             0 => 1,
             n => n,
         };
-        let sample = ArchiverSample::new(now, value);
+        // Refresh extras from this scan's pvget result (the pvget
+        // returns the full NTScalar so all sub-fields are available
+        // for free — no extra channel spawn needed).
+        for (field_name, path) in &extras_paths {
+            if let Some(PvField::Scalar(s)) = pv_field_walk_path(&field, path) {
+                extras.insert(field_name.clone(), scalar_value_to_string(s));
+            }
+        }
+        let mut sample = ArchiverSample::new(now, value);
+        attach_extras(&extras, &mut sample);
         let pv_sample = PvSample {
             pv_name: pv_name.clone(),
             dbr_type,
@@ -2272,6 +2372,69 @@ fn pv_field_to_arch_db_type(field: &PvField) -> Option<(ArchDbType, i32)> {
         }
         _ => return None,
     })
+}
+
+/// Map a CA field name (`HIHI`, `LOLO`, `EGU`, …) to the dotted
+/// pvAccess path under an NTScalar / NTScalarArray. Returns `None`
+/// for fields that have no PVA equivalent — caller should drop them
+/// silently rather than building an unsatisfiable pvRequest.
+fn ca_archive_field_to_pva_path(field: &str) -> Option<&'static str> {
+    Some(match field {
+        // display sub-structure
+        "EGU" => "display.units",
+        "PREC" => "display.precision",
+        "DESC" => "display.description",
+        "HOPR" => "display.limitHigh",
+        "LOPR" => "display.limitLow",
+        // valueAlarm sub-structure (alarm thresholds)
+        "HIHI" => "valueAlarm.highAlarmLimit",
+        "LOLO" => "valueAlarm.lowAlarmLimit",
+        "HIGH" => "valueAlarm.highWarningLimit",
+        "LOW" => "valueAlarm.lowWarningLimit",
+        "HHSV" => "valueAlarm.highAlarmSeverity",
+        "LLSV" => "valueAlarm.lowAlarmSeverity",
+        "HSV" => "valueAlarm.highWarningSeverity",
+        "LSV" => "valueAlarm.lowWarningSeverity",
+        "HYST" => "valueAlarm.hysteresis",
+        // control sub-structure (drive limits)
+        "DRVH" => "control.limitHigh",
+        "DRVL" => "control.limitLow",
+        _ => return None,
+    })
+}
+
+/// Walk a dotted PVA field path (`valueAlarm.highAlarmLimit`) from
+/// the root [`PvField`]. Returns `None` if any segment is missing or
+/// the path lands on a non-structure intermediate.
+fn pv_field_walk_path<'a>(root: &'a PvField, path: &str) -> Option<&'a PvField> {
+    let mut current = root;
+    for segment in path.split('.') {
+        let PvField::Structure(s) = current else {
+            return None;
+        };
+        current = s.get_field(segment)?;
+    }
+    Some(current)
+}
+
+/// Stringify a [`ScalarValue`] for storage in the per-sample extras
+/// map. Java archiver's `archiveFields` blob is a string-string map,
+/// so we mirror that wire shape.
+fn scalar_value_to_string(s: &ScalarValue) -> String {
+    match s {
+        ScalarValue::Boolean(v) => v.to_string(),
+        ScalarValue::Byte(v) => v.to_string(),
+        ScalarValue::Short(v) => v.to_string(),
+        ScalarValue::Int(v) => v.to_string(),
+        ScalarValue::Long(v) => v.to_string(),
+        ScalarValue::UByte(v) => v.to_string(),
+        ScalarValue::UShort(v) => v.to_string(),
+        ScalarValue::UInt(v) => v.to_string(),
+        ScalarValue::ULong(v) => v.to_string(),
+        ScalarValue::Float(v) => v.to_string(),
+        ScalarValue::Double(v) => v.to_string(),
+        ScalarValue::String(s) => s.clone(),
+    }
 }
 
 /// Element count for a PVA value: 1 for scalar, length for arrays,
