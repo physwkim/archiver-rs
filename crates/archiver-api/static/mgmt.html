@@ -264,7 +264,8 @@ async function fetchPvStatuses(pvs) {
     );
     const results = await Promise.all(promises);
     for (const { pv, status } of results) {
-      const cells = document.querySelectorAll(`.pv-status[data-pv="${css(pv)}"]`);
+      const safe = pv.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      const cells = document.querySelectorAll(`.pv-status[data-pv="${safe}"]`);
       cells.forEach(cell => { cell.innerHTML = statusBadge(status); });
     }
   }

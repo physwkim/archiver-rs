@@ -214,6 +214,9 @@ impl EtlExecutor {
                     "Failed to remove source after ETL marker found: {e}"
                 );
             }
+            // Drop any open BufWriter on the just-deleted path so the
+            // engine doesn't continue writing into the orphaned inode.
+            self.source.evict_writer_for_path(source_path);
             if let Err(e) = tokio::fs::remove_file(&marker).await {
                 warn!(?marker, "Failed to remove ETL marker: {e}");
             }
@@ -226,6 +229,7 @@ impl EtlExecutor {
         let source_path = source_path.to_path_buf();
         let source_path_disp = source_path.clone();
         let dest = self.dest.clone();
+        let source = self.source.clone();
         let source_name = self.source.name().to_string();
         let dest_name = self.dest.name().to_string();
 
@@ -244,6 +248,9 @@ impl EtlExecutor {
             let marker = source_path.with_extension("pb.etl_done");
             tokio::fs::write(&marker, b"").await?;
             tokio::fs::remove_file(&source_path).await?;
+            // Drop any open BufWriter on the just-deleted path so the
+            // engine doesn't continue writing into the orphaned inode.
+            source.evict_writer_for_path(&source_path);
             tokio::fs::remove_file(&marker).await.ok();
             metrics::counter!(
                 "archiver_etl_files_moved_total",

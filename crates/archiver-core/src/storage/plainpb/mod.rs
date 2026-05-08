@@ -135,6 +135,37 @@ impl PlainPbStoragePlugin {
         &self.root_folder
     }
 
+    /// Drop any cached BufWriter whose target path matches `path`.
+    /// Call this after `remove_file` on a `.pb` file the engine may have
+    /// open — without it, subsequent `append_event` writes go to the
+    /// deleted-but-still-open inode (a "ghost" file invisible to readers
+    /// because `list_files_for_range` walks the directory). Safe no-op
+    /// when nothing matches. Returns true if a writer was evicted.
+    pub fn evict_writer_for_path(&self, path: &Path) -> bool {
+        let mut cache = match self.write_cache.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(
+                    ?path,
+                    "write cache poisoned during evict_writer_for_path: {e}"
+                );
+                return false;
+            }
+        };
+        let to_remove: Vec<String> = cache
+            .iter()
+            .filter(|(_, c)| c.path == path)
+            .map(|(pv, _)| pv.clone())
+            .collect();
+        let removed = !to_remove.is_empty();
+        for pv in to_remove {
+            if let Some(mut cached) = cache.remove(&pv) {
+                let _ = cached.writer.flush();
+            }
+        }
+        removed
+    }
+
     /// Ensure a parent directory exists, using a cached set to skip repeated syscalls.
     fn ensure_parent_dir(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
@@ -190,6 +221,24 @@ impl PlainPbStoragePlugin {
                 );
             }
             cache.remove(pv);
+        }
+
+        // Defense-in-depth for ghost-file writes: if the cached writer's
+        // target path no longer exists on disk (deleted by ETL while we
+        // missed the eviction, by manual `rm`, by a flaky NFS mount, …)
+        // its bytes are going into an orphaned inode invisible to readers.
+        // Drop the writer so the next branch reopens a fresh file.
+        if let Some(existing) = cache.get(pv)
+            && !existing.path.exists()
+        {
+            tracing::warn!(
+                pv,
+                path = ?existing.path,
+                "Cached writer's file disappeared from filesystem; reopening"
+            );
+            if let Some(mut cached) = cache.remove(pv) {
+                let _ = cached.writer.flush();
+            }
         }
 
         if !cache.contains_key(pv) {

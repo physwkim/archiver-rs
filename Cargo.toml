@@ -119,6 +119,7 @@ axum-server = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 rustls = { workspace = true }
 epics-rs = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use dashmap::DashMap;
+use epics_rs::base::server::snapshot::DbrClass;
 use epics_rs::base::types::{DbFieldType, EpicsValue};
 use epics_rs::ca::client::{CaChannel, CaClient, ConnectionEvent};
 use tokio::sync::mpsc;
@@ -137,6 +138,10 @@ pub struct PvCounters {
     /// archive-time recorded type (Java parity 9f2234f). `-1` = no
     /// mismatch ever seen.
     pub latest_observed_dbr: AtomicI32,
+    /// Number of DBR_CTRL metadata refresh attempts that failed (timeout,
+    /// transport error, missing display info). Operators looking at PVs
+    /// with empty PREC/EGU should check this.
+    pub metadata_fetch_failures: AtomicU64,
 }
 
 impl Default for PvCounters {
@@ -153,6 +158,7 @@ impl Default for PvCounters {
             transient_error_count: AtomicU64::new(0),
             // -1 sentinel = no type mismatch ever observed.
             latest_observed_dbr: AtomicI32::new(-1),
+            metadata_fetch_failures: AtomicU64::new(0),
         }
     }
 }
@@ -173,6 +179,7 @@ pub struct PvCountersSnapshot {
     /// `Some(dbr_type as i32)` if a type-change mismatch has been
     /// observed; `None` otherwise (Java parity 9f2234f).
     pub latest_observed_dbr: Option<i32>,
+    pub metadata_fetch_failures: u64,
 }
 
 impl From<&PvCounters> for PvCountersSnapshot {
@@ -197,6 +204,7 @@ impl From<&PvCounters> for PvCountersSnapshot {
                 -1 => None,
                 v => Some(v),
             },
+            metadata_fetch_failures: c.metadata_fetch_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -518,6 +526,7 @@ impl ChannelManager {
         let ci = conn_info.clone();
         let extras_for_loop = extras.clone();
         let counters_for_loop = counters.clone();
+        let registry_for_loop = self.registry.clone();
 
         let drift = self.server_ioc_drift_secs;
         match &record.sample_mode {
@@ -531,6 +540,7 @@ impl ChannelManager {
                         tx,
                         token,
                         ci,
+                        registry_for_loop,
                         extras_for_loop,
                         counters_for_loop,
                         drift,
@@ -550,6 +560,7 @@ impl ChannelManager {
                         token,
                         period,
                         ci,
+                        registry_for_loop,
                         extras_for_loop,
                         counters_for_loop,
                     )
@@ -855,6 +866,93 @@ impl ChannelManager {
     }
 }
 
+/// Read DBR_CTRL metadata from the channel and persist `precision`/`units`
+/// to the registry when they differ from stored values. Best-effort: any
+/// failure (timeout, transport error, missing display info, non-numeric
+/// type) is logged at debug and silently ignored. Skips the SQL write
+/// entirely when the in-memory record already matches, so reconnect
+/// storms don't churn the database.
+async fn refresh_ctrl_metadata(
+    channel: &CaChannel,
+    registry: &PvRegistry,
+    pv_name: &str,
+    counters: &PvCounters,
+) {
+    // 15s — long enough for slow-network IOCs (Java's default `epicsTimeout`
+    // is 30s; 15s splits the difference). Failures count toward
+    // `metadata_fetch_failures` so operators can spot PVs that never get
+    // PREC/EGU populated.
+    const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+    let snapshot = match tokio::time::timeout(
+        FETCH_TIMEOUT,
+        channel.get_with_metadata(DbrClass::Ctrl),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            counters
+                .metadata_fetch_failures
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(pv = pv_name, "Ctrl metadata fetch failed: {e}");
+            return;
+        }
+        Err(_) => {
+            counters
+                .metadata_fetch_failures
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(pv = pv_name, "Ctrl metadata fetch timed out");
+            return;
+        }
+    };
+    let Some(display) = snapshot.display else {
+        // Non-numeric type (string, enum, …) — DBR_CTRL has no
+        // DisplayInfo. Not a failure; just nothing to persist.
+        return;
+    };
+
+    let new_prec = display.precision.to_string();
+    let new_egu_trimmed = display.units.trim();
+    let new_egu_opt: Option<&str> = if new_egu_trimmed.is_empty() {
+        None
+    } else {
+        Some(new_egu_trimmed)
+    };
+
+    let stored = match registry.get_pv(pv_name) {
+        Ok(Some(r)) => r,
+        Ok(None) => return,
+        Err(e) => {
+            debug!(pv = pv_name, "Registry read for metadata compare failed: {e}");
+            return;
+        }
+    };
+
+    let prec_changed = stored.prec.as_deref() != Some(new_prec.as_str());
+    let egu_changed = match (stored.egu.as_deref(), new_egu_opt) {
+        (Some(s), Some(n)) => s != n,
+        (None, Some(_)) => true,
+        // Don't overwrite a populated EGU with empty, and don't
+        // bother writing None over None.
+        _ => false,
+    };
+    if !prec_changed && !egu_changed {
+        return;
+    }
+
+    let prec_arg = prec_changed.then_some(new_prec.as_str());
+    let egu_arg = if egu_changed { new_egu_opt } else { None };
+    if let Err(e) = registry.update_metadata(pv_name, prec_arg, egu_arg) {
+        warn!(pv = pv_name, "Failed to persist PREC/EGU: {e}");
+    } else {
+        debug!(
+            pv = pv_name,
+            prec = ?prec_arg, egu = ?egu_arg,
+            "Refreshed PREC/EGU from DBR_CTRL"
+        );
+    }
+}
+
 /// Monitor loop: subscribe to a channel and forward values.
 #[allow(clippy::too_many_arguments)]
 async fn monitor_loop(
@@ -865,6 +963,7 @@ async fn monitor_loop(
     tx: mpsc::Sender<PvSample>,
     cancel_token: CancellationToken,
     conn_info: Arc<Mutex<ConnectionInfo>>,
+    registry: Arc<PvRegistry>,
     extras: Arc<ExtraFieldsCache>,
     counters: Arc<PvCounters>,
     server_ioc_drift_secs: u64,
@@ -945,6 +1044,20 @@ async fn monitor_loop(
                     }
                 }
             }
+        }
+
+        // Refresh DBR_CTRL metadata once per (re)connect so the registry's
+        // PREC/EGU stay in sync with the IOC. Fire-and-forget so a slow
+        // CA stack can't gate `subscribe()` (and therefore the first
+        // sample) on a metadata round-trip.
+        {
+            let channel = channel.clone();
+            let registry = registry.clone();
+            let counters = counters.clone();
+            let pv_name = pv_name.clone();
+            tokio::spawn(async move {
+                refresh_ctrl_metadata(&channel, &registry, &pv_name, &counters).await;
+            });
         }
 
         // Subscribe.
@@ -1115,11 +1228,15 @@ async fn scan_loop(
     cancel_token: CancellationToken,
     period_secs: f64,
     conn_info: Arc<Mutex<ConnectionInfo>>,
+    registry: Arc<PvRegistry>,
     extras: Arc<ExtraFieldsCache>,
     counters: Arc<PvCounters>,
 ) {
     let period = Duration::from_secs_f64(period_secs);
     let mut interval = tokio::time::interval(period);
+    // Reset on every detected disconnect so we re-fetch metadata after
+    // each reconnect (mirrors monitor_loop's once-per-(re)connect cadence).
+    let mut metadata_done = false;
 
     loop {
         tokio::select! {
@@ -1146,7 +1263,23 @@ async fn scan_loop(
                     .last_disconnect_unix_secs
                     .store(unix_secs(SystemTime::now()), Ordering::Relaxed);
             }
+            metadata_done = false;
             continue;
+        }
+
+        if !metadata_done {
+            // Fire-and-forget; matches monitor_loop's once-per-(re)connect
+            // semantics. The local `metadata_done` flag exists because
+            // scan_loop's outer iteration is per-tick (vs monitor_loop's
+            // per-reconnect), so we'd otherwise spawn a fetch every tick.
+            let channel = channel.clone();
+            let registry = registry.clone();
+            let counters = counters.clone();
+            let pv_name = pv_name.clone();
+            tokio::spawn(async move {
+                refresh_ctrl_metadata(&channel, &registry, &pv_name, &counters).await;
+            });
+            metadata_done = true;
         }
 
         match channel.get().await {

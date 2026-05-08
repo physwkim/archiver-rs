@@ -25,12 +25,28 @@ use archiver_engine::policy::PolicyConfig;
 
 use supervisor::RuntimeSupervisor;
 
+/// Local-time formatter for tracing logs. tracing-subscriber's built-in
+/// timers default to UTC; chrono's `Local` reads the system TZ so logs
+/// match the operator's wall clock.
+struct LocalTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(
+            w,
+            "{}",
+            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z")
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with_timer(LocalTimer)
         .init();
 
     // Load configuration.
