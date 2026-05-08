@@ -25,13 +25,23 @@ A high-performance EPICS Channel Access archiver written in Rust, compatible wit
 
 The binary is published on crates.io as **`epics-archiver`** (the
 shorter `archiver` and `archiver-rs` names are taken by unrelated
-crates):
+crates).
+
+### From crates.io (recommended)
 
 ```bash
 cargo install epics-archiver
 ```
 
-Or build from source:
+The binary lands in `~/.cargo/bin/epics-archiver`. Make sure
+`~/.cargo/bin` is on your `PATH`, then run:
+
+```bash
+epics-archiver --help    # version + usage
+epics-archiver           # reads archiver.toml from current directory
+```
+
+### From source
 
 ```bash
 git clone https://github.com/physwkim/archiver-rs.git
@@ -39,8 +49,23 @@ cd archiver-rs
 cargo build --release
 ```
 
-The binary is produced at `target/release/epics-archiver`. After
-`cargo install`, it lands in `~/.cargo/bin/epics-archiver`.
+The binary is produced at `target/release/epics-archiver`. The
+Quick Start examples below all use the bare `epics-archiver`
+command — for source builds, substitute `./target/release/epics-archiver`
+or add the binary to your `PATH`.
+
+### Library crates
+
+The four library crates are available separately for projects
+that want to embed parts of the archiver:
+
+```toml
+[dependencies]
+archiver-proto  = "0.3"
+archiver-core   = "0.3"
+archiver-engine = "0.3"
+archiver-api    = "0.3"
+```
 
 ## Quick Start
 
@@ -88,23 +113,23 @@ export EPICS_CA_AUTO_ADDR_LIST=YES
 
 ```bash
 # Default: reads archiver.toml from current directory
-./target/release/epics-archiver
+epics-archiver
 
 # Or specify a config file path
-./target/release/epics-archiver /etc/archiver/myconfig.toml
+epics-archiver /etc/archiver/myconfig.toml
 ```
 
 The default log level is `info`. Use the `RUST_LOG` environment variable for more detail:
 
 ```bash
 # Enable debug logging for all archiver crates
-RUST_LOG=debug ./target/release/epics-archiver
+RUST_LOG=debug epics-archiver
 
 # Debug only for the engine, info for everything else
-RUST_LOG=info,archiver_engine=debug ./target/release/epics-archiver
+RUST_LOG=info,archiver_engine=debug epics-archiver
 
 # Suppress noisy storage writes, keep engine debug
-RUST_LOG=info,archiver_engine=debug,archiver_core::storage=warn ./target/release/epics-archiver
+RUST_LOG=info,archiver_engine=debug,archiver_core::storage=warn epics-archiver
 ```
 
 ### 4. Archive a PV
@@ -446,13 +471,13 @@ retrieval_url = "http://app2-host:17665/retrieval"
 
    ```bash
    # On app0-host
-   EPICS_CA_ADDR_LIST="10.0.1.255" ./epics-archiver appliance0.toml
+   EPICS_CA_ADDR_LIST="10.0.1.255" epics-archiver appliance0.toml
 
    # On app1-host
-   EPICS_CA_ADDR_LIST="10.0.2.255" ./epics-archiver appliance1.toml
+   EPICS_CA_ADDR_LIST="10.0.2.255" epics-archiver appliance1.toml
 
    # On app2-host
-   EPICS_CA_ADDR_LIST="10.0.3.255" ./epics-archiver appliance2.toml
+   EPICS_CA_ADDR_LIST="10.0.3.255" epics-archiver appliance2.toml
    ```
 
 5. **Archive PVs** on whichever appliance you choose — the PV is owned by the appliance that archives it:
