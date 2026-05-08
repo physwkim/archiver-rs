@@ -160,12 +160,14 @@ impl StoragePlugin for TieredStorage {
         Ok(())
     }
 
-    async fn flush_ingest_writes(&self) -> anyhow::Result<()> {
+    async fn flush_ingest_writes(&self) -> anyhow::Result<Vec<String>> {
         // The engine's write_loop only writes to STS (see
         // `append_event_with_meta`); MTS/LTS writers exist only for
         // ETL. Limiting the ingest-path flush to STS prevents an
         // NFS-stalled long-term store from blocking live archiving.
-        self.sts.flush_writes().await
+        // Per-PV failure list bubbles up so write_loop can drop
+        // those PVs from the pending-timestamp commit.
+        self.sts.flush_ingest_writes().await
     }
 
     fn stores_for_pv(&self, pv: &str) -> anyhow::Result<Vec<StoreSummary>> {

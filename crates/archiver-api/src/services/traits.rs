@@ -112,6 +112,11 @@ pub struct PvCountersDto {
     /// DBR_CTRL metadata fetches that failed (timeout / transport / no
     /// DisplayInfo). Useful when PVs persistently show empty PREC/EGU.
     pub metadata_fetch_failures: u64,
+    /// Storage `append_event_with_meta` calls that exceeded the
+    /// per-sample timeout — distinct from `buffer_overflow_drops`
+    /// so operators can tell a wedged storage tier apart from a
+    /// slow writer.
+    pub storage_append_timeouts: u64,
 }
 
 // --- ArchiverCommand (async — write operations on archiver engine) ---

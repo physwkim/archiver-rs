@@ -57,6 +57,7 @@ impl ArchiverQuery for ChannelArchiverControl {
                         transient_error_count: c.transient_error_count,
                         latest_observed_dbr: c.latest_observed_dbr,
                         metadata_fetch_failures: c.metadata_fetch_failures,
+                        storage_append_timeouts: c.storage_append_timeouts,
                     },
                 )
             })

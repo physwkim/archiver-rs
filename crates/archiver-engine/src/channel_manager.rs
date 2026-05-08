@@ -144,6 +144,12 @@ pub struct PvCounters {
     /// transport error, missing display info). Operators looking at PVs
     /// with empty PREC/EGU should check this.
     pub metadata_fetch_failures: AtomicU64,
+    /// Number of `storage.append_event_with_meta` calls that exceeded
+    /// the per-sample storage timeout. Distinct from
+    /// `buffer_overflow_drops` (mpsc channel saturation) so an
+    /// operator can tell "the storage tier is wedged" apart from
+    /// "the writer can't keep up with the producer".
+    pub storage_append_timeouts: AtomicU64,
 }
 
 impl Default for PvCounters {
@@ -161,6 +167,7 @@ impl Default for PvCounters {
             // -1 sentinel = no type mismatch ever observed.
             latest_observed_dbr: AtomicI32::new(-1),
             metadata_fetch_failures: AtomicU64::new(0),
+            storage_append_timeouts: AtomicU64::new(0),
         }
     }
 }
@@ -182,6 +189,7 @@ pub struct PvCountersSnapshot {
     /// observed; `None` otherwise (Java parity 9f2234f).
     pub latest_observed_dbr: Option<i32>,
     pub metadata_fetch_failures: u64,
+    pub storage_append_timeouts: u64,
 }
 
 impl From<&PvCounters> for PvCountersSnapshot {
@@ -207,6 +215,7 @@ impl From<&PvCounters> for PvCountersSnapshot {
                 v => Some(v),
             },
             metadata_fetch_failures: c.metadata_fetch_failures.load(Ordering::Relaxed),
+            storage_append_timeouts: c.storage_append_timeouts.load(Ordering::Relaxed),
         }
     }
 }
@@ -2622,71 +2631,111 @@ pub async fn write_loop(
                     element_count: pv_sample.element_count,
                     ..Default::default()
                 };
-                // Bound each append so a slow backend (NFS hiccup,
-                // disk that just went read-only, …) can't park the
-                // entire archive write loop forever. NB: this only
-                // helps when the future respects async cancellation;
-                // a fully sync hang inside write_cached still pins
-                // the runtime worker until the OS unblocks the
-                // syscall. Real isolation requires spawn_blocking +
-                // per-PV locks; documented as a known follow-up.
+                // Bound each append + isolate sync syscall hangs.
+                // `spawn_blocking` moves the actual I/O to the
+                // blocking thread pool, so a stuck NFS write parks
+                // a blocking-pool thread instead of a runtime
+                // worker. The `tokio::time::timeout` then bounds
+                // how long write_loop waits for that join — a
+                // stuck task is abandoned (its future is dropped)
+                // and write_loop continues. NOTE: the abandoned
+                // task remains parked on the blocking pool until
+                // the OS unblocks it; under sustained hangs the
+                // blocking pool eventually saturates, after which
+                // newer spawn_blocking calls queue. mpsc back-
+                // pressure then drops samples via overflow.
+                // True isolation also needs per-PV locks (Issue 5).
                 const STORAGE_APPEND_TIMEOUT: Duration = Duration::from_secs(30);
-                let res = tokio::time::timeout(
-                    STORAGE_APPEND_TIMEOUT,
-                    storage.append_event_with_meta(
+                let pv_name_for_post = pv_sample.pv_name.clone();
+                let counters_for_post = pv_sample.counters.clone();
+                let storage_for_task = storage.clone();
+                let join = tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(storage_for_task.append_event_with_meta(
                         &pv_sample.pv_name,
                         pv_sample.dbr_type,
                         &pv_sample.sample,
                         &meta,
-                    ),
-                )
-                .await;
+                    ))
+                });
+                let res = tokio::time::timeout(STORAGE_APPEND_TIMEOUT, join).await;
                 match res {
-                    Ok(Ok(())) => {
+                    Ok(Ok(Ok(()))) => {
                         metrics::counter!("archiver_events_stored_total").increment(1);
-                        if let Some(ref c) = pv_sample.counters {
+                        if let Some(ref c) = counters_for_post {
                             c.events_stored.fetch_add(1, Ordering::Relaxed);
                         }
-                        ts_updates.insert(pv_sample.pv_name, ts);
+                        ts_updates.insert(pv_name_for_post, ts);
                     }
-                    Ok(Err(e)) => {
-                        error!(pv = pv_sample.pv_name, "Write error: {e}");
+                    Ok(Ok(Err(e))) => {
+                        error!(pv = pv_name_for_post, "Write error: {e}");
+                    }
+                    Ok(Err(join_err)) => {
+                        error!(
+                            pv = pv_name_for_post,
+                            "Storage write task panicked: {join_err}"
+                        );
                     }
                     Err(_) => {
                         error!(
-                            pv = pv_sample.pv_name,
+                            pv = pv_name_for_post,
                             "Storage append timed out after {STORAGE_APPEND_TIMEOUT:?}; \
-                             sample dropped"
+                             sample dropped (task remains on blocking pool)"
                         );
-                        if let Some(ref c) = pv_sample.counters {
-                            c.buffer_overflow_drops.fetch_add(1, Ordering::Relaxed);
+                        if let Some(ref c) = counters_for_post {
+                            c.storage_append_timeouts.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
 
-                // Periodic flush: storage FIRST so registry timestamps
-                // only get committed for samples that actually made it
-                // to disk. If storage flush fails (disk full, write
-                // error on a writer), keep ts_updates pending so the
-                // NEXT successful flush picks them up — without this
-                // gate the registry's `last_event` would silently lie
-                // when bytes never reached disk.
+                // Periodic flush: storage FIRST. The flush returns
+                // the per-PV failure list so we can drop ONLY those
+                // PVs from `ts_updates` — successful PVs still get
+                // their `last_event` committed. Without per-PV
+                // filtering, a single failing PV would either taint
+                // every PV's commit (registry says "we have data we
+                // don't") or block every PV's commit (registry
+                // never advances).
                 if last_flush.elapsed() > flush_period && !ts_updates.is_empty() {
                     match storage.flush_ingest_writes().await {
-                        Ok(()) => {
-                            let refs: Vec<(&str, SystemTime)> = ts_updates
-                                .iter()
-                                .map(|(name, ts)| (name.as_str(), *ts))
-                                .collect();
-                            if let Err(e) = registry.batch_update_timestamps(&refs) {
-                                error!("Failed to flush timestamps: {e}");
+                        Ok(failed_pvs) => {
+                            for pv in &failed_pvs {
+                                ts_updates.remove(pv);
                             }
-                            ts_updates.clear();
+                            if !failed_pvs.is_empty() {
+                                error!(
+                                    "STS flush dropped {} PV(s) from timestamp commit \
+                                     (their bytes never reached disk): {:?}",
+                                    failed_pvs.len(),
+                                    failed_pvs
+                                );
+                            }
+                            if !ts_updates.is_empty() {
+                                let refs: Vec<(&str, SystemTime)> = ts_updates
+                                    .iter()
+                                    .map(|(name, ts)| (name.as_str(), *ts))
+                                    .collect();
+                                match registry.batch_update_timestamps(&refs) {
+                                    Ok(()) => ts_updates.clear(),
+                                    Err(e) => {
+                                        // Don't clear — retry on next cycle.
+                                        // Otherwise a transient SQLite error
+                                        // would orphan timestamps the disk
+                                        // has but the registry doesn't know
+                                        // about, with no retry path.
+                                        error!(
+                                            "Registry timestamp commit failed; \
+                                             keeping {} pending for retry: {e}",
+                                            ts_updates.len()
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             error!(
-                                "STS ingest flush failed; deferring registry \
-                                 timestamp commit ({} pending PVs): {e}",
+                                "STS ingest flush errored; deferring all {} \
+                                 pending timestamp commits: {e}",
                                 ts_updates.len()
                             );
                         }
@@ -2701,7 +2750,9 @@ pub async fn write_loop(
                         element_count: pv_sample.element_count,
                         ..Default::default()
                     };
-                    if let Err(e) = storage
+                    let drain_ts = pv_sample.sample.timestamp;
+                    let drain_pv = pv_sample.pv_name.clone();
+                    match storage
                         .append_event_with_meta(
                             &pv_sample.pv_name,
                             pv_sample.dbr_type,
@@ -2710,7 +2761,15 @@ pub async fn write_loop(
                         )
                         .await
                     {
-                        warn!(pv = pv_sample.pv_name, "Shutdown drain write error: {e}");
+                        Ok(()) => {
+                            // Track for the final ts_updates commit so
+                            // restart-time recovery sees the drained
+                            // samples reflected in `last_event`.
+                            ts_updates.insert(drain_pv, drain_ts);
+                        }
+                        Err(e) => {
+                            warn!(pv = pv_sample.pv_name, "Shutdown drain write error: {e}");
+                        }
                     }
                 }
                 // Final flush: storage FIRST so the registry's

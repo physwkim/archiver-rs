@@ -612,3 +612,40 @@ async fn injection_flush_after_no_writes_is_noop() {
     plugin.flush_writes().await.expect("empty flush is Ok");
     plugin.flush_writes().await.expect("empty flush is repeatable");
 }
+
+#[tokio::test]
+async fn injection_ingest_flush_returns_empty_vec_on_success() {
+    // Contract: `flush_ingest_writes` returns `Ok(Vec::new())` when
+    // every dirty writer flushed cleanly. Regression guard for the
+    // per-PV failure surface — if the impl ever mistakenly listed
+    // healthy PVs as "failed", write_loop would orphan their
+    // timestamps from the registry commit.
+    let dir = temp_dir();
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap().into();
+    for i in 0..5 {
+        let pv = format!("TEST:Pv{i}");
+        let s = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(i as f64));
+        plugin
+            .append_event(&pv, ArchDbType::ScalarDouble, &s)
+            .await
+            .unwrap();
+    }
+
+    let failed = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        failed.is_empty(),
+        "all healthy writers should flush; got failed: {failed:?}"
+    );
+
+    // Subsequent flush after no new writes — dirty bit clean, still
+    // Ok(empty). Validates that successful flush clears the dirty
+    // flag so the next flush doesn't touch healthy writers again.
+    let failed = plugin.flush_ingest_writes().await.unwrap();
+    assert!(failed.is_empty());
+}

@@ -146,6 +146,49 @@ impl PlainPbStoragePlugin {
         &self.root_folder
     }
 
+    /// Flush every dirty cached writer. Returns the list of PV
+    /// names whose flush failed (and whose entries were evicted as
+    /// a result, with their buffered bytes discarded via
+    /// `into_parts` so a re-flush from `BufWriter::drop` can't
+    /// silently re-issue the same failing syscall).
+    fn flush_dirty_writers(&self) -> Vec<String> {
+        let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut to_remove = Vec::new();
+        let mut failed = Vec::new();
+        for (pv, cached) in cache.iter_mut() {
+            // Skip writers with nothing pending — every `get_data`
+            // call lands here, and at scale (1000+ PVs) the avoided
+            // syscall storm matters: only PVs that actually buffered
+            // bytes since the last flush get touched.
+            if !cached.dirty {
+                continue;
+            }
+            match cached.writer.flush() {
+                Ok(()) => cached.dirty = false,
+                Err(e) => {
+                    tracing::warn!(pv, path = ?cached.path, "Failed to flush cached writer: {e}");
+                    metrics::counter!(
+                        "archiver_pb_flush_failures_total",
+                        "tier" => self.plugin_name.clone(),
+                    )
+                    .increment(1);
+                    failed.push(pv.clone());
+                    to_remove.push(pv.clone());
+                }
+            }
+        }
+        for pv in to_remove {
+            if let Some(removed) = cache.remove(&pv) {
+                // `into_parts` drops buffered bytes WITHOUT letting
+                // BufWriter::drop attempt a final flush — that flush
+                // would re-issue the failing syscall, and the buffer
+                // is already suspect (the reason we got here).
+                let (_file, _buffered) = removed.writer.into_parts();
+            }
+        }
+        failed
+    }
+
     /// Drop any cached BufWriter whose target path matches `path`.
     /// Call this after `remove_file` on a `.pb` file the engine may have
     /// open — without it, subsequent `append_event` writes go to the
@@ -336,13 +379,22 @@ impl PlainPbStoragePlugin {
             // create+append+header path which validates the file
             // and reopens fresh. Tail-trim runs in `file_needs_header`
             // on that next open and removes any partial record.
+            //
+            // Use `into_parts` to discard buffered bytes WITHOUT
+            // letting BufWriter::drop attempt a final flush; that
+            // flush would re-issue the same failing syscall (worst
+            // case: another partial write) and the buffered bytes
+            // are already suspect.
             tracing::warn!(
                 pv,
                 path = ?cached.path,
                 "Write failed; evicting cached writer to force \
                  reopen on next sample: {e}"
             );
-            cache.remove(pv);
+            if let Some(removed) = cache.remove(pv) {
+                let (_file, _buffered) = removed.writer.into_parts();
+                // _file dropped → fd closed without flush.
+            }
             return Err(e.into());
         }
         cached.dirty = true;
@@ -811,49 +863,23 @@ impl StoragePlugin for PlainPbStoragePlugin {
     }
 
     async fn flush_writes(&self) -> anyhow::Result<()> {
-        // Recover from poison: cache mutations are atomic at the
-        // HashMap level, so post-panic state stays internally consistent.
-        let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
-        let mut to_remove = Vec::new();
-        let mut errors: Vec<(String, String)> = Vec::new();
-        for (pv, cached) in cache.iter_mut() {
-            // Skip writers with nothing pending — every `get_data`
-            // call lands here, and at scale (1000+ PVs) the avoided
-            // syscall storm matters: only PVs that actually buffered
-            // bytes since the last flush get touched.
-            if !cached.dirty {
-                continue;
-            }
-            match cached.writer.flush() {
-                Ok(()) => cached.dirty = false,
-                Err(e) => {
-                    tracing::warn!(pv, path = ?cached.path, "Failed to flush cached writer: {e}");
-                    metrics::counter!(
-                        "archiver_pb_flush_failures_total",
-                        "tier" => self.plugin_name.clone(),
-                    )
-                    .increment(1);
-                    errors.push((pv.clone(), e.to_string()));
-                    to_remove.push(pv.clone());
-                }
-            }
-        }
-        for pv in to_remove {
-            cache.remove(&pv);
-        }
-        if !errors.is_empty() {
-            // Surface failures so callers (write_loop's periodic flush,
-            // get_data) can react — e.g. write_loop must NOT commit
-            // registry timestamps for samples that didn't actually
-            // make it to disk.
+        let failed = self.flush_dirty_writers();
+        if !failed.is_empty() {
+            // Read-side callers (`get_data` etc.) just want to know
+            // "is the storage still healthy?". Write-side callers
+            // (write_loop) use `flush_ingest_writes` to get the
+            // per-PV failure list directly.
             anyhow::bail!(
-                "{} writer flush(es) failed (first: pv={} err={})",
-                errors.len(),
-                errors[0].0,
-                errors[0].1,
+                "{} writer flush(es) failed (first pv={})",
+                failed.len(),
+                failed[0],
             );
         }
         Ok(())
+    }
+
+    async fn flush_ingest_writes(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self.flush_dirty_writers())
     }
 
     fn stores_for_pv(&self, pv: &str) -> anyhow::Result<Vec<StoreSummary>> {

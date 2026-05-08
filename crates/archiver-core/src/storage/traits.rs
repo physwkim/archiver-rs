@@ -111,13 +111,27 @@ pub trait StoragePlugin: Send + Sync {
     }
 
     /// Flush only the cached writers used by the *ingest* path (the
-    /// engine's monitor/scan write_loop). Default is the same as
-    /// [`Self::flush_writes`]; multi-tier implementations should
-    /// override to limit scope (e.g. STS only) so a slow MTS/LTS
-    /// mount can't stall the live archive pipeline. ETL still drives
-    /// MTS/LTS flushing on its own cadence.
-    async fn flush_ingest_writes(&self) -> anyhow::Result<()> {
-        self.flush_writes().await
+    /// engine's monitor/scan write_loop), returning per-PV failures.
+    ///
+    /// Returns:
+    /// - `Ok(empty Vec)` — every dirty writer flushed cleanly. Caller
+    ///   may safely commit pending registry timestamps for ALL PVs.
+    /// - `Ok(non-empty Vec)` — listed PVs' flushes failed (their
+    ///   buffered bytes are lost, their cached writers were evicted).
+    ///   Caller MUST drop those PVs from any pending timestamp commit
+    ///   so the registry doesn't lie about `last_event` for samples
+    ///   that never reached disk.
+    /// - `Err(...)` — catastrophic / non-per-PV failure (e.g. lock
+    ///   poisoning beyond recovery). Caller should defer all timestamp
+    ///   commits for retry on the next cycle.
+    ///
+    /// Multi-tier implementations should limit scope to the ingest
+    /// tier (e.g. STS only) so a slow MTS/LTS mount can't stall the
+    /// live archive pipeline. ETL drives MTS/LTS flushing separately.
+    async fn flush_ingest_writes(&self) -> anyhow::Result<Vec<String>> {
+        // Default: best-effort fall back to flush_writes. Implementations
+        // that can identify per-PV failures should override.
+        self.flush_writes().await.map(|_| Vec::new())
     }
 
     /// Per-tier summary scoped to a single PV: name, root folder, granularity,

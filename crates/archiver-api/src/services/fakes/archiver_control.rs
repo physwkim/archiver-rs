@@ -104,6 +104,7 @@ impl ArchiverQuery for FakeArchiverControl {
                         transient_error_count: 0,
                         latest_observed_dbr: None,
                         metadata_fetch_failures: 0,
+                        storage_append_timeouts: 0,
                     },
                 )
             })
