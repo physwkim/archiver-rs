@@ -110,6 +110,16 @@ pub trait StoragePlugin: Send + Sync {
         Ok(())
     }
 
+    /// Flush only the cached writers used by the *ingest* path (the
+    /// engine's monitor/scan write_loop). Default is the same as
+    /// [`Self::flush_writes`]; multi-tier implementations should
+    /// override to limit scope (e.g. STS only) so a slow MTS/LTS
+    /// mount can't stall the live archive pipeline. ETL still drives
+    /// MTS/LTS flushing on its own cadence.
+    async fn flush_ingest_writes(&self) -> anyhow::Result<()> {
+        self.flush_writes().await
+    }
+
     /// Per-tier summary scoped to a single PV: name, root folder, granularity,
     /// and how many `.pb` files this tier holds for that PV. Total size /
     /// total files are left None.

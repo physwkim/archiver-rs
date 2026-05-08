@@ -2622,37 +2622,75 @@ pub async fn write_loop(
                     element_count: pv_sample.element_count,
                     ..Default::default()
                 };
-                if let Err(e) = storage
-                    .append_event_with_meta(
+                // Bound each append so a slow backend (NFS hiccup,
+                // disk that just went read-only, …) can't park the
+                // entire archive write loop forever. NB: this only
+                // helps when the future respects async cancellation;
+                // a fully sync hang inside write_cached still pins
+                // the runtime worker until the OS unblocks the
+                // syscall. Real isolation requires spawn_blocking +
+                // per-PV locks; documented as a known follow-up.
+                const STORAGE_APPEND_TIMEOUT: Duration = Duration::from_secs(30);
+                let res = tokio::time::timeout(
+                    STORAGE_APPEND_TIMEOUT,
+                    storage.append_event_with_meta(
                         &pv_sample.pv_name,
                         pv_sample.dbr_type,
                         &pv_sample.sample,
                         &meta,
-                    )
-                    .await
-                {
-                    error!(pv = pv_sample.pv_name, "Write error: {e}");
-                } else {
-                    metrics::counter!("archiver_events_stored_total").increment(1);
-                    if let Some(ref c) = pv_sample.counters {
-                        c.events_stored.fetch_add(1, Ordering::Relaxed);
+                    ),
+                )
+                .await;
+                match res {
+                    Ok(Ok(())) => {
+                        metrics::counter!("archiver_events_stored_total").increment(1);
+                        if let Some(ref c) = pv_sample.counters {
+                            c.events_stored.fetch_add(1, Ordering::Relaxed);
+                        }
+                        ts_updates.insert(pv_sample.pv_name, ts);
                     }
-                    ts_updates.insert(pv_sample.pv_name, ts);
+                    Ok(Err(e)) => {
+                        error!(pv = pv_sample.pv_name, "Write error: {e}");
+                    }
+                    Err(_) => {
+                        error!(
+                            pv = pv_sample.pv_name,
+                            "Storage append timed out after {STORAGE_APPEND_TIMEOUT:?}; \
+                             sample dropped"
+                        );
+                        if let Some(ref c) = pv_sample.counters {
+                            c.buffer_overflow_drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
 
-                // Periodic flush: timestamps to SQLite + buffered writes to disk.
+                // Periodic flush: storage FIRST so registry timestamps
+                // only get committed for samples that actually made it
+                // to disk. If storage flush fails (disk full, write
+                // error on a writer), keep ts_updates pending so the
+                // NEXT successful flush picks them up — without this
+                // gate the registry's `last_event` would silently lie
+                // when bytes never reached disk.
                 if last_flush.elapsed() > flush_period && !ts_updates.is_empty() {
-                    let refs: Vec<(&str, SystemTime)> = ts_updates
-                        .iter()
-                        .map(|(name, ts)| (name.as_str(), *ts))
-                        .collect();
-                    if let Err(e) = registry.batch_update_timestamps(&refs) {
-                        error!("Failed to flush timestamps: {e}");
+                    match storage.flush_ingest_writes().await {
+                        Ok(()) => {
+                            let refs: Vec<(&str, SystemTime)> = ts_updates
+                                .iter()
+                                .map(|(name, ts)| (name.as_str(), *ts))
+                                .collect();
+                            if let Err(e) = registry.batch_update_timestamps(&refs) {
+                                error!("Failed to flush timestamps: {e}");
+                            }
+                            ts_updates.clear();
+                        }
+                        Err(e) => {
+                            error!(
+                                "STS ingest flush failed; deferring registry \
+                                 timestamp commit ({} pending PVs): {e}",
+                                ts_updates.len()
+                            );
+                        }
                     }
-                    if let Err(e) = storage.flush_writes().await {
-                        error!("Failed to flush storage writes: {e}");
-                    }
-                    ts_updates.clear();
                     last_flush = std::time::Instant::now();
                 }
             }
@@ -2675,8 +2713,20 @@ pub async fn write_loop(
                         warn!(pv = pv_sample.pv_name, "Shutdown drain write error: {e}");
                     }
                 }
-                // Final flush: timestamps + buffered writes.
-                if !ts_updates.is_empty() {
+                // Final flush: storage FIRST so the registry's
+                // last_event timestamps don't claim more than what
+                // actually reached disk. Use the all-tier flush_writes
+                // here (not flush_ingest_writes) — at shutdown we
+                // want every cached writer drained, including any
+                // ETL-side caches.
+                let storage_ok = match storage.flush_writes().await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!("Shutdown storage flush failed: {e}");
+                        false
+                    }
+                };
+                if storage_ok && !ts_updates.is_empty() {
                     let refs: Vec<(&str, SystemTime)> = ts_updates
                         .iter()
                         .map(|(name, ts)| (name.as_str(), *ts))
@@ -2684,9 +2734,6 @@ pub async fn write_loop(
                     if let Err(e) = registry.batch_update_timestamps(&refs) {
                         warn!("Shutdown timestamp flush failed: {e}");
                     }
-                }
-                if let Err(e) = storage.flush_writes().await {
-                    warn!("Shutdown storage flush failed: {e}");
                 }
                 info!("Write loop shutting down");
                 break;

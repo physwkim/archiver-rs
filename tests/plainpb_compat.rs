@@ -446,3 +446,169 @@ async fn multi_year_timestamp_roundtrip() {
         }
     }
 }
+
+// ───── Failure-injection tests ─────
+//
+// These exercise the PB writer's recovery surface: partial header
+// from a previous-process crash, partial trailing sample from a
+// mid-flush kill, and the dirty-bit flush gate. They write directly
+// to the storage root using `std::fs` so they bypass the cache and
+// model the "another process / previous incarnation left this state"
+// scenario. The reading test cases use the public StoragePlugin
+// surface to confirm recovery is observable end-to-end.
+
+use std::io::Write;
+
+fn pv_path_for(plugin_root: &std::path::Path, pv: &str, ts: SystemTime) -> std::path::PathBuf {
+    use std::fs;
+    let plugin = PlainPbStoragePlugin::new(
+        "tmp",
+        plugin_root.to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+    let p = plugin.file_path_for(pv, ts);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    p
+}
+
+#[tokio::test]
+async fn injection_partial_header_recovers_on_next_write() {
+    let dir = temp_dir();
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 1, 15, 10, 30, 0).unwrap().into();
+    let path = pv_path_for(dir.path(), "TEST:Pv", ts);
+
+    // Simulate a previous-process crash: file exists with 5 bytes of
+    // garbage that does NOT parse as PayloadInfo. The writer should
+    // detect this on first write_cached call, truncate, and recreate.
+    std::fs::write(&path, b"\x01\x02\x03\x04\x05").unwrap();
+
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+    let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(42.0));
+    plugin
+        .append_event("TEST:Pv", ArchDbType::ScalarDouble, &sample)
+        .await
+        .expect("append must recover from corrupt header");
+
+    let start: SystemTime = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap().into();
+    let end: SystemTime = Utc.with_ymd_and_hms(2026, 1, 15, 11, 0, 0).unwrap().into();
+    let mut streams = plugin.get_data("TEST:Pv", start, end).await.unwrap();
+    assert_eq!(streams.len(), 1);
+    let read = streams[0].next_event().unwrap().unwrap();
+    match read.value {
+        ArchiverValue::ScalarDouble(v) => assert_eq!(v, 42.0),
+        other => panic!("expected ScalarDouble(42.0), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn injection_partial_trailing_record_gets_trimmed() {
+    let dir = temp_dir();
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 2, 20, 14, 5, 0).unwrap().into();
+
+    // First, create a valid file with one real sample via the plugin.
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+    let s1 = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(1.0));
+    plugin
+        .append_event("TEST:Trim", ArchDbType::ScalarDouble, &s1)
+        .await
+        .unwrap();
+    plugin.flush_writes().await.unwrap();
+
+    // Now manually append junk bytes WITHOUT a terminating newline,
+    // simulating a writer killed mid-flush. Drop the plugin so the
+    // BufWriter's open file handle releases the inode.
+    drop(plugin);
+    let path = pv_path_for(dir.path(), "TEST:Trim", ts);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(b"not-a-real-sample-bytes-no-newline").unwrap();
+    drop(file);
+
+    // Reopen the plugin and write another sample — the file_needs_header
+    // path runs trim_to_last_newline first, dropping the partial bytes.
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+    let ts2: SystemTime = Utc.with_ymd_and_hms(2026, 2, 20, 14, 5, 30).unwrap().into();
+    let s2 = ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(2.0));
+    plugin
+        .append_event("TEST:Trim", ArchDbType::ScalarDouble, &s2)
+        .await
+        .unwrap();
+
+    // Reading should give us back BOTH s1 and s2 cleanly. Without the
+    // tail trim, the partial bytes would derail the second-record
+    // parse.
+    let start: SystemTime = Utc.with_ymd_and_hms(2026, 2, 20, 14, 0, 0).unwrap().into();
+    let end: SystemTime = Utc.with_ymd_and_hms(2026, 2, 20, 15, 0, 0).unwrap().into();
+    let mut streams = plugin.get_data("TEST:Trim", start, end).await.unwrap();
+    let mut values = Vec::new();
+    while let Some(sample) = streams[0].next_event().unwrap() {
+        if let ArchiverValue::ScalarDouble(v) = sample.value {
+            values.push(v);
+        }
+    }
+    assert_eq!(values, vec![1.0, 2.0], "both samples must be readable after trim");
+}
+
+#[tokio::test]
+async fn injection_zero_byte_file_treated_as_missing() {
+    let dir = temp_dir();
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 3, 10, 8, 0, 0).unwrap().into();
+
+    // Empty file with no bytes — Java parity: same as missing.
+    let path = pv_path_for(dir.path(), "TEST:Empty", ts);
+    std::fs::File::create(&path).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+    let s = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(99.0));
+    plugin
+        .append_event("TEST:Empty", ArchDbType::ScalarDouble, &s)
+        .await
+        .unwrap();
+
+    let start: SystemTime = Utc.with_ymd_and_hms(2026, 3, 10, 7, 0, 0).unwrap().into();
+    let end: SystemTime = Utc.with_ymd_and_hms(2026, 3, 10, 9, 0, 0).unwrap().into();
+    let mut streams = plugin.get_data("TEST:Empty", start, end).await.unwrap();
+    let read = streams[0].next_event().unwrap().unwrap();
+    match read.value {
+        ArchiverValue::ScalarDouble(v) => assert_eq!(v, 99.0),
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn injection_flush_after_no_writes_is_noop() {
+    // Dirty-bit gate: flush_writes with an empty cache (no PV ever
+    // written) must succeed and do nothing. Regression guard for
+    // F12 — if the dirty skip ever had a bug that flushed clean
+    // writers, this would still pass; but it does verify the empty
+    // path doesn't error.
+    let dir = temp_dir();
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+    plugin.flush_writes().await.expect("empty flush is Ok");
+    plugin.flush_writes().await.expect("empty flush is repeatable");
+}

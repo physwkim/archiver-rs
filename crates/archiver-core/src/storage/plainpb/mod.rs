@@ -328,7 +328,23 @@ impl PlainPbStoragePlugin {
         let mut frame = Vec::with_capacity(escaped_sample.len() + 1);
         frame.extend_from_slice(&escaped_sample);
         frame.push(codec::NEWLINE);
-        cached.writer.write_all(&frame)?;
+        if let Err(e) = cached.writer.write_all(&frame) {
+            // After a partial write (ENOSPC, NFS hiccup, …) the
+            // BufWriter's internal state is suspect — reusing it
+            // would compound the corruption (tail garbage, repeated
+            // failures). Evict so the next call goes through the
+            // create+append+header path which validates the file
+            // and reopens fresh. Tail-trim runs in `file_needs_header`
+            // on that next open and removes any partial record.
+            tracing::warn!(
+                pv,
+                path = ?cached.path,
+                "Write failed; evicting cached writer to force \
+                 reopen on next sample: {e}"
+            );
+            cache.remove(pv);
+            return Err(e.into());
+        }
         cached.dirty = true;
         Ok(())
     }
@@ -799,6 +815,7 @@ impl StoragePlugin for PlainPbStoragePlugin {
         // HashMap level, so post-panic state stays internally consistent.
         let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut to_remove = Vec::new();
+        let mut errors: Vec<(String, String)> = Vec::new();
         for (pv, cached) in cache.iter_mut() {
             // Skip writers with nothing pending — every `get_data`
             // call lands here, and at scale (1000+ PVs) the avoided
@@ -816,12 +833,25 @@ impl StoragePlugin for PlainPbStoragePlugin {
                         "tier" => self.plugin_name.clone(),
                     )
                     .increment(1);
+                    errors.push((pv.clone(), e.to_string()));
                     to_remove.push(pv.clone());
                 }
             }
         }
         for pv in to_remove {
             cache.remove(&pv);
+        }
+        if !errors.is_empty() {
+            // Surface failures so callers (write_loop's periodic flush,
+            // get_data) can react — e.g. write_loop must NOT commit
+            // registry timestamps for samples that didn't actually
+            // make it to disk.
+            anyhow::bail!(
+                "{} writer flush(es) failed (first: pv={} err={})",
+                errors.len(),
+                errors[0].0,
+                errors[0].1,
+            );
         }
         Ok(())
     }
