@@ -138,3 +138,5 @@ futures = { workspace = true }
 prost = { workspace = true }
 urlencoding = { workspace = true }
 epics-rs = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }

@@ -90,6 +90,21 @@ pub struct EngineConfig {
     /// recompiling.
     #[serde(default = "default_server_ioc_drift_secs")]
     pub server_ioc_drift_secs: u64,
+    /// Number of parallel write-loop shards. `1` (the default)
+    /// keeps the legacy single-worker layout. Sites with many
+    /// active PVs and a fast STS can raise this to e.g. 4–16; the
+    /// engine spawns a dispatcher that hashes `pv_name` to a fixed
+    /// shard so per-PV ordering is preserved while different PVs
+    /// can append concurrently.
+    #[serde(default = "default_write_shards")]
+    pub write_shards: usize,
+    /// Per-shard mpsc capacity. Only consulted when `write_shards
+    /// > 1`. The dispatcher `send().await`s into each shard
+    /// channel, so a saturated shard back-pressures the upstream
+    /// main channel (which then makes producer `try_send` fail
+    /// with overflow drops).
+    #[serde(default = "default_per_shard_buffer")]
+    pub per_shard_buffer: usize,
 }
 
 fn default_write_period() -> u64 {
@@ -98,6 +113,14 @@ fn default_write_period() -> u64 {
 
 fn default_server_ioc_drift_secs() -> u64 {
     30 * 60
+}
+
+fn default_write_shards() -> usize {
+    1
+}
+
+fn default_per_shard_buffer() -> usize {
+    4096
 }
 
 /// Security configuration.

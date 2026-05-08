@@ -6,8 +6,17 @@ pub mod writer;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+
+/// Default cap on simultaneously-open `BufWriter` file handles across
+/// all PVs in one PlainPB tier. Sized to stay well clear of the
+/// typical Linux process fd ulimit (1024) so the storage plugin can
+/// run on an out-of-the-box host without `ulimit -n` tuning. Sites
+/// with raised ulimits and tens of thousands of active PVs should
+/// override via [`PlainPbStoragePlugin::with_max_open_writers`].
+pub const DEFAULT_MAX_OPEN_WRITERS: usize = 512;
 
 use async_trait::async_trait;
 use prost::Message;
@@ -19,6 +28,22 @@ use crate::types::{ArchDbType, ArchiverSample};
 
 use self::reader::PbFileReader;
 
+/// RAII handle that decrements the plugin's `open_writers` counter
+/// when the owning [`CachedWriter`] is dropped. Tying the decrement
+/// to Drop guarantees the count stays in sync with reality even if
+/// a future code path takes the writer without going through
+/// `flush_dirty_writers` / `evict_lru_writer` — every drop site
+/// already exercises this guard.
+struct WriterFdGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for WriterFdGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Cached file handle for writing the current partition of a PV.
 struct CachedWriter {
     path: PathBuf,
@@ -29,11 +54,54 @@ struct CachedWriter {
     /// across every cached writer (Java parity is similar — the
     /// `dirty` bit short-circuits the iteration).
     dirty: bool,
-    /// Last access timestamp — the LRU key used by the EMFILE /
-    /// ENFILE recovery path: when `open` returns "too many open
-    /// files", the writer with the smallest `last_used` is evicted
-    /// to free a descriptor and the open is retried.
+    /// Last access timestamp — the LRU key used by the always-on
+    /// fd-cap eviction path: when [`PlainPbStoragePlugin::open_writers`]
+    /// reaches `max_open_writers`, the writer with the smallest
+    /// `last_used` is evicted to make room for the next open.
     last_used: SystemTime,
+    /// Decrements `open_writers` on drop. Field name starts with
+    /// `_` because it's never read directly — it exists purely for
+    /// its Drop side-effect.
+    _fd_guard: WriterFdGuard,
+}
+
+/// Per-PV serialization slot. Holds the cached writer (if any) and
+/// a tombstone bit so a concurrent `append` doesn't resurrect a PV
+/// whose `delete_pv_data`/`rename_pv` is already in flight.
+///
+/// Each slot is wrapped in its own `Mutex` so I/O for one PV cannot
+/// stall I/O for any other. The outer `write_cache` map is locked
+/// only while inserting/looking up/removing slots — never while
+/// holding a filesystem syscall.
+struct PvWriterSlot {
+    writer: Option<CachedWriter>,
+    /// Set under the slot lock by `delete_pv_data` / `rename_pv`.
+    /// Once true, every subsequent `append` for this PV bails with
+    /// an error so the deleted PV doesn't reappear from a racing
+    /// late writer. The slot stays in `write_cache` only until the
+    /// caller that set the flag clears the entry from the map; new
+    /// `append`s that look up the PV after the cache eviction get a
+    /// fresh slot.
+    dead: bool,
+}
+
+/// Aggregated outcome of one `flush_dirty_writers` pass — used to
+/// give the read-side and the write-side flush surfaces different
+/// semantics over the same underlying iteration.
+struct FlushOutcome {
+    /// PVs whose `flush()` syscall errored. Their cached writers
+    /// have been evicted (buffered bytes discarded via `into_parts`)
+    /// and their entries removed from the map. Surfaced to the
+    /// write_loop so it drops their `last_event` from the registry
+    /// commit batch.
+    failed: Vec<String>,
+    /// PVs whose slot was already locked (an `append` or another
+    /// flush is in flight). Their dirty bytes remain buffered and
+    /// will be picked up on the next flush cycle. Surfaced to the
+    /// write_loop alongside `failed` so the registry doesn't claim
+    /// `last_event` for samples whose bytes are still in BufWriter
+    /// memory — under-commit, never over-commit.
+    deferred: Vec<String>,
 }
 
 /// Wraps a `PbFileReader` and clamps emitted samples to `[start, end]`.
@@ -98,23 +166,69 @@ pub struct PlainPbStoragePlugin {
     plugin_name: String,
     root_folder: PathBuf,
     granularity: PartitionGranularity,
-    /// One `BufWriter` per PV, pointing at that PV's current partition file.
-    /// When the partition rolls over (hour/day/year boundary), the old writer
-    /// is flushed and dropped so we never accumulate stale file handles.
-    write_cache: Mutex<HashMap<String, CachedWriter>>,
+    /// One per-PV slot, each holding (at most) one `BufWriter` pointed
+    /// at that PV's current partition file. The outer `Mutex<HashMap>`
+    /// is held only briefly to look up / insert / remove a slot; all
+    /// I/O happens under the per-slot mutex so a stuck syscall on one
+    /// PV does NOT block any other PV's appends or flushes.
+    write_cache: Mutex<HashMap<String, Arc<Mutex<PvWriterSlot>>>>,
     /// Directories known to exist. Avoids redundant create_dir_all syscalls.
     known_dirs: Mutex<HashSet<PathBuf>>,
+    /// Always-on cap on simultaneously-open `BufWriter` file
+    /// handles across every PV. When `open_writers` reaches this
+    /// cap, `write_cached` proactively evicts the LRU non-busy
+    /// writer before opening a new one, so a site with 50k active
+    /// PVs doesn't blow past the process fd ulimit. `usize::MAX`
+    /// disables the cap entirely.
+    max_open_writers: usize,
+    /// Live count of [`CachedWriter`]s held in any slot. Maintained
+    /// by [`WriterFdGuard`]: incremented on every fresh
+    /// `CachedWriter` construction, decremented on drop. Compared
+    /// against `max_open_writers` in `write_cached` to drive the
+    /// always-on LRU eviction.
+    open_writers: Arc<AtomicUsize>,
 }
 
 impl PlainPbStoragePlugin {
     pub fn new(name: &str, root_folder: PathBuf, granularity: PartitionGranularity) -> Self {
+        Self::with_max_open_writers(name, root_folder, granularity, DEFAULT_MAX_OPEN_WRITERS)
+    }
+
+    /// Construct with an explicit cap on simultaneously-open writers.
+    /// Pass `0` (or `usize::MAX`) to disable the cap; otherwise the
+    /// LRU eviction kicks in once `open_writers` reaches the cap.
+    /// Sites that have raised `ulimit -n` for tens of thousands of
+    /// active PVs should pass that fd budget here so the writer
+    /// cache doesn't thrash on EMFILE.
+    pub fn with_max_open_writers(
+        name: &str,
+        root_folder: PathBuf,
+        granularity: PartitionGranularity,
+        max_open_writers: usize,
+    ) -> Self {
+        let cap = if max_open_writers == 0 {
+            usize::MAX
+        } else {
+            max_open_writers
+        };
         Self {
             plugin_name: name.to_string(),
             root_folder,
             granularity,
             write_cache: Mutex::new(HashMap::new()),
             known_dirs: Mutex::new(HashSet::new()),
+            max_open_writers: cap,
+            open_writers: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Snapshot of the current open-writer count. Exposed for
+    /// observability in tests and for sites that want to surface a
+    /// metric — production callers should NOT branch on this value
+    /// (it's instantaneous and lock-free, so it can drift between
+    /// the read and any subsequent action).
+    pub fn open_writer_count(&self) -> usize {
+        self.open_writers.load(Ordering::Relaxed)
     }
 
     /// Build the file path for a PV at a given timestamp.
@@ -146,16 +260,47 @@ impl PlainPbStoragePlugin {
         &self.root_folder
     }
 
-    /// Flush every dirty cached writer. Returns the list of PV
-    /// names whose flush failed (and whose entries were evicted as
-    /// a result, with their buffered bytes discarded via
-    /// `into_parts` so a re-flush from `BufWriter::drop` can't
-    /// silently re-issue the same failing syscall).
-    fn flush_dirty_writers(&self) -> Vec<String> {
-        let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
-        let mut to_remove = Vec::new();
+    /// Flush every dirty cached writer that we can lock without
+    /// blocking. Per-slot `try_lock` keeps a stuck PV (e.g. an NFS
+    /// hang in an in-flight `append`) from blocking the flush of
+    /// every other PV — that one PV is reported in `deferred` and
+    /// retried on the next flush cycle.
+    ///
+    /// Errored flushes evict the cached writer (buffered bytes are
+    /// dropped via `into_parts` so `BufWriter::drop` cannot re-issue
+    /// the failing syscall) and are reported in `failed`.
+    fn flush_dirty_writers(&self) -> FlushOutcome {
+        // Snapshot slot Arcs under a brief outer lock so we never
+        // hold the outer cache mutex while attempting an inner-slot
+        // lock — that would deadlock with an `append` that holds
+        // its slot lock and is waiting on the outer lock to record
+        // a partition rollover.
+        let snapshot: Vec<(String, Arc<Mutex<PvWriterSlot>>)> = {
+            let cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+
         let mut failed = Vec::new();
-        for (pv, cached) in cache.iter_mut() {
+        let mut deferred = Vec::new();
+        let mut to_remove = Vec::new();
+
+        for (pv, slot_arc) in snapshot {
+            let mut slot_guard = match slot_arc.try_lock() {
+                Ok(g) => g,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // Someone is mid-append (or another flush). Their
+                    // bytes (if any) stay buffered; we'll retry next
+                    // cycle. Caller must drop this PV from any pending
+                    // ts_updates commit so the registry doesn't claim
+                    // bytes that haven't reached disk yet.
+                    deferred.push(pv);
+                    continue;
+                }
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            };
+            let Some(cached) = slot_guard.writer.as_mut() else {
+                continue;
+            };
             // Skip writers with nothing pending — every `get_data`
             // call lands here, and at scale (1000+ PVs) the avoided
             // syscall storm matters: only PVs that actually buffered
@@ -172,21 +317,27 @@ impl PlainPbStoragePlugin {
                         "tier" => self.plugin_name.clone(),
                     )
                     .increment(1);
+                    // `into_parts` drops buffered bytes WITHOUT letting
+                    // BufWriter::drop attempt a final flush — that flush
+                    // would re-issue the failing syscall, and the buffer
+                    // is already suspect (the reason we got here).
+                    if let Some(removed) = slot_guard.writer.take() {
+                        let (_file, _buffered) = removed.writer.into_parts();
+                    }
                     failed.push(pv.clone());
-                    to_remove.push(pv.clone());
+                    to_remove.push(pv);
                 }
             }
         }
-        for pv in to_remove {
-            if let Some(removed) = cache.remove(&pv) {
-                // `into_parts` drops buffered bytes WITHOUT letting
-                // BufWriter::drop attempt a final flush — that flush
-                // would re-issue the failing syscall, and the buffer
-                // is already suspect (the reason we got here).
-                let (_file, _buffered) = removed.writer.into_parts();
+
+        if !to_remove.is_empty() {
+            let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+            for pv in &to_remove {
+                cache.remove(pv);
             }
         }
-        failed
+
+        FlushOutcome { failed, deferred }
     }
 
     /// Drop any cached BufWriter whose target path matches `path`.
@@ -200,20 +351,35 @@ impl PlainPbStoragePlugin {
         // contract is "after this returns, no future write goes
         // through the cached writer for `path`", and a poisoned
         // mutex shouldn't be a way to break that invariant.
-        let mut cache = self.write_cache.lock().unwrap_or_else(|e| {
-            tracing::warn!(?path, "write cache poisoned at evict_writer_for_path: {e}");
-            e.into_inner()
-        });
-        let to_remove: Vec<String> = cache
-            .iter()
-            .filter(|(_, c)| c.path == path)
-            .map(|(pv, _)| pv.clone())
-            .collect();
-        let removed = !to_remove.is_empty();
-        for pv in to_remove {
-            if let Some(mut cached) = cache.remove(&pv) {
+        let candidates: Vec<(String, Arc<Mutex<PvWriterSlot>>)> = {
+            let cache = self.write_cache.lock().unwrap_or_else(|e| {
+                tracing::warn!(?path, "write cache poisoned at evict_writer_for_path: {e}");
+                e.into_inner()
+            });
+            cache
+                .iter()
+                .filter(|(_, slot)| {
+                    slot.try_lock()
+                        .ok()
+                        .and_then(|g| g.writer.as_ref().map(|cw| cw.path == path))
+                        .unwrap_or(false)
+                })
+                .map(|(pv, slot)| (pv.clone(), slot.clone()))
+                .collect()
+        };
+        let mut removed = false;
+        for (pv, slot_arc) in candidates {
+            let mut slot_guard = slot_arc.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(mut cached) = slot_guard.writer.take() {
                 let _ = cached.writer.flush();
+                removed = true;
             }
+            // Drop the slot from the outer map so a later append
+            // creates a fresh slot and doesn't observe a stale
+            // (now-empty) writer entry.
+            drop(slot_guard);
+            let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.remove(&pv);
         }
         removed
     }
@@ -244,6 +410,23 @@ impl PlainPbStoragePlugin {
         Ok(())
     }
 
+    /// Look up the slot Arc for `pv`, creating an empty one under a
+    /// brief outer-cache lock if absent. The returned Arc lets the
+    /// caller serialise on the per-PV mutex without holding the
+    /// outer cache lock during file I/O.
+    fn slot_for(&self, pv: &str) -> Arc<Mutex<PvWriterSlot>> {
+        let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry(pv.to_string())
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(PvWriterSlot {
+                    writer: None,
+                    dead: false,
+                }))
+            })
+            .clone()
+    }
+
     /// Write a sample using the cached BufWriter, creating the file + header if needed.
     fn write_cached(
         &self,
@@ -256,16 +439,28 @@ impl PlainPbStoragePlugin {
         let sample_bytes = writer::encode_sample(dbr_type, sample)?;
         let escaped_sample = codec::escape(&sample_bytes);
 
-        // Recover from poison: cache mutations are atomic at the
-        // HashMap level, so post-panic state stays internally consistent.
-        let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
-
         let path_buf = path.to_path_buf();
+        let slot_arc = self.slot_for(pv);
+        // Recover from poison: per-PV slot mutations are confined to
+        // this method and `flush_dirty_writers` / `delete_pv_data` /
+        // `rename_pv`, all of which leave internally-consistent state
+        // on early return. Better to proceed than fail every future
+        // append for a PV whose writer once panicked.
+        let mut slot = slot_arc.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Tombstone check: a concurrent `delete_pv_data` /
+        // `rename_pv` may have grabbed this Arc and set `dead`.
+        // Bail rather than recreate the file we just deleted.
+        if slot.dead {
+            anyhow::bail!(
+                "PV `{pv}` was deleted/renamed concurrently; refusing to recreate file"
+            );
+        }
 
         // If the cached writer points at a different path, the partition has
         // rolled over — flush and drop the old writer before opening the new
         // one so we don't leak file handles.
-        if let Some(existing) = cache.get_mut(pv)
+        if let Some(existing) = slot.writer.as_mut()
             && existing.path != path_buf
         {
             if let Err(e) = existing.writer.flush() {
@@ -275,7 +470,7 @@ impl PlainPbStoragePlugin {
                     "Failed to flush writer on partition rollover: {e}"
                 );
             }
-            cache.remove(pv);
+            slot.writer = None;
         }
 
         // Defense-in-depth for ghost-file writes: if the cached writer's
@@ -283,7 +478,7 @@ impl PlainPbStoragePlugin {
         // missed the eviction, by manual `rm`, by a flaky NFS mount, …)
         // its bytes are going into an orphaned inode invisible to readers.
         // Drop the writer so the next branch reopens a fresh file.
-        if let Some(existing) = cache.get(pv)
+        if let Some(existing) = slot.writer.as_ref()
             && !existing.path.exists()
         {
             tracing::warn!(
@@ -291,25 +486,46 @@ impl PlainPbStoragePlugin {
                 path = ?existing.path,
                 "Cached writer's file disappeared from filesystem; reopening"
             );
-            if let Some(mut cached) = cache.remove(pv) {
+            if let Some(mut cached) = slot.writer.take() {
                 let _ = cached.writer.flush();
             }
         }
 
-        if !cache.contains_key(pv) {
+        if slot.writer.is_none() {
             let needs_header = file_needs_header(path);
+
+            // Always-on fd cap: if we're already at the configured
+            // ceiling, evict the LRU non-busy writer BEFORE asking
+            // the kernel for another fd. Without this proactive
+            // step, every active-PV count above the cap would either
+            // (a) blow past the OS ulimit if the cap is below
+            // ulimit, or (b) silently grow without bound. Loop so
+            // bursty appends across many PVs converge to the cap
+            // even when several callers race to evict.
+            while self.open_writers.load(Ordering::Relaxed) >= self.max_open_writers {
+                if !self.evict_lru_writer(pv) {
+                    // No evictable candidate — every other slot is
+                    // busy. Fall through and let the open syscall
+                    // either succeed (we're below ulimit anyway) or
+                    // fail with EMFILE for the recovery branch below.
+                    break;
+                }
+            }
+
             // Open with EMFILE/ENFILE recovery: if the OS file-handle
-            // table is exhausted, evict our LRU cached writer to free
-            // a descriptor and retry once. Without this, every
-            // subsequent write fails until a writer is naturally
-            // evicted (e.g. by partition rollover hours later).
+            // table is exhausted (cap was set above ulimit, or other
+            // processes consumed fds), evict our LRU cached writer
+            // to free a descriptor and retry once. Without this,
+            // every subsequent write fails until a writer is
+            // naturally evicted (e.g. by partition rollover hours
+            // later).
             let file = match std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
             {
                 Ok(f) => f,
-                Err(e) if is_too_many_open_files(&e) && evict_lru_writer(&mut cache) => {
+                Err(e) if is_too_many_open_files(&e) && self.evict_lru_writer(pv) => {
                     tracing::warn!(
                         ?path,
                         "Hit OS file-handle limit; evicted LRU writer and \
@@ -345,23 +561,29 @@ impl PlainPbStoragePlugin {
                 bw.write_all(&header_frame)?;
             }
 
-            cache.insert(
-                pv.to_string(),
-                CachedWriter {
-                    path: path_buf,
-                    writer: bw,
-                    // Header bytes (if any) are buffered but not yet
-                    // flushed. Mark dirty so the periodic flush picks
-                    // them up — without this, a PV that gets created
-                    // and then receives no further samples within a
-                    // flush_period would never persist its header.
-                    dirty: true,
-                    last_used: SystemTime::now(),
+            // Increment BEFORE constructing the CachedWriter so
+            // the WriterFdGuard on the new writer balances against
+            // this fetch_add via its Drop impl. Doing it here (not
+            // inside a `CachedWriter::new`) keeps the count tied to
+            // the single construction path.
+            self.open_writers.fetch_add(1, Ordering::Relaxed);
+            slot.writer = Some(CachedWriter {
+                path: path_buf,
+                writer: bw,
+                // Header bytes (if any) are buffered but not yet
+                // flushed. Mark dirty so the periodic flush picks
+                // them up — without this, a PV that gets created
+                // and then receives no further samples within a
+                // flush_period would never persist its header.
+                dirty: true,
+                last_used: SystemTime::now(),
+                _fd_guard: WriterFdGuard {
+                    counter: self.open_writers.clone(),
                 },
-            );
+            });
         }
 
-        let cached = cache.get_mut(pv).expect("just inserted");
+        let cached = slot.writer.as_mut().expect("just inserted");
         cached.last_used = SystemTime::now();
         // Atomic-at-buffer-layer sample frame: a single `write_all`
         // means the BufWriter never splits the sample/newline pair
@@ -391,14 +613,83 @@ impl PlainPbStoragePlugin {
                 "Write failed; evicting cached writer to force \
                  reopen on next sample: {e}"
             );
-            if let Some(removed) = cache.remove(pv) {
+            if let Some(removed) = slot.writer.take() {
                 let (_file, _buffered) = removed.writer.into_parts();
                 // _file dropped → fd closed without flush.
             }
+            // Drop the slot from the outer map so the next append
+            // gets a clean lookup (no stale empty slot lingering).
+            drop(slot);
+            let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.remove(pv);
             return Err(e.into());
         }
         cached.dirty = true;
         Ok(())
+    }
+
+    /// Find the slot with the oldest `last_used` (excluding
+    /// `current_pv`, which holds its own slot lock at the call site)
+    /// and evict its writer. Slots whose mutex is currently held by
+    /// another thread are skipped — `try_lock` returning `WouldBlock`
+    /// means an in-flight append is already using that fd, so taking
+    /// it would not free anything anyway.
+    ///
+    /// Returns `true` when something was evicted (caller should
+    /// retry the failed open), `false` when no candidate could be
+    /// freed (caller should fail through with the original ENFILE).
+    fn evict_lru_writer(&self, current_pv: &str) -> bool {
+        // Snapshot Arcs under the outer lock, then probe each with
+        // try_lock so a stuck slot doesn't make EMFILE recovery
+        // itself hang.
+        let candidates: Vec<(String, Arc<Mutex<PvWriterSlot>>)> = {
+            let cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .iter()
+                .filter(|(pv, _)| pv.as_str() != current_pv)
+                .map(|(pv, slot)| (pv.clone(), slot.clone()))
+                .collect()
+        };
+
+        let mut oldest: Option<(String, Arc<Mutex<PvWriterSlot>>, SystemTime)> = None;
+        for (pv, slot_arc) in candidates {
+            let Ok(guard) = slot_arc.try_lock() else {
+                continue;
+            };
+            let Some(cw) = guard.writer.as_ref() else {
+                drop(guard);
+                continue;
+            };
+            let last_used = cw.last_used;
+            drop(guard);
+            match &oldest {
+                Some((_, _, ts)) if *ts <= last_used => {}
+                _ => oldest = Some((pv, slot_arc, last_used)),
+            }
+        }
+
+        let Some((pv, slot_arc, _)) = oldest else {
+            return false;
+        };
+        let Ok(mut guard) = slot_arc.try_lock() else {
+            // Lost the race — another thread grabbed the slot
+            // between our scan and the eviction.
+            return false;
+        };
+        let Some(mut cached) = guard.writer.take() else {
+            return false;
+        };
+        let _ = cached.writer.flush();
+        tracing::debug!(
+            pv,
+            path = ?cached.path,
+            "LRU evicted to recover file descriptor"
+        );
+        drop(guard);
+        // Remove the now-empty slot from the outer map.
+        let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.remove(&pv);
+        true
     }
 }
 
@@ -411,30 +702,6 @@ fn is_too_many_open_files(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(23) | Some(24))
 }
 
-/// Evict the cached writer with the oldest `last_used` to free a
-/// file descriptor. Returns `true` when something was evicted (caller
-/// should retry the failed open), `false` when the cache was empty
-/// (nothing to evict, fail through).
-fn evict_lru_writer(cache: &mut HashMap<String, CachedWriter>) -> bool {
-    let oldest_pv = cache
-        .iter()
-        .min_by_key(|(_, c)| c.last_used)
-        .map(|(pv, _)| pv.clone());
-    match oldest_pv {
-        Some(pv) => {
-            if let Some(mut cached) = cache.remove(&pv) {
-                let _ = cached.writer.flush();
-                tracing::debug!(
-                    pv,
-                    path = ?cached.path,
-                    "LRU evicted to recover file descriptor"
-                );
-            }
-            true
-        }
-        None => false,
-    }
-}
 
 /// Decide whether a file at `path` needs a fresh PayloadInfo header
 /// written before sample data is appended. Returns `true` when:
@@ -831,12 +1098,21 @@ impl StoragePlugin for PlainPbStoragePlugin {
 
     async fn delete_pv_data(&self, pv: &str) -> anyhow::Result<u64> {
         // Evict the cached writer for this PV before deleting files.
-        {
+        // Tombstone the slot under its own lock so a concurrent
+        // `append` (holding the same Arc but blocked on the slot
+        // lock) bails when it wakes up — without the tombstone, it
+        // would happily recreate the file we're about to delete.
+        let slot_arc = {
             let mut cache = self
                 .write_cache
                 .lock()
                 .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
-            if let Some(mut cached) = cache.remove(pv) {
+            cache.remove(pv)
+        };
+        if let Some(arc) = slot_arc {
+            let mut slot = arc.lock().unwrap_or_else(|e| e.into_inner());
+            slot.dead = true;
+            if let Some(mut cached) = slot.writer.take() {
                 let _ = cached.writer.flush();
             }
         }
@@ -863,23 +1139,35 @@ impl StoragePlugin for PlainPbStoragePlugin {
     }
 
     async fn flush_writes(&self) -> anyhow::Result<()> {
-        let failed = self.flush_dirty_writers();
-        if !failed.is_empty() {
-            // Read-side callers (`get_data` etc.) just want to know
-            // "is the storage still healthy?". Write-side callers
-            // (write_loop) use `flush_ingest_writes` to get the
-            // per-PV failure list directly.
+        // Read-side callers (`get_data` etc.) only care about real
+        // I/O errors. Deferred writers (an `append` is in flight)
+        // are not failures — those bytes will reach disk on the
+        // next cycle, and the reader can still see everything
+        // already flushed. Surfacing deferred as Err would make
+        // every concurrent read+write race look like storage death.
+        let outcome = self.flush_dirty_writers();
+        if !outcome.failed.is_empty() {
             anyhow::bail!(
                 "{} writer flush(es) failed (first pv={})",
-                failed.len(),
-                failed[0],
+                outcome.failed.len(),
+                outcome.failed[0],
             );
         }
         Ok(())
     }
 
     async fn flush_ingest_writes(&self) -> anyhow::Result<Vec<String>> {
-        Ok(self.flush_dirty_writers())
+        // Write_loop wants both:
+        //   - failed: bytes lost — drop ts_updates for these
+        //   - deferred: bytes still buffered — drop ts_updates so
+        //     the registry doesn't claim more than what's on disk;
+        //     they'll be picked up next flush cycle.
+        // Both classes must NOT advance the registry's `last_event`,
+        // so the union goes back to the caller as one list.
+        let outcome = self.flush_dirty_writers();
+        let mut all = outcome.failed;
+        all.extend(outcome.deferred);
+        Ok(all)
     }
 
     fn stores_for_pv(&self, pv: &str) -> anyhow::Result<Vec<StoreSummary>> {
@@ -916,17 +1204,28 @@ impl StoragePlugin for PlainPbStoragePlugin {
 
     async fn rename_pv(&self, from: &str, to: &str) -> anyhow::Result<u64> {
         // Evict any cached writers for the source PV so they don't keep an
-        // open handle on a soon-to-be-renamed file.
-        {
+        // open handle on a soon-to-be-renamed file. Tombstone source so a
+        // racing append cannot resurrect it after we've moved its files.
+        let from_slot = {
             let mut cache = self
                 .write_cache
                 .lock()
                 .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
-            if let Some(mut cached) = cache.remove(from) {
-                let _ = cached.writer.flush();
-            }
             // Also evict the destination cache entry if any (defensive).
-            if let Some(mut cached) = cache.remove(to) {
+            // Destination is NOT tombstoned — `to` is the live PV after
+            // this returns, and future appends to it are legal.
+            if let Some(arc) = cache.remove(to) {
+                let mut slot = arc.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(mut cached) = slot.writer.take() {
+                    let _ = cached.writer.flush();
+                }
+            }
+            cache.remove(from)
+        };
+        if let Some(arc) = from_slot {
+            let mut slot = arc.lock().unwrap_or_else(|e| e.into_inner());
+            slot.dead = true;
+            if let Some(mut cached) = slot.writer.take() {
                 let _ = cached.writer.flush();
             }
         }

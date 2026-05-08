@@ -2554,14 +2554,335 @@ fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
     }
 }
 
+/// Tunables for [`write_loop_with_config`]. Production uses the
+/// defaults via [`write_loop`]; tests dial the timeouts down to
+/// sub-second values so failure-injection cases finish in a few
+/// hundred milliseconds instead of minutes.
+#[derive(Debug, Clone)]
+pub struct WriteLoopConfig {
+    /// How often to call `flush_ingest_writes` and commit the
+    /// pending `last_event` timestamps to the registry.
+    pub flush_period: Duration,
+    /// Bound on how long write_loop waits for a single
+    /// `append_event_with_meta` JoinHandle. On timeout the sample
+    /// is logged as abandoned-but-may-succeed-late and the loop
+    /// moves on (the spawn_blocking task remains parked on the
+    /// blocking pool — per-PV serialization in PlainPB keeps any
+    /// late completion ordered behind subsequent same-PV samples).
+    pub append_timeout: Duration,
+    /// Bound on how long write_loop waits for one
+    /// `flush_ingest_writes` JoinHandle during the periodic flush.
+    /// On timeout, every pending `ts_updates` entry is deferred to
+    /// the next cycle (we don't know which PVs reached disk).
+    pub flush_timeout: Duration,
+    /// Bound on each individual append issued during the shutdown
+    /// drain.
+    pub drain_per_sample_timeout: Duration,
+    /// Total wall-clock budget for the shutdown drain. Once
+    /// exceeded, remaining buffered samples are abandoned without
+    /// even attempting an append, so a wedged STS can't stretch an
+    /// orderly stop into "kill -9".
+    pub drain_total_budget: Duration,
+    /// Bound on the final `flush_writes` issued at shutdown.
+    pub shutdown_flush_timeout: Duration,
+}
+
+impl Default for WriteLoopConfig {
+    fn default() -> Self {
+        Self {
+            flush_period: Duration::from_secs(10),
+            append_timeout: Duration::from_secs(30),
+            flush_timeout: Duration::from_secs(30),
+            drain_per_sample_timeout: Duration::from_secs(5),
+            drain_total_budget: Duration::from_secs(30),
+            shutdown_flush_timeout: Duration::from_secs(15),
+        }
+    }
+}
+
+/// Tunables for [`run_sharded_write_pool`].
+///
+/// `shards = 1` is the legacy single-worker layout and incurs no
+/// dispatcher overhead. `shards > 1` spawns a dispatcher that hashes
+/// each sample's `pv_name` to a fixed shard (so any one PV's samples
+/// always land in the same per-shard write_loop, preserving
+/// timestamp ordering) and N parallel shard workers — different PVs
+/// can append concurrently instead of queueing behind a single task.
+/// Sites with many active PVs and a fast STS should set this to
+/// `min(num_cpus, expected concurrent slow appends)`.
+#[derive(Debug, Clone)]
+pub struct ShardedWritePoolConfig {
+    /// Number of parallel shard workers. Must be ≥ 1; `1` is the
+    /// degenerate case (no dispatcher, behaves identically to a
+    /// bare `write_loop_with_config`).
+    pub shards: usize,
+    /// mpsc capacity of each shard's input channel. The dispatcher
+    /// `send().await`s into this — full shards back-pressure the
+    /// dispatcher, which back-pressures the upstream main mpsc,
+    /// which makes producer `try_send` fail with overflow drops.
+    pub per_shard_buffer: usize,
+    /// Per-worker config (timeouts, flush period). Cloned into
+    /// each shard.
+    pub write_loop: WriteLoopConfig,
+}
+
+impl Default for ShardedWritePoolConfig {
+    fn default() -> Self {
+        Self {
+            shards: 1,
+            per_shard_buffer: 4096,
+            write_loop: WriteLoopConfig::default(),
+        }
+    }
+}
+
+/// Hash a PV name to a shard index in `0..n`. `DefaultHasher` is
+/// stable enough for in-process partitioning — we don't care about
+/// hash quality across process restarts (the file layout is keyed
+/// by PV name on disk, not by shard).
+fn shard_for_pv(pv: &str, n: usize) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    debug_assert!(n > 0);
+    let mut h = DefaultHasher::new();
+    pv.hash(&mut h);
+    (h.finish() % n as u64) as usize
+}
+
+/// Run an N-shard write pool: 1 dispatcher (hashes pv_name → shard)
+/// + N parallel `write_loop_with_config` workers. Each shard has
+/// independent `ts_updates`, an independent flush ticker, and its
+/// own per-PV writer slots inside the shared storage plugin (so
+/// per-PV ordering is naturally preserved by the consistent-hash
+/// routing — samples for one PV always go to the same shard).
+///
+/// `shards == 1` short-circuits the dispatcher and runs a single
+/// `write_loop_with_config` directly so single-worker deployments
+/// pay zero overhead.
+pub async fn run_sharded_write_pool(
+    storage: Arc<dyn StoragePlugin>,
+    registry: Arc<PvRegistry>,
+    rx: mpsc::Receiver<PvSample>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    cfg: ShardedWritePoolConfig,
+) {
+    let n = cfg.shards.max(1);
+    if n == 1 {
+        write_loop_with_config(storage, registry, rx, shutdown, cfg.write_loop).await;
+        return;
+    }
+
+    let mut shard_txs = Vec::with_capacity(n);
+    let mut shard_handles = Vec::with_capacity(n);
+    for shard_idx in 0..n {
+        let (s_tx, s_rx) = mpsc::channel::<PvSample>(cfg.per_shard_buffer);
+        shard_txs.push(s_tx);
+        let storage = storage.clone();
+        let registry = registry.clone();
+        let shard_shutdown = shutdown.clone();
+        let shard_cfg = cfg.write_loop.clone();
+        shard_handles.push(tokio::spawn(async move {
+            tracing::info!(shard = shard_idx, "Shard write loop started");
+            write_loop_with_config(storage, registry, s_rx, shard_shutdown, shard_cfg)
+                .await;
+            tracing::info!(shard = shard_idx, "Shard write loop exited");
+        }));
+    }
+
+    dispatch_loop(rx, shard_txs, shutdown).await;
+
+    // Dispatcher exited → the shard senders it owned were dropped
+    // → shard receivers see EOS on their next poll. The shard
+    // workers should already have observed the same shutdown
+    // signal via their cloned watch::Receiver and be running their
+    // drain branches. Wait for them to finish.
+    for h in shard_handles {
+        let _ = h.await;
+    }
+}
+
+/// Reads the upstream main mpsc, hashes each sample's `pv_name`,
+/// and forwards to the appropriate shard channel via
+/// `Sender::send().await` so a slow shard back-pressures the
+/// upstream channel rather than silently dropping samples.
+async fn dispatch_loop(
+    mut rx: mpsc::Receiver<PvSample>,
+    shard_txs: Vec<mpsc::Sender<PvSample>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let n = shard_txs.len();
+    info!(shards = n, "Sharded write dispatcher started");
+    loop {
+        tokio::select! {
+            biased;
+            // `biased` so we always check shutdown before draining
+            // another sample — keeps the shutdown latency bounded
+            // even under a sustained sample storm.
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    // Drain whatever's still in the upstream mpsc
+                    // and route it to shards (try_send so a
+                    // saturated shard doesn't extend our drain
+                    // window past its own per-shard timeout).
+                    while let Ok(sample) = rx.try_recv() {
+                        let idx = shard_for_pv(&sample.pv_name, n);
+                        let _ = shard_txs[idx].try_send(sample);
+                    }
+                    break;
+                }
+            }
+            maybe = rx.recv() => {
+                match maybe {
+                    Some(sample) => {
+                        let idx = shard_for_pv(&sample.pv_name, n);
+                        if let Err(e) = shard_txs[idx].send(sample).await {
+                            // Shard's receiver dropped → the shard
+                            // worker exited (panic or shutdown
+                            // race). We'll lose this sample, but
+                            // we should keep the dispatcher alive
+                            // for the OTHER shards. Log and
+                            // continue — `e.0` would expose the
+                            // sample we dropped.
+                            warn!(
+                                shard = idx,
+                                pv = e.0.pv_name,
+                                "Shard channel closed; sample dropped"
+                            );
+                        }
+                    }
+                    None => break, // Upstream closed.
+                }
+            }
+        }
+    }
+    info!("Sharded write dispatcher exiting");
+}
+
 /// Background writer task — drains samples and writes to storage.
+///
+/// Thin wrapper that fills [`WriteLoopConfig`] from [`Default`] and
+/// the caller-supplied `flush_period`. Production callers use this
+/// form; the test suite uses [`write_loop_with_config`] directly to
+/// dial timeouts down.
 pub async fn write_loop(
+    storage: Arc<dyn StoragePlugin>,
+    registry: Arc<PvRegistry>,
+    rx: mpsc::Receiver<PvSample>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    flush_period: Duration,
+) {
+    let cfg = WriteLoopConfig {
+        flush_period,
+        ..Default::default()
+    };
+    write_loop_with_config(storage, registry, rx, shutdown, cfg).await
+}
+
+/// Run one flush + commit cycle: spawn the storage's
+/// `flush_ingest_writes` on the blocking pool with a bounded
+/// timeout, then commit the pending registry timestamps for every
+/// PV the flush did NOT report as failed/deferred.
+///
+/// Mutates `ts_updates`:
+///   * On clean flush: drops failed/deferred PVs and (on successful
+///     batch update) clears the rest.
+///   * On flush error / panic / timeout: leaves every entry intact
+///     so the next cycle retries.
+async fn run_flush_and_commit(
+    storage: &Arc<dyn StoragePlugin>,
+    registry: &Arc<PvRegistry>,
+    ts_updates: &mut std::collections::HashMap<String, SystemTime>,
+    flush_timeout: Duration,
+) {
+    let storage_for_flush = storage.clone();
+    let flush_join = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(storage_for_flush.flush_ingest_writes())
+    });
+    match tokio::time::timeout(flush_timeout, flush_join).await {
+        Ok(Ok(Ok(failed_pvs))) => {
+            for pv in &failed_pvs {
+                ts_updates.remove(pv);
+            }
+            if !failed_pvs.is_empty() {
+                error!(
+                    "STS flush dropped {} PV(s) from timestamp commit \
+                     (their bytes never reached disk OR an in-flight \
+                     append is still running): {:?}",
+                    failed_pvs.len(),
+                    failed_pvs
+                );
+            }
+            if !ts_updates.is_empty() {
+                let refs: Vec<(&str, SystemTime)> = ts_updates
+                    .iter()
+                    .map(|(name, ts)| (name.as_str(), *ts))
+                    .collect();
+                match registry.batch_update_timestamps(&refs) {
+                    Ok(()) => ts_updates.clear(),
+                    Err(e) => {
+                        // Don't clear — retry on next cycle.
+                        // Otherwise a transient SQLite error would
+                        // orphan timestamps the disk has but the
+                        // registry doesn't know about, with no
+                        // retry path.
+                        error!(
+                            "Registry timestamp commit failed; \
+                             keeping {} pending for retry: {e}",
+                            ts_updates.len()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(Ok(Err(e))) => {
+            error!(
+                "STS ingest flush errored; deferring all {} \
+                 pending timestamp commits: {e}",
+                ts_updates.len()
+            );
+        }
+        Ok(Err(join_err)) => {
+            error!(
+                "STS ingest flush task panicked; deferring all {} \
+                 pending timestamp commits: {join_err}",
+                ts_updates.len()
+            );
+        }
+        Err(_) => {
+            // Flush wedged. Defer EVERY pending ts_updates rather
+            // than commit any — we don't know which PVs reached
+            // disk. The blocking task remains parked on the pool
+            // until the OS unblocks it; further flush attempts on
+            // the next cycle will queue another spawn_blocking,
+            // with the same timeout safety net.
+            metrics::counter!("archiver_storage_flush_timeouts_total").increment(1);
+            error!(
+                "STS ingest flush timed out after {flush_timeout:?}; \
+                 deferring all {} pending timestamp commits \
+                 (task remains on blocking pool)",
+                ts_updates.len()
+            );
+        }
+    }
+}
+
+/// Same as [`write_loop`] but accepts the full [`WriteLoopConfig`].
+pub async fn write_loop_with_config(
     storage: Arc<dyn StoragePlugin>,
     registry: Arc<PvRegistry>,
     mut rx: mpsc::Receiver<PvSample>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-    flush_period: Duration,
+    cfg: WriteLoopConfig,
 ) {
+    let WriteLoopConfig {
+        flush_period,
+        append_timeout,
+        flush_timeout,
+        drain_per_sample_timeout,
+        drain_total_budget,
+        shutdown_flush_timeout,
+    } = cfg;
     info!("Write loop started");
     // HashMap keyed by PV name → latest timestamp. Avoids duplicate entries
     // when the same PV receives many samples between flushes, and feeds
@@ -2573,7 +2894,22 @@ pub async fn write_loop(
     // PB partition.
     let mut last_dbr_type: std::collections::HashMap<String, ArchDbType> =
         std::collections::HashMap::new();
-    let mut last_flush = std::time::Instant::now();
+
+    // Periodic flush ticker: fires every `flush_period` regardless
+    // of sample arrival. Without this, a PV that stops producing
+    // (e.g. an IOC that goes silent) would keep its last buffered
+    // bytes hostage in the BufWriter until shutdown — observable
+    // only as missing data in the registry's `last_event` while the
+    // disk has the bytes.
+    //
+    // `Skip` missed-tick behaviour: if write_loop blocks on a slow
+    // append and several ticks queue up, fire only ONCE on resume
+    // rather than spamming N flushes back-to-back.
+    let mut flush_ticker = tokio::time::interval(flush_period);
+    flush_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick so the first real flush
+    // happens at `flush_period`, not at t=0.
+    let _ = flush_ticker.tick().await;
 
     loop {
         tokio::select! {
@@ -2644,27 +2980,49 @@ pub async fn write_loop(
                 // blocking pool eventually saturates, after which
                 // newer spawn_blocking calls queue. mpsc back-
                 // pressure then drops samples via overflow.
-                // True isolation also needs per-PV locks (Issue 5).
-                const STORAGE_APPEND_TIMEOUT: Duration = Duration::from_secs(30);
+                //
+                // Late-success ordering: a timed-out task may still
+                // complete its write later. Per-PV serialization
+                // inside PlainPB (`PvWriterSlot` mutex) guarantees
+                // that any subsequent same-PV append blocks behind
+                // the in-flight one, so on-disk timestamp order
+                // stays monotonic even when write_loop has already
+                // moved past the timed-out sample.
                 let pv_name_for_post = pv_sample.pv_name.clone();
                 let counters_for_post = pv_sample.counters.clone();
+                let counters_in_task = pv_sample.counters.clone();
                 let storage_for_task = storage.clone();
                 let join = tokio::task::spawn_blocking(move || {
                     let rt = tokio::runtime::Handle::current();
-                    rt.block_on(storage_for_task.append_event_with_meta(
+                    let res = rt.block_on(storage_for_task.append_event_with_meta(
                         &pv_sample.pv_name,
                         pv_sample.dbr_type,
                         &pv_sample.sample,
                         &meta,
-                    ))
-                });
-                let res = tokio::time::timeout(STORAGE_APPEND_TIMEOUT, join).await;
-                match res {
-                    Ok(Ok(Ok(()))) => {
+                    ));
+                    // Bump counters from inside the task so a
+                    // late-completing write (write_loop already
+                    // gave up on the JoinHandle via timeout) still
+                    // gets counted. Without this, every timed-out-
+                    // but-late-success sample silently leaks from
+                    // events_stored / archiver_events_stored_total
+                    // even though the bytes ARE on disk.
+                    if res.is_ok() {
                         metrics::counter!("archiver_events_stored_total").increment(1);
-                        if let Some(ref c) = counters_for_post {
+                        if let Some(c) = counters_in_task.as_ref() {
                             c.events_stored.fetch_add(1, Ordering::Relaxed);
                         }
+                    }
+                    res
+                });
+                let res = tokio::time::timeout(append_timeout, join).await;
+                match res {
+                    Ok(Ok(Ok(()))) => {
+                        // Counters were already bumped inside the
+                        // blocking task; here we only record the
+                        // registry-level timestamp, which must stay
+                        // on the loop task because ts_updates is a
+                        // local HashMap.
                         ts_updates.insert(pv_name_for_post, ts);
                     }
                     Ok(Ok(Err(e))) => {
@@ -2677,10 +3035,17 @@ pub async fn write_loop(
                         );
                     }
                     Err(_) => {
+                        // Sample MAY still land on disk later —
+                        // per-PV serialization keeps that ordered
+                        // — but write_loop won't see the result,
+                        // so registry's `last_event` for this PV
+                        // will lag until the NEXT sample for the
+                        // same PV catches it up.
                         error!(
                             pv = pv_name_for_post,
-                            "Storage append timed out after {STORAGE_APPEND_TIMEOUT:?}; \
-                             sample dropped (task remains on blocking pool)"
+                            "Storage append timed out after {append_timeout:?}; \
+                             write_loop abandoning (task remains on blocking pool, \
+                             may still succeed late)"
                         );
                         if let Some(ref c) = counters_for_post {
                             c.storage_append_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -2688,103 +3053,128 @@ pub async fn write_loop(
                     }
                 }
 
-                // Periodic flush: storage FIRST. The flush returns
-                // the per-PV failure list so we can drop ONLY those
-                // PVs from `ts_updates` — successful PVs still get
-                // their `last_event` committed. Without per-PV
-                // filtering, a single failing PV would either taint
-                // every PV's commit (registry says "we have data we
-                // don't") or block every PV's commit (registry
-                // never advances).
-                if last_flush.elapsed() > flush_period && !ts_updates.is_empty() {
-                    match storage.flush_ingest_writes().await {
-                        Ok(failed_pvs) => {
-                            for pv in &failed_pvs {
-                                ts_updates.remove(pv);
-                            }
-                            if !failed_pvs.is_empty() {
-                                error!(
-                                    "STS flush dropped {} PV(s) from timestamp commit \
-                                     (their bytes never reached disk): {:?}",
-                                    failed_pvs.len(),
-                                    failed_pvs
-                                );
-                            }
-                            if !ts_updates.is_empty() {
-                                let refs: Vec<(&str, SystemTime)> = ts_updates
-                                    .iter()
-                                    .map(|(name, ts)| (name.as_str(), *ts))
-                                    .collect();
-                                match registry.batch_update_timestamps(&refs) {
-                                    Ok(()) => ts_updates.clear(),
-                                    Err(e) => {
-                                        // Don't clear — retry on next cycle.
-                                        // Otherwise a transient SQLite error
-                                        // would orphan timestamps the disk
-                                        // has but the registry doesn't know
-                                        // about, with no retry path.
-                                        error!(
-                                            "Registry timestamp commit failed; \
-                                             keeping {} pending for retry: {e}",
-                                            ts_updates.len()
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                "STS ingest flush errored; deferring all {} \
-                                 pending timestamp commits: {e}",
-                                ts_updates.len()
-                            );
-                        }
-                    }
-                    last_flush = std::time::Instant::now();
+            }
+            _ = flush_ticker.tick() => {
+                // Periodic flush, decoupled from sample arrival so
+                // a quiet PV's buffered bytes still reach disk.
+                // Skip when there's nothing to commit — saves a
+                // syscall per tick on idle systems.
+                if !ts_updates.is_empty() {
+                    run_flush_and_commit(
+                        &storage,
+                        &registry,
+                        &mut ts_updates,
+                        flush_timeout,
+                    )
+                    .await;
                 }
             }
             _ = shutdown.changed() => {
-                // Drain remaining samples.
+                // Drain remaining samples. Apply the same
+                // spawn_blocking + bounded-timeout discipline as the
+                // main loop body so a wedged STS doesn't make
+                // shutdown itself hang on the runtime worker.
+                //
+                // An overall `drain_deadline` further bounds total
+                // shutdown time so any ONE stuck PV can't stretch
+                // the orderly stop into "kill the process". Samples
+                // past the deadline are abandoned (their bytes never
+                // reach disk and registry won't claim them).
+                let drain_start = std::time::Instant::now();
+                let mut drained_ok = 0usize;
+                let mut drained_err = 0usize;
+                let mut drained_skipped = 0usize;
+
                 while let Ok(pv_sample) = rx.try_recv() {
+                    if drain_start.elapsed() > drain_total_budget {
+                        drained_skipped += 1;
+                        continue;
+                    }
                     let meta = AppendMeta {
                         element_count: pv_sample.element_count,
                         ..Default::default()
                     };
                     let drain_ts = pv_sample.sample.timestamp;
                     let drain_pv = pv_sample.pv_name.clone();
-                    match storage
-                        .append_event_with_meta(
+                    let storage_for_drain = storage.clone();
+                    let join = tokio::task::spawn_blocking(move || {
+                        let rt = tokio::runtime::Handle::current();
+                        rt.block_on(storage_for_drain.append_event_with_meta(
                             &pv_sample.pv_name,
                             pv_sample.dbr_type,
                             &pv_sample.sample,
                             &meta,
-                        )
-                        .await
-                    {
-                        Ok(()) => {
+                        ))
+                    });
+                    match tokio::time::timeout(drain_per_sample_timeout, join).await {
+                        Ok(Ok(Ok(()))) => {
                             // Track for the final ts_updates commit so
                             // restart-time recovery sees the drained
                             // samples reflected in `last_event`.
                             ts_updates.insert(drain_pv, drain_ts);
+                            drained_ok += 1;
                         }
-                        Err(e) => {
-                            warn!(pv = pv_sample.pv_name, "Shutdown drain write error: {e}");
+                        Ok(Ok(Err(e))) => {
+                            warn!(pv = drain_pv, "Shutdown drain write error: {e}");
+                            drained_err += 1;
+                        }
+                        Ok(Err(join_err)) => {
+                            warn!(
+                                pv = drain_pv,
+                                "Shutdown drain write task panicked: {join_err}"
+                            );
+                            drained_err += 1;
+                        }
+                        Err(_) => {
+                            warn!(
+                                pv = drain_pv,
+                                "Shutdown drain append timed out after \
+                                 {drain_per_sample_timeout:?}; abandoning"
+                            );
+                            drained_err += 1;
                         }
                     }
                 }
+                if drained_skipped > 0 {
+                    warn!(
+                        "Shutdown drain budget ({drain_total_budget:?}) exhausted; \
+                         {drained_skipped} buffered sample(s) abandoned without \
+                         attempting append (ok={drained_ok}, err={drained_err})"
+                    );
+                }
+
                 // Final flush: storage FIRST so the registry's
                 // last_event timestamps don't claim more than what
                 // actually reached disk. Use the all-tier flush_writes
                 // here (not flush_ingest_writes) — at shutdown we
                 // want every cached writer drained, including any
-                // ETL-side caches.
-                let storage_ok = match storage.flush_writes().await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        warn!("Shutdown storage flush failed: {e}");
-                        false
-                    }
-                };
+                // ETL-side caches. Same spawn_blocking + timeout
+                // discipline as the periodic flush above so a stuck
+                // mount doesn't make shutdown hang.
+                let storage_for_flush = storage.clone();
+                let flush_join = tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(storage_for_flush.flush_writes())
+                });
+                let storage_ok =
+                    match tokio::time::timeout(shutdown_flush_timeout, flush_join).await {
+                        Ok(Ok(Ok(()))) => true,
+                        Ok(Ok(Err(e))) => {
+                            warn!("Shutdown storage flush failed: {e}");
+                            false
+                        }
+                        Ok(Err(join_err)) => {
+                            warn!("Shutdown storage flush task panicked: {join_err}");
+                            false
+                        }
+                        Err(_) => {
+                            warn!(
+                                "Shutdown storage flush timed out after \
+                                 {shutdown_flush_timeout:?}; abandoning ts_updates commit"
+                            );
+                            false
+                        }
+                    };
                 if storage_ok && !ts_updates.is_empty() {
                     let refs: Vec<(&str, SystemTime)> = ts_updates
                         .iter()

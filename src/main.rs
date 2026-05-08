@@ -130,13 +130,27 @@ async fn main() -> anyhow::Result<()> {
     let write_storage = storage.clone();
     let write_registry = registry.clone();
     let write_shutdown = supervisor.shutdown_rx();
+    let pool_cfg = channel_manager::ShardedWritePoolConfig {
+        shards: config.engine.write_shards.max(1),
+        per_shard_buffer: config.engine.per_shard_buffer.max(1),
+        write_loop: channel_manager::WriteLoopConfig {
+            flush_period,
+            ..Default::default()
+        },
+    };
+    info!(
+        shards = pool_cfg.shards,
+        per_shard_buffer = pool_cfg.per_shard_buffer,
+        ?flush_period,
+        "Spawning sharded write pool"
+    );
     supervisor.spawn("write_loop", async move {
-        channel_manager::write_loop(
+        channel_manager::run_sharded_write_pool(
             write_storage,
             write_registry,
             sample_rx,
             write_shutdown,
-            flush_period,
+            pool_cfg,
         )
         .await;
     });
