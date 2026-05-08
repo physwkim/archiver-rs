@@ -23,6 +23,12 @@ use self::reader::PbFileReader;
 struct CachedWriter {
     path: PathBuf,
     writer: BufWriter<std::fs::File>,
+    /// `true` between writes and the next successful flush. Lets
+    /// `flush_writes` skip writers that have nothing pending so a
+    /// reader-side `get_data` doesn't pay an O(N) syscall storm
+    /// across every cached writer (Java parity is similar — the
+    /// `dirty` bit short-circuits the iteration).
+    dirty: bool,
 }
 
 /// Wraps a `PbFileReader` and clamps emitted samples to `[start, end]`.
@@ -242,14 +248,7 @@ impl PlainPbStoragePlugin {
         }
 
         if !cache.contains_key(pv) {
-            // Java parity (651c3a6b): treat a zero-byte file the same as
-            // a missing one. A crash mid-create would otherwise leave us
-            // appending samples to a file with no PayloadInfo header,
-            // producing a permanently undecodable file.
-            let needs_header = !path.exists()
-                || std::fs::metadata(path)
-                    .map(|m| m.len() == 0)
-                    .unwrap_or(false);
+            let needs_header = file_needs_header(path);
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -267,8 +266,14 @@ impl PlainPbStoragePlugin {
                 );
                 let header_bytes = header.encode_to_vec();
                 let escaped_header = codec::escape(&header_bytes);
-                bw.write_all(&escaped_header)?;
-                bw.write_all(&[codec::NEWLINE])?;
+                // Single write_all so the header+newline never split
+                // across BufWriter flushes — same atomicity rationale
+                // as the sample frame below.
+                let mut header_frame =
+                    Vec::with_capacity(escaped_header.len() + 1);
+                header_frame.extend_from_slice(&escaped_header);
+                header_frame.push(codec::NEWLINE);
+                bw.write_all(&header_frame)?;
             }
 
             cache.insert(
@@ -276,15 +281,66 @@ impl PlainPbStoragePlugin {
                 CachedWriter {
                     path: path_buf,
                     writer: bw,
+                    // Header bytes (if any) are buffered but not yet
+                    // flushed. Mark dirty so the periodic flush picks
+                    // them up — without this, a PV that gets created
+                    // and then receives no further samples within a
+                    // flush_period would never persist its header.
+                    dirty: true,
                 },
             );
         }
 
         let cached = cache.get_mut(pv).expect("just inserted");
-        cached.writer.write_all(&escaped_sample)?;
-        cached.writer.write_all(&[codec::NEWLINE])?;
+        // Atomic-at-buffer-layer sample frame: a single `write_all`
+        // means the BufWriter never splits the sample/newline pair
+        // across two internal flushes. OS-level write atomicity is
+        // still bounded by the kernel page boundary, but this removes
+        // our contribution to the partial-record risk.
+        let mut frame = Vec::with_capacity(escaped_sample.len() + 1);
+        frame.extend_from_slice(&escaped_sample);
+        frame.push(codec::NEWLINE);
+        cached.writer.write_all(&frame)?;
+        cached.dirty = true;
         Ok(())
     }
+}
+
+/// Decide whether a file at `path` needs a fresh PayloadInfo header
+/// written before sample data is appended. Returns `true` when:
+/// 1. the file doesn't exist,
+/// 2. the file exists but is 0 bytes (Java parity 651c3a6b: a crash
+///    mid-create would otherwise leave a header-less file), OR
+/// 3. the file exists with bytes but `PbFileReader::open` cannot
+///    parse the header — in that case we **truncate** the file so
+///    the caller's `create+append` opens cleanly. Without this
+///    third branch, a partial-header crash makes the file forever
+///    unreadable AND every subsequent append silently piles garbage
+///    onto a corrupt prefix.
+fn file_needs_header(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if size == 0 {
+        return true;
+    }
+    if PbFileReader::open(path).is_err() {
+        tracing::warn!(
+            ?path,
+            "PB file has unreadable header; truncating so a fresh \
+             header gets written"
+        );
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+        {
+            tracing::warn!(?path, "Failed to truncate corrupt PB file: {e}");
+        }
+        return true;
+    }
+    false
 }
 
 /// Convert PV name to file path key.
@@ -627,9 +683,19 @@ impl StoragePlugin for PlainPbStoragePlugin {
             .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
         let mut to_remove = Vec::new();
         for (pv, cached) in cache.iter_mut() {
-            if let Err(e) = cached.writer.flush() {
-                tracing::warn!(pv, path = ?cached.path, "Failed to flush cached writer: {e}");
-                to_remove.push(pv.clone());
+            // Skip writers with nothing pending — every `get_data`
+            // call lands here, and at scale (1000+ PVs) the avoided
+            // syscall storm matters: only PVs that actually buffered
+            // bytes since the last flush get touched.
+            if !cached.dirty {
+                continue;
+            }
+            match cached.writer.flush() {
+                Ok(()) => cached.dirty = false,
+                Err(e) => {
+                    tracing::warn!(pv, path = ?cached.path, "Failed to flush cached writer: {e}");
+                    to_remove.push(pv.clone());
+                }
             }
         }
         for pv in to_remove {
