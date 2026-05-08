@@ -94,7 +94,11 @@ archiver-api = { path = "crates/archiver-api", version = "0.3.0" }
 
 [package]
 name = "epics-archiver"
-version.workspace = true
+# Decoupled from workspace.package.version so the binary can ship
+# bug-fix releases (e.g. CLI ergonomics) without churning the four
+# library crates whose code is unchanged. Library crates remain at
+# workspace.package.version (0.3.0).
+version = "0.3.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

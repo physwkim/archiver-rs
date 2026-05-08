@@ -40,8 +40,52 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
     }
 }
 
+/// Print short usage / help text to stdout. Hand-rolled (no clap)
+/// because the binary takes at most one positional argument and
+/// otherwise reads everything from `archiver.toml`.
+fn print_help() {
+    println!(
+        "epics-archiver {}\n\
+         EPICS Archiver Appliance — Rust port.\n\
+         \n\
+         USAGE:\n    \
+             epics-archiver [CONFIG_PATH]\n\
+         \n\
+         ARGUMENTS:\n    \
+             CONFIG_PATH    Path to TOML config file [default: archiver.toml]\n\
+         \n\
+         FLAGS:\n    \
+             -h, --help       Print this help text and exit\n    \
+             -V, --version    Print version and exit\n\
+         \n\
+         ENVIRONMENT:\n    \
+             RUST_LOG               Logging filter (default: info)\n    \
+             EPICS_CA_ADDR_LIST     CA name resolution targets\n    \
+             EPICS_CA_AUTO_ADDR_LIST  Auto-add broadcast addresses\n\
+         \n\
+         See README.md for the full configuration reference.\n\
+         Source: https://github.com/physwkim/archiver-rs",
+        env!("CARGO_PKG_VERSION"),
+    );
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Handle --help / --version BEFORE initialising tracing so the
+    // output is plain stdout (no log prefixes).
+    let first_arg = std::env::args().nth(1);
+    match first_arg.as_deref() {
+        Some("-h") | Some("--help") => {
+            print_help();
+            return Ok(());
+        }
+        Some("-V") | Some("--version") => {
+            println!("epics-archiver {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        _ => {}
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -50,9 +94,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Load configuration.
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "archiver.toml".to_string());
+    let config_path = first_arg.unwrap_or_else(|| "archiver.toml".to_string());
     let config_str = tokio::fs::read_to_string(&config_path)
         .await
         .context(format!("Failed to read config file: {config_path}"))?;

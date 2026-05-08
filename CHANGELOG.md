@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.3.1 — 2026-05-08 (binary-only)
+
+### Added
+
+- **`--help` and `--version` flags on the `epics-archiver` binary.**
+  Hand-rolled (no `clap` dependency) — handles `-h`/`--help` and
+  `-V`/`--version` before reaching the config-load path. Without
+  these, `epics-archiver --help` was treated as a config path and
+  failed with a misleading "No such file or directory" error.
+  README's Installing section claimed `--help` worked; it does now.
+
+### Notes
+
+- This is a binary-only release. The four library crates
+  (`archiver-{proto,core,engine,api}`) are unchanged at v0.3.0.
+
 ## v0.3.0 — 2026-05-08
 
 ### Added
