@@ -113,7 +113,12 @@ impl ArchiverQuery for FakeArchiverControl {
 
 #[async_trait]
 impl ArchiverCommand for FakeArchiverControl {
-    async fn archive_pv(&self, pv: &str, _mode: &SampleMode) -> anyhow::Result<()> {
+    async fn archive_pv(
+        &self,
+        pv: &str,
+        _mode: &SampleMode,
+        _protocol: archiver_core::registry::Protocol,
+    ) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
         state.archived.insert(pv.to_string());
         Ok(())

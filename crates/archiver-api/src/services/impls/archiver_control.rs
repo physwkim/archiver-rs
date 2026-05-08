@@ -85,8 +85,13 @@ use archiver_core::types::archiver_value_to_json;
 
 #[async_trait]
 impl ArchiverCommand for ChannelArchiverControl {
-    async fn archive_pv(&self, pv: &str, mode: &SampleMode) -> anyhow::Result<()> {
-        self.inner.archive_pv(pv, mode).await
+    async fn archive_pv(
+        &self,
+        pv: &str,
+        mode: &SampleMode,
+        protocol: archiver_core::registry::Protocol,
+    ) -> anyhow::Result<()> {
+        self.inner.archive_pv(pv, mode, protocol).await
     }
 
     async fn pause_pv(&self, pv: &str) -> anyhow::Result<()> {

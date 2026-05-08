@@ -6,11 +6,13 @@ use dashmap::DashMap;
 use epics_rs::base::server::snapshot::DbrClass;
 use epics_rs::base::types::{DbFieldType, EpicsValue};
 use epics_rs::ca::client::{CaChannel, CaClient, ConnectionEvent};
+use epics_rs::pva::client_native::PvaClient;
+use epics_rs::pva::pvdata::{PvField, ScalarValue};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use archiver_core::registry::{PvRecord, PvRegistry, PvStatus, SampleMode};
+use archiver_core::registry::{Protocol, PvRecord, PvRegistry, PvStatus, SampleMode};
 use archiver_core::storage::traits::{AppendMeta, StoragePlugin};
 use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
 
@@ -211,8 +213,11 @@ impl From<&PvCounters> for PvCountersSnapshot {
 
 /// Handle for a running PV archiving task.
 struct PvHandle {
-    #[allow(dead_code)]
-    channel: CaChannel,
+    /// `Some` for CA-acquired PVs (used by `try_get_value` for the
+    /// live-value RPC); `None` for PVA-acquired PVs since PVA exposes
+    /// no Clone-able channel handle — live_value for those routes
+    /// through `pva_client` directly.
+    channel: Option<CaChannel>,
     cancel_token: CancellationToken,
     #[allow(dead_code)]
     dbr_type: ArchDbType,
@@ -257,10 +262,14 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
-/// Manages EPICS Channel Access connections and dispatches archived samples to storage.
+/// Manages EPICS Channel Access + pvAccess connections and dispatches
+/// archived samples to storage.
 pub struct ChannelManager {
     /// The CA client context.
     ca_client: CaClient,
+    /// The PVA client context (lazily used only when a PV's registry
+    /// row carries `Protocol::Pva`).
+    pva_client: PvaClient,
     /// Active channels: PV name → handle with cancellation.
     channels: DashMap<String, PvHandle>,
     /// PVs currently being archived (in-progress CA connect). Prevents TOCTOU races
@@ -314,10 +323,12 @@ impl ChannelManager {
         server_ioc_drift_secs: u64,
     ) -> anyhow::Result<(Self, mpsc::Receiver<PvSample>)> {
         let ca_client = CaClient::new().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pva_client = PvaClient::new().map_err(|e| anyhow::anyhow!("{e}"))?;
         let (tx, rx) = mpsc::channel(SAMPLE_CHANNEL_CAPACITY);
 
         let mgr = Self {
             ca_client,
+            pva_client,
             channels: DashMap::new(),
             pending_archives: DashMap::new(),
             op_locks: DashMap::new(),
@@ -386,7 +397,12 @@ impl ChannelManager {
     }
 
     /// Start archiving a new PV.
-    pub async fn archive_pv(&self, pv_name: &str, sample_mode: &SampleMode) -> anyhow::Result<()> {
+    pub async fn archive_pv(
+        &self,
+        pv_name: &str,
+        sample_mode: &SampleMode,
+        protocol: Protocol,
+    ) -> anyhow::Result<()> {
         // Serialise with pause/resume/stop/destroy on the same PV.
         let lock = self.op_lock(pv_name);
         let _g = lock.lock().await;
@@ -409,7 +425,10 @@ impl ChannelManager {
             key: pv_name.to_string(),
         };
 
-        self.archive_pv_inner(pv_name, sample_mode).await
+        match protocol {
+            Protocol::Ca => self.archive_pv_inner(pv_name, sample_mode).await,
+            Protocol::Pva => self.archive_pv_inner_pva(pv_name, sample_mode).await,
+        }
     }
 
     /// Inner implementation of archive_pv, separated for cleanup safety.
@@ -450,7 +469,8 @@ impl ChannelManager {
         let dbr_type = dbr_field_to_arch_type(info.native_type);
         let element_count = info.element_count as i32;
 
-        // Register in SQLite.
+        // Register in SQLite. (CA path — PVA acquisition uses a separate
+        // entry point, so this branch is always Protocol::Ca.)
         self.registry
             .register_pv(pv_name, dbr_type, &effective_mode, element_count)?;
         // Java parity (b30f1a6): persist the matched policy's stable name so
@@ -470,8 +490,98 @@ impl ChannelManager {
         Ok(())
     }
 
-    /// Internal: start CA subscription for a PV record.
+    /// PVA equivalent of [`Self::archive_pv_inner`]. Connects via the
+    /// pvAccess client, infers archive type from a one-shot pvget, then
+    /// hands off to a `monitor_loop_pva` that mirrors the CA monitor
+    /// loop's lifecycle (samples → write_loop, cancel_token shutdown).
+    async fn archive_pv_inner_pva(
+        &self,
+        pv_name: &str,
+        sample_mode: &SampleMode,
+    ) -> anyhow::Result<()> {
+        if self.channels.contains_key(pv_name) {
+            anyhow::bail!("PV {pv_name} is already being archived");
+        }
+
+        // Apply policy override (same surface as CA path).
+        let (effective_mode, matched_policy_name) = if let Some(ref policy) = self.policy {
+            if let Some(p) = policy.find_policy(pv_name) {
+                (p.to_sample_mode(), Some(p.policy_name().to_string()))
+            } else {
+                (sample_mode.clone(), None)
+            }
+        } else {
+            (sample_mode.clone(), None)
+        };
+
+        // Connect + introspect: a one-shot pvget tells us the value
+        // shape. We rely on it instead of a `cainfo` analogue because
+        // PVA channels carry their type only via fetched data.
+        let connect = tokio::time::timeout(
+            CA_CONNECT_TIMEOUT,
+            self.pva_client.pvconnect(pv_name),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("PVA connect to {pv_name} timed out"))?
+        .map_err(|e| anyhow::anyhow!("Failed to connect to {pv_name} via PVA: {e}"))?;
+        debug!(pv = pv_name, server = %connect, "PVA channel connected");
+
+        let initial = tokio::time::timeout(CA_CONNECT_TIMEOUT, self.pva_client.pvget(pv_name))
+            .await
+            .map_err(|_| anyhow::anyhow!("PVA pvget for {pv_name} timed out"))?
+            .map_err(|e| anyhow::anyhow!("Failed to pvget {pv_name}: {e}"))?;
+        let (dbr_type, element_count) = pv_field_to_arch_db_type(&initial).ok_or_else(|| {
+            anyhow::anyhow!(
+                "PV {pv_name}: PVA value is not a scalar/scalar-array; structured types not yet supported"
+            )
+        })?;
+
+        // Register with Pva flag.
+        self.registry.register_pv_with_protocol(
+            pv_name,
+            dbr_type,
+            &effective_mode,
+            element_count,
+            Protocol::Pva,
+        )?;
+        if let Some(ref name) = matched_policy_name {
+            self.registry.update_policy_name(pv_name, Some(name))?;
+        }
+        // Persist PREC/EGU extracted from the same pvget — equivalent
+        // to the CA path's DBR_CTRL refresh. Non-fatal on error.
+        let (prec, egu) = pv_field_extract_display(&initial);
+        if (prec.is_some() || egu.is_some())
+            && let Err(e) =
+                self.registry
+                    .update_metadata(pv_name, prec.as_deref(), egu.as_deref())
+        {
+            debug!(pv = pv_name, "Failed to persist PVA PREC/EGU: {e}");
+        }
+
+        let record = self
+            .registry
+            .get_pv(pv_name)?
+            .ok_or_else(|| anyhow::anyhow!("PV {pv_name} not found in registry"))?;
+        self.start_archiving_internal(&record).await?;
+
+        metrics::gauge!("archiver_pvs_active").increment(1.0);
+        info!(
+            pv = pv_name,
+            ?dbr_type,
+            element_count,
+            protocol = "pva",
+            "Started archiving"
+        );
+        Ok(())
+    }
+
+    /// Internal: start a subscription for a PV record. Routes by
+    /// `record.protocol`; the CA branch keeps the historical behaviour,
+    /// the PVA branch goes through `start_archiving_internal_pva`.
     async fn start_archiving_internal(&self, record: &PvRecord) -> anyhow::Result<()> {
+        if record.protocol == Protocol::Pva {
+            return self.start_archiving_internal_pva(record).await;
+        }
         let pv_name = record.pv_name.clone();
         let dbr_type = record.dbr_type;
         let element_count = record.element_count;
@@ -493,7 +603,7 @@ impl ChannelManager {
         self.channels.insert(
             pv_name.clone(),
             PvHandle {
-                channel: channel.clone(),
+                channel: Some(channel.clone()),
                 cancel_token: cancel_token.clone(),
                 dbr_type,
                 conn_info: conn_info.clone(),
@@ -567,6 +677,125 @@ impl ChannelManager {
                     .await;
                 });
             }
+        }
+
+        Ok(())
+    }
+
+    /// PVA equivalent of `start_archiving_internal`. Spawns a single
+    /// callback-driven monitor task; pvAccess auto-reconnect inside
+    /// `pvmonitor_handle` removes the explicit reconnect loop the CA
+    /// path needs. PVA records use `channel: None` on the [`PvHandle`]
+    /// and skip per-field "extras" subscriptions (`.HIHI`/`.LOLO`/…)
+    /// since pvAccess wraps those in the NTScalar value structure
+    /// rather than separate channels.
+    async fn start_archiving_internal_pva(&self, record: &PvRecord) -> anyhow::Result<()> {
+        let pv_name = record.pv_name.clone();
+        let dbr_type = record.dbr_type;
+        let element_count = record.element_count;
+        let cancel_token = CancellationToken::new();
+        let conn_info = Arc::new(Mutex::new(ConnectionInfo::default()));
+        let extras: Arc<ExtraFieldsCache> = Arc::new(DashMap::new());
+        let field_tokens: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
+        let update_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let counters = Arc::new(PvCounters::default());
+
+        self.channels.insert(
+            pv_name.clone(),
+            PvHandle {
+                channel: None,
+                cancel_token: cancel_token.clone(),
+                dbr_type,
+                conn_info: conn_info.clone(),
+                extras: extras.clone(),
+                field_tokens: field_tokens.clone(),
+                update_lock,
+                counters: counters.clone(),
+            },
+        );
+
+        let tx = self.sample_tx.clone();
+        let pva_client = self.pva_client.clone();
+        let token = cancel_token.clone();
+        let ci = conn_info.clone();
+        let counters_for_loop = counters.clone();
+        let drift = self.server_ioc_drift_secs;
+
+        match &record.sample_mode {
+            SampleMode::Monitor => {
+                let pv_name_loop = pv_name.clone();
+                tokio::spawn(async move {
+                    monitor_loop_pva(
+                        pv_name_loop,
+                        dbr_type,
+                        element_count,
+                        pva_client,
+                        tx,
+                        token,
+                        ci,
+                        counters_for_loop,
+                        drift,
+                    )
+                    .await;
+                });
+            }
+            SampleMode::Scan { period_secs } => {
+                let period = *period_secs;
+                let pv_name_loop = pv_name.clone();
+                tokio::spawn(async move {
+                    scan_loop_pva(
+                        pv_name_loop,
+                        dbr_type,
+                        pva_client,
+                        tx,
+                        token,
+                        period,
+                        ci,
+                        counters_for_loop,
+                        drift,
+                    )
+                    .await;
+                });
+            }
+        }
+
+        // Auxiliary periodic refreshers: keep PREC/EGU current after
+        // IOC restarts, and approximate disconnect events from a long
+        // sample gap. Both bind to the same cancel_token so a stop /
+        // delete reaps every PVA-side task in one go.
+        {
+            let pv_name = pv_name.clone();
+            let pva_client = self.pva_client.clone();
+            let registry = self.registry.clone();
+            let cancel = cancel_token.clone();
+            let counters_for_refresh = counters.clone();
+            tokio::spawn(async move {
+                pva_metadata_refresh_loop(
+                    pv_name,
+                    pva_client,
+                    registry,
+                    cancel,
+                    counters_for_refresh,
+                )
+                .await;
+            });
+        }
+        {
+            let pv_name = pv_name.clone();
+            let conn_info = conn_info.clone();
+            let counters_for_watch = counters.clone();
+            let cancel = cancel_token.clone();
+            let sample_mode = record.sample_mode.clone();
+            tokio::spawn(async move {
+                pva_state_watchdog(
+                    pv_name,
+                    conn_info,
+                    counters_for_watch,
+                    cancel,
+                    sample_mode,
+                )
+                .await;
+            });
         }
 
         Ok(())
@@ -819,7 +1048,19 @@ impl ChannelManager {
         pv_name: &str,
         timeout: Duration,
     ) -> Option<anyhow::Result<ArchiverValue>> {
-        let channel = self.channels.get(pv_name)?.channel.clone();
+        let channel_opt = self.channels.get(pv_name)?.channel.clone();
+        let Some(channel) = channel_opt else {
+            // PVA-acquired PV — live_value via pva_client.pvget.
+            let pva = self.pva_client.clone();
+            let name = pv_name.to_string();
+            let res = tokio::time::timeout(timeout, pva.pvget(&name)).await;
+            return Some(match res {
+                Ok(Ok(field)) => pv_field_scalar_to_archiver(&field)
+                    .ok_or_else(|| anyhow::anyhow!("PVA value not a scalar")),
+                Ok(Err(e)) => Err(anyhow::anyhow!("PVA get failed: {e}")),
+                Err(_) => Err(anyhow::anyhow!("PVA get timed out after {timeout:?}")),
+            });
+        };
         // Wait briefly for connection — channel.get on a disconnected
         // channel would otherwise return an error from deep in the CA
         // stack. Capped by the same timeout the caller chose.
@@ -966,6 +1207,396 @@ async fn refresh_ctrl_metadata(
             prec = ?prec_arg, egu = ?egu_arg,
             "Refreshed PREC/EGU from DBR_CTRL"
         );
+    }
+}
+
+/// PVA monitor loop: subscribes once via `pvmonitor_handle` (which
+/// internally auto-reconnects, so we don't need the CA monitor's
+/// outer reconnect loop) and parks until cancellation. Each
+/// fan-in event is decoded inline, packaged as a [`PvSample`], and
+/// non-blocking-pushed into the storage write_loop's channel —
+/// blocking would stall the pvAccess reactor thread.
+#[allow(clippy::too_many_arguments)]
+async fn monitor_loop_pva(
+    pv_name: String,
+    dbr_type: ArchDbType,
+    element_count: i32,
+    pva_client: PvaClient,
+    tx: mpsc::Sender<PvSample>,
+    cancel_token: CancellationToken,
+    conn_info: Arc<Mutex<ConnectionInfo>>,
+    counters: Arc<PvCounters>,
+    server_ioc_drift_secs: u64,
+) {
+    let drift_secs = server_ioc_drift_secs;
+    // Static element_count is unused — each callback derives the
+    // current array length from the live PvField, so an NTScalarArray
+    // whose size changes between events still gets tagged correctly.
+    let _ = element_count;
+
+    // Subscribe with retry. pvAccess monitors are sticky once
+    // established, so we only loop on the *initial* attempt.
+    let _handle = loop {
+        let pv_name_cb = pv_name.clone();
+        let dbr_type_cb = dbr_type;
+        let tx_cb = tx.clone();
+        let conn_info_cb = conn_info.clone();
+        let counters_cb = counters.clone();
+
+        let cb = move |_desc: &epics_rs::pva::pvdata::FieldDesc, field: &PvField| {
+            let now = SystemTime::now();
+
+            // Update connection bookkeeping. First-event semantics
+            // mirror the CA path — each delivered event re-affirms
+            // `Connected` state and refreshes `last_event_time`.
+            let first_after_connect = {
+                let mut ci = conn_info_cb.lock().unwrap_or_else(|e| e.into_inner());
+                let first = ci.last_event_time.is_none();
+                if ci.connected_since.is_none() {
+                    ci.connected_since = Some(now);
+                }
+                ci.is_connected = true;
+                ci.last_event_time = Some(now);
+                ci.state = PvConnectionState::Connected;
+                first
+            };
+            if first_after_connect {
+                counters_cb
+                    .first_event_unix_secs
+                    .compare_exchange(
+                        0,
+                        unix_secs(now),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .ok();
+            }
+            counters_cb.events_received.fetch_add(1, Ordering::Relaxed);
+
+            let Some(value) = pv_field_scalar_to_archiver(field) else {
+                // Non-scalar — happens on schema mismatch (e.g. server
+                // started serving NTNDArray). Drop, count, log once
+                // per event for visibility.
+                counters_cb
+                    .type_change_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    pv = pv_name_cb,
+                    "PVA event has non-scalar value; dropping"
+                );
+                return;
+            };
+
+            let ts = pv_field_extract_timestamp(field);
+            // IOC-drift filter parity with the CA monitor loop. First
+            // sample after connect is exempt (legitimate backfill on
+            // reconnect can include older timestamps).
+            if !first_after_connect && !ioc_timestamp_in_window(ts, now, drift_secs) {
+                counters_cb
+                    .timestamp_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    pv = pv_name_cb,
+                    ?ts,
+                    "Dropping PVA sample with out-of-window timestamp"
+                );
+                return;
+            }
+            // Per-event element_count — handles NTScalarArrays that
+            // resize between samples. `0` (unsupported shape) shouldn't
+            // happen here since the callback returned earlier on
+            // non-scalar; treat as 1 defensively.
+            let elem_count = match pv_field_element_count(field) {
+                0 => 1,
+                n => n,
+            };
+            let sample = ArchiverSample::new(ts, value);
+            let pv_sample = PvSample {
+                pv_name: pv_name_cb.clone(),
+                dbr_type: dbr_type_cb,
+                sample,
+                element_count: Some(elem_count),
+                counters: Some(counters_cb.clone()),
+            };
+            // Non-blocking — the reactor thread can't await our mpsc
+            // backpressure. Saturation is rare (write_loop drains at
+            // ~10⁵ samples/s) and counted for operator visibility.
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx_cb.try_send(pv_sample) {
+                counters_cb
+                    .buffer_overflow_drops
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        };
+
+        match pva_client.pvmonitor_handle(&pv_name, cb).await {
+            Ok(h) => break h,
+            Err(e) => {
+                counters
+                    .transient_error_count
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(pv = pv_name, "PVA pvmonitor failed: {e}; retrying");
+                tokio::select! {
+                    _ = cancel_token.cancelled() => return,
+                    _ = tokio::time::sleep(CA_RETRY_DELAY) => continue,
+                }
+            }
+        }
+    };
+
+    debug!(pv = pv_name, "PVA monitor active");
+    cancel_token.cancelled().await;
+    debug!(pv = pv_name, "PVA monitor cancelled; dropping subscription");
+    // `_handle` drops here, which tears down the subscription on the
+    // pvAccess client.
+}
+
+/// PVA Scan loop: periodic `pvget` instead of streaming monitor.
+/// Mirrors the CA scan_loop's per-tick connection check + sample emit.
+#[allow(clippy::too_many_arguments)]
+async fn scan_loop_pva(
+    pv_name: String,
+    dbr_type: ArchDbType,
+    pva_client: PvaClient,
+    tx: mpsc::Sender<PvSample>,
+    cancel_token: CancellationToken,
+    period_secs: f64,
+    conn_info: Arc<Mutex<ConnectionInfo>>,
+    counters: Arc<PvCounters>,
+    server_ioc_drift_secs: u64,
+) {
+    let period = Duration::from_secs_f64(period_secs);
+    let mut interval = tokio::time::interval(period);
+    let drift_secs = server_ioc_drift_secs;
+    // Hard timeout per pvget — at most one tick of slack so a stuck
+    // PVA server can't accumulate pending requests.
+    let pvget_timeout = period.max(Duration::from_secs(5));
+
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            _ = interval.tick() => {}
+        }
+
+        let res = tokio::time::timeout(pvget_timeout, pva_client.pvget(&pv_name)).await;
+        let field = match res {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => {
+                let was_connected = {
+                    let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
+                    let prev = ci.is_connected;
+                    ci.is_connected = false;
+                    ci.last_event_time = None;
+                    ci.state = match ci.state {
+                        PvConnectionState::Connected => PvConnectionState::Disconnected,
+                        PvConnectionState::Disconnected => PvConnectionState::Disconnected,
+                        _ => PvConnectionState::Connecting,
+                    };
+                    prev
+                };
+                if was_connected {
+                    counters.disconnect_count.fetch_add(1, Ordering::Relaxed);
+                    counters
+                        .last_disconnect_unix_secs
+                        .store(unix_secs(SystemTime::now()), Ordering::Relaxed);
+                }
+                counters
+                    .transient_error_count
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(pv = pv_name, "PVA scan pvget failed: {e}");
+                continue;
+            }
+            Err(_) => {
+                counters
+                    .transient_error_count
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(pv = pv_name, "PVA scan pvget timed out");
+                continue;
+            }
+        };
+
+        let now = SystemTime::now();
+        let first_after_connect = {
+            let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
+            let first = ci.last_event_time.is_none();
+            if ci.connected_since.is_none() {
+                ci.connected_since = Some(now);
+            }
+            ci.is_connected = true;
+            ci.last_event_time = Some(now);
+            ci.state = PvConnectionState::Connected;
+            first
+        };
+        counters.events_received.fetch_add(1, Ordering::Relaxed);
+        if first_after_connect {
+            counters
+                .first_event_unix_secs
+                .compare_exchange(0, unix_secs(now), Ordering::Relaxed, Ordering::Relaxed)
+                .ok();
+        }
+
+        let Some(value) = pv_field_scalar_to_archiver(&field) else {
+            counters.type_change_drops.fetch_add(1, Ordering::Relaxed);
+            debug!(pv = pv_name, "PVA scan returned non-scalar value; dropping");
+            continue;
+        };
+        // Scan mode: timestamp the sample at receive time (no IOC
+        // timestamp available reliably for periodic pvget, mirroring
+        // CA scan_loop's `now` policy).
+        let _ = drift_secs; // referenced for symmetry; not used here
+        let elem_count = match pv_field_element_count(&field) {
+            0 => 1,
+            n => n,
+        };
+        let sample = ArchiverSample::new(now, value);
+        let pv_sample = PvSample {
+            pv_name: pv_name.clone(),
+            dbr_type,
+            sample,
+            element_count: Some(elem_count),
+            counters: Some(counters.clone()),
+        };
+        if let Err(rejected) =
+            try_send_with_overflow_count(&tx, pv_sample, &counters).await
+        {
+            // Channel closed (write_loop down). Cooperative shutdown.
+            let _ = rejected;
+            return;
+        }
+    }
+}
+
+/// Periodic refresh task for PVA-acquired PVs: re-fetches DBR_CTRL-
+/// equivalent metadata (`display.units`, `display.precision`) every
+/// few minutes and persists when changed. PVA's monitor callback API
+/// doesn't surface explicit reconnect events the way CA's
+/// `ConnectionEvent` does, so a dedicated periodic poll is the
+/// simplest way to keep PREC/EGU fresh after IOC restarts.
+async fn pva_metadata_refresh_loop(
+    pv_name: String,
+    pva_client: PvaClient,
+    registry: Arc<PvRegistry>,
+    cancel_token: CancellationToken,
+    counters: Arc<PvCounters>,
+) {
+    // 5 minutes — operators almost never change PREC/EGU at runtime;
+    // shorter cadence wastes registry/network and longer leaves UI
+    // stale across IOC restarts. Same magic number Java EAA uses
+    // for its `metaFieldsRefresh` cron.
+    const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+    const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+    let mut tick = tokio::time::interval(REFRESH_INTERVAL);
+    // Skip the immediate first tick — initial pvget already populated
+    // PREC/EGU at archive_pv time.
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+
+        let res = tokio::time::timeout(FETCH_TIMEOUT, pva_client.pvget(&pv_name)).await;
+        let field = match res {
+            Ok(Ok(f)) => f,
+            _ => {
+                counters
+                    .metadata_fetch_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        let (new_prec, new_egu) = pv_field_extract_display(&field);
+        let stored = match registry.get_pv(&pv_name) {
+            Ok(Some(r)) => r,
+            _ => continue,
+        };
+        let prec_changed = match (stored.prec.as_deref(), new_prec.as_deref()) {
+            (Some(s), Some(n)) => s != n,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        let egu_changed = match (stored.egu.as_deref(), new_egu.as_deref()) {
+            (Some(s), Some(n)) => s != n,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if !prec_changed && !egu_changed {
+            continue;
+        }
+        let prec_arg = if prec_changed { new_prec.as_deref() } else { None };
+        let egu_arg = if egu_changed { new_egu.as_deref() } else { None };
+        if let Err(e) = registry.update_metadata(&pv_name, prec_arg, egu_arg) {
+            warn!(pv = pv_name, "Failed to persist PVA PREC/EGU: {e}");
+        } else {
+            debug!(pv = pv_name, prec = ?prec_arg, egu = ?egu_arg, "Refreshed PVA display");
+        }
+    }
+}
+
+/// State watchdog for PVA-acquired PVs: a dedicated task that flips
+/// `conn_info.state` to `Disconnected` when no event has arrived
+/// within `STALE_THRESHOLD`. PVA's callback API doesn't surface
+/// explicit channel-state changes — we approximate by treating a
+/// long event gap as a disconnect. Trade-off: a genuinely silent PV
+/// (alarm-only, low-rate scan) appears disconnected. Operators can
+/// raise the threshold by env var if their PV cadence is slower.
+async fn pva_state_watchdog(
+    pv_name: String,
+    conn_info: Arc<Mutex<ConnectionInfo>>,
+    counters: Arc<PvCounters>,
+    cancel_token: CancellationToken,
+    sample_mode: SampleMode,
+) {
+    const POLL_INTERVAL: Duration = Duration::from_secs(5);
+    // Threshold scales with the expected event cadence so a slow Scan
+    // PV (period=300 s) doesn't flap on every tick. For Monitor mode
+    // the floor is 60 s — most production PVs change at least that
+    // often. Operators who archive truly silent PVs (alarm-only) will
+    // see stale disconnected status; that's a known limitation.
+    let stale_threshold = match sample_mode {
+        SampleMode::Monitor => Duration::from_secs(60),
+        SampleMode::Scan { period_secs } => {
+            Duration::from_secs_f64((period_secs * 3.0).max(60.0))
+        }
+    };
+    let mut interval = tokio::time::interval(POLL_INTERVAL);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            _ = interval.tick() => {}
+        }
+        let stale_now = {
+            let ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
+            if !ci.is_connected {
+                continue;
+            }
+            match ci.last_event_time {
+                Some(t) => SystemTime::now()
+                    .duration_since(t)
+                    .map(|d| d > stale_threshold)
+                    .unwrap_or(false),
+                None => false,
+            }
+        };
+        if stale_now {
+            let was_connected = {
+                let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
+                let prev = ci.is_connected;
+                ci.is_connected = false;
+                ci.state = PvConnectionState::Disconnected;
+                prev
+            };
+            if was_connected {
+                counters.disconnect_count.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .last_disconnect_unix_secs
+                    .store(unix_secs(SystemTime::now()), Ordering::Relaxed);
+                debug!(
+                    pv = pv_name,
+                    "PVA watchdog: marking disconnected after stale heartbeat"
+                );
+            }
+        }
     }
 }
 
@@ -1569,6 +2200,142 @@ fn panic_payload_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
     } else {
         "<non-string panic payload>".to_string()
     }
+}
+
+/// Resolve the data-bearing sub-field of a PVA value. NTScalar /
+/// NTScalarArray / NTEnum wrap the raw value in a `value` field; bare
+/// scalars are passed through.
+fn pv_value_field(field: &PvField) -> &PvField {
+    match field {
+        PvField::Structure(s) => s.get_field("value").unwrap_or(field),
+        _ => field,
+    }
+}
+
+/// Map a PVA `ScalarValue` to an archiver `ArchiverValue`.
+fn scalar_value_to_archiver(s: &ScalarValue) -> ArchiverValue {
+    match s {
+        ScalarValue::Boolean(v) => ArchiverValue::ScalarEnum(*v as i32),
+        ScalarValue::Byte(v) => ArchiverValue::ScalarByte(vec![*v as u8]),
+        ScalarValue::UByte(v) => ArchiverValue::ScalarByte(vec![*v]),
+        ScalarValue::Short(v) => ArchiverValue::ScalarShort(*v as i32),
+        ScalarValue::UShort(v) => ArchiverValue::ScalarShort(*v as i32),
+        ScalarValue::Int(v) => ArchiverValue::ScalarInt(*v),
+        ScalarValue::UInt(v) => ArchiverValue::ScalarInt(*v as i32),
+        ScalarValue::Long(v) => ArchiverValue::ScalarInt(*v as i32),
+        ScalarValue::ULong(v) => ArchiverValue::ScalarInt(*v as i32),
+        ScalarValue::Float(v) => ArchiverValue::ScalarFloat(*v),
+        ScalarValue::Double(v) => ArchiverValue::ScalarDouble(*v),
+        ScalarValue::String(s) => ArchiverValue::ScalarString(s.clone()),
+    }
+}
+
+/// Extract a scalar `ArchiverValue` from a top-level PVA value (which
+/// may be an NTScalar wrapper). Returns `None` for array/struct types
+/// that don't reduce to a scalar.
+fn pv_field_scalar_to_archiver(field: &PvField) -> Option<ArchiverValue> {
+    match pv_value_field(field) {
+        PvField::Scalar(s) => Some(scalar_value_to_archiver(s)),
+        _ => None,
+    }
+}
+
+/// Pick the `(ArchDbType, element_count)` to record at archive_pv time
+/// from an NTScalar / NTScalarArray's introspection-pvget result.
+/// Returns `None` for unsupported (struct / union / variant) shapes.
+fn pv_field_to_arch_db_type(field: &PvField) -> Option<(ArchDbType, i32)> {
+    let value = pv_value_field(field);
+    Some(match value {
+        PvField::Scalar(s) => (
+            match s {
+                ScalarValue::Boolean(_) => ArchDbType::ScalarEnum,
+                ScalarValue::Byte(_) | ScalarValue::UByte(_) => ArchDbType::ScalarByte,
+                ScalarValue::Short(_) | ScalarValue::UShort(_) => ArchDbType::ScalarShort,
+                ScalarValue::Int(_)
+                | ScalarValue::UInt(_)
+                | ScalarValue::Long(_)
+                | ScalarValue::ULong(_) => ArchDbType::ScalarInt,
+                ScalarValue::Float(_) => ArchDbType::ScalarFloat,
+                ScalarValue::Double(_) => ArchDbType::ScalarDouble,
+                ScalarValue::String(_) => ArchDbType::ScalarString,
+            },
+            1,
+        ),
+        // Array variants — keep the corresponding scalar element type but
+        // bump element_count. write_loop / PB encoder doesn't currently
+        // serialise PVA arrays, so callers should reject these for now.
+        PvField::ScalarArray(arr) => {
+            let elem = arr.first()?;
+            let inner = PvField::Scalar(elem.clone());
+            let (t, _) = pv_field_to_arch_db_type(&inner)?;
+            (t, arr.len() as i32)
+        }
+        _ => return None,
+    })
+}
+
+/// Element count for a PVA value: 1 for scalar, length for arrays,
+/// 0 for unsupported shapes (treated as "unknown" by callers).
+fn pv_field_element_count(field: &PvField) -> i32 {
+    match pv_value_field(field) {
+        PvField::Scalar(_) => 1,
+        PvField::ScalarArray(arr) => arr.len() as i32,
+        PvField::ScalarArrayTyped(t) => t.len() as i32,
+        _ => 0,
+    }
+}
+
+/// Pull `(precision, units)` out of an NTScalar / NTScalarArray's
+/// `display` sub-structure. Returns `(None, None)` for bare scalars
+/// or structures missing `display` (some servers omit it).
+/// Negative precision is the Java EAA "no precision info" sentinel —
+/// treat it the same as missing so we don't surface "-1" to the UI.
+fn pv_field_extract_display(field: &PvField) -> (Option<String>, Option<String>) {
+    let PvField::Structure(s) = field else {
+        return (None, None);
+    };
+    let Some(PvField::Structure(disp)) = s.get_field("display") else {
+        return (None, None);
+    };
+    let prec = match disp.get_field("precision") {
+        Some(PvField::Scalar(ScalarValue::Int(p))) if *p >= 0 => Some(p.to_string()),
+        Some(PvField::Scalar(ScalarValue::Short(p))) if *p >= 0 => Some(p.to_string()),
+        Some(PvField::Scalar(ScalarValue::Long(p))) if *p >= 0 => Some(p.to_string()),
+        _ => None,
+    };
+    let egu = match disp.get_field("units") {
+        Some(PvField::Scalar(ScalarValue::String(u))) => {
+            let t = u.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        }
+        _ => None,
+    };
+    (prec, egu)
+}
+
+/// Pull the IOC-reported timestamp out of an NTScalar / NTScalarArray.
+/// Falls back to `SystemTime::now()` when the structure lacks a usable
+/// `timeStamp` sub-field, so a malformed server doesn't drop samples.
+fn pv_field_extract_timestamp(field: &PvField) -> SystemTime {
+    let PvField::Structure(s) = field else {
+        return SystemTime::now();
+    };
+    let Some(PvField::Structure(ts)) = s.get_field("timeStamp") else {
+        return SystemTime::now();
+    };
+    let secs = match ts.get_field("secondsPastEpoch") {
+        Some(PvField::Scalar(ScalarValue::Long(v))) => *v as u64,
+        Some(PvField::Scalar(ScalarValue::ULong(v))) => *v,
+        Some(PvField::Scalar(ScalarValue::Int(v))) => *v as u64,
+        Some(PvField::Scalar(ScalarValue::UInt(v))) => *v as u64,
+        _ => return SystemTime::now(),
+    };
+    let nanos = match ts.get_field("nanoseconds") {
+        Some(PvField::Scalar(ScalarValue::Int(v))) => *v as u32,
+        Some(PvField::Scalar(ScalarValue::UInt(v))) => *v,
+        _ => 0,
+    };
+    SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
 }
 
 /// Convert epics-base-rs DbFieldType to archiver ArchDbType.

@@ -30,12 +30,14 @@ pub async fn archive_pv(
     if let Ok(req) = serde_json::from_str::<ArchivePvRequest>(&body_str)
         && let Some(pv) = req.pv
     {
-        let pv = archiver_core::registry::normalize_pv_name(&pv).to_string();
+        let (protocol, pv_norm) = archiver_core::registry::parse_pv_with_protocol(&pv);
+        let pv = pv_norm.to_string();
         let sample_mode = parse_sample_mode(req.sampling_method.as_deref(), req.sampling_period);
         return archive_single_pv(
             &state,
             &pv,
             &sample_mode,
+            protocol,
             req.appliance.as_deref(),
             &headers,
         )
@@ -44,16 +46,10 @@ pub async fn archive_pv(
 
     // Try as JSON array of ArchivePvRequest objects (with per-PV appliance + sampling).
     if let Ok(reqs) = serde_json::from_str::<Vec<ArchivePvRequest>>(&body_str) {
-        // Normalize each entry's pv field so the per-request channel name
-        // matches what the registry stores.
-        let reqs: Vec<_> = reqs
-            .into_iter()
-            .filter_map(|mut r| {
-                let pv = r.pv?;
-                r.pv = Some(archiver_core::registry::normalize_pv_name(&pv).to_string());
-                Some(r)
-            })
-            .collect();
+        // Don't normalize away the `pva://` / `ca://` prefix here — the
+        // bulk handler re-parses the raw name with `parse_pv_with_protocol`
+        // so protocol info survives as far as the engine.
+        let reqs: Vec<_> = reqs.into_iter().filter(|r| r.pv.is_some()).collect();
         if !reqs.is_empty() {
             return bulk_archive_requests(&state, &reqs, &headers).await;
         }
@@ -130,11 +126,16 @@ async fn bulk_archive_requests(
 
     // Archive local PVs.
     for req in &local_reqs {
-        let Some(pv) = req.pv.as_deref() else {
+        let Some(pv_raw) = req.pv.as_deref() else {
             continue;
         };
+        let (protocol, pv) = archiver_core::registry::parse_pv_with_protocol(pv_raw);
         let sample_mode = parse_sample_mode(req.sampling_method.as_deref(), req.sampling_period);
-        let status = match state.archiver_cmd.archive_pv(pv, &sample_mode).await {
+        let status = match state
+            .archiver_cmd
+            .archive_pv(pv, &sample_mode, protocol)
+            .await
+        {
             Ok(()) => "Archive request submitted".to_string(),
             Err(e) => {
                 tracing::warn!(pv, "Failed to archive: {e}");
@@ -233,6 +234,7 @@ async fn archive_single_pv(
     state: &AppState,
     pv: &str,
     sample_mode: &SampleMode,
+    protocol: archiver_core::registry::Protocol,
     appliance: Option<&str>,
     headers: &HeaderMap,
 ) -> Response {
@@ -284,8 +286,13 @@ async fn archive_single_pv(
         }
     }
 
-    match crate::usecases::archive_pv::archive_pv(state.archiver_cmd.as_ref(), pv, sample_mode)
-        .await
+    match crate::usecases::archive_pv::archive_pv(
+        state.archiver_cmd.as_ref(),
+        pv,
+        sample_mode,
+        protocol,
+    )
+    .await
     {
         Ok(msg) => msg.into_response(),
         Err(e) => e.into_response(),

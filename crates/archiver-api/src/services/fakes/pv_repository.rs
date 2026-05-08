@@ -221,6 +221,7 @@ impl PvCommandRepository for InMemoryPvRepository {
             alias_for: None,
             archive_fields: Vec::new(),
             policy_name: None,
+            protocol: archiver_core::registry::Protocol::Ca,
         };
         self.pvs.lock().unwrap().insert(pv.to_string(), record);
         Ok(())
@@ -304,6 +305,7 @@ impl PvCommandRepository for InMemoryPvRepository {
             alias_for: alias_for.map(|s| s.to_string()),
             archive_fields: archive_fields.to_vec(),
             policy_name: policy_name.map(|s| s.to_string()),
+            protocol: archiver_core::registry::Protocol::Ca,
         };
         self.pvs.lock().unwrap().insert(pv.to_string(), record);
         Ok(())
@@ -362,6 +364,7 @@ impl PvCommandRepository for InMemoryPvRepository {
             alias_for: Some(target.to_string()),
             archive_fields: Vec::new(),
             policy_name: None,
+            protocol: archiver_core::registry::Protocol::Ca,
         };
         lock.insert(alias.to_string(), row);
         Ok(())

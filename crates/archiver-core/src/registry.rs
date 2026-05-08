@@ -13,6 +13,36 @@ use tracing::info;
 
 use crate::types::ArchDbType;
 
+/// Wire protocol the engine should use when subscribing to a PV.
+///
+/// Selected from a `pva://` / `ca://` prefix on the user-supplied name.
+/// Unprefixed names default to [`Protocol::Ca`] for Java EAA parity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Protocol {
+    /// Channel Access (the original EPICS protocol).
+    #[default]
+    Ca,
+    /// pvAccess (structured types, larger payloads).
+    Pva,
+}
+
+impl Protocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::Ca => "ca",
+            Protocol::Pva => "pva",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ca" => Some(Protocol::Ca),
+            "pva" => Some(Protocol::Pva),
+            _ => None,
+        }
+    }
+}
+
 /// Canonicalize a user-supplied PV name to the form the registry stores.
 ///
 /// Java archiver's `PVNames.normalizeChannelName` + `stripPrefixFromName`:
@@ -27,6 +57,18 @@ pub fn normalize_pv_name(name: &str) -> &str {
         .or_else(|| name.strip_prefix("ca://"))
         .unwrap_or(name);
     name.strip_suffix(".VAL").unwrap_or(name)
+}
+
+/// Like [`normalize_pv_name`] but also reports the protocol the prefix
+/// asked for. Returns `(Protocol::Ca, name)` when no prefix is present.
+pub fn parse_pv_with_protocol(name: &str) -> (Protocol, &str) {
+    if let Some(rest) = name.strip_prefix("pva://") {
+        (Protocol::Pva, rest.strip_suffix(".VAL").unwrap_or(rest))
+    } else if let Some(rest) = name.strip_prefix("ca://") {
+        (Protocol::Ca, rest.strip_suffix(".VAL").unwrap_or(rest))
+    } else {
+        (Protocol::Ca, name.strip_suffix(".VAL").unwrap_or(name))
+    }
 }
 
 /// Strip a trailing `.<FIELD>` suffix (e.g. `.HIHI`, `.LOLO`, `.DESC`) from
@@ -185,6 +227,10 @@ pub struct PvRecord {
     pub archive_fields: Vec<String>,
     /// Name of the policy that selected this PV's sampling configuration.
     pub policy_name: Option<String>,
+    /// Wire protocol the engine subscribes with — selected from the
+    /// `pva://` / `ca://` prefix at archive_pv time. Defaults to
+    /// [`Protocol::Ca`] for legacy rows.
+    pub protocol: Protocol,
 }
 
 /// SQLite-backed PV metadata registry.
@@ -239,7 +285,8 @@ impl PvRegistry {
                 egu             TEXT,
                 alias_for       TEXT,
                 archive_fields  TEXT,
-                policy_name     TEXT
+                policy_name     TEXT,
+                protocol        TEXT NOT NULL DEFAULT 'ca'
             );
 
             CREATE INDEX IF NOT EXISTS idx_pv_status ON pv_info(status);
@@ -256,6 +303,7 @@ impl PvRegistry {
             "ALTER TABLE pv_info ADD COLUMN alias_for TEXT",
             "ALTER TABLE pv_info ADD COLUMN archive_fields TEXT",
             "ALTER TABLE pv_info ADD COLUMN policy_name TEXT",
+            "ALTER TABLE pv_info ADD COLUMN protocol TEXT NOT NULL DEFAULT 'ca'",
         ] {
             match conn.execute(stmt, []) {
                 Ok(_) => {}
@@ -273,13 +321,33 @@ impl PvRegistry {
         Ok(())
     }
 
-    /// Register a new PV for archiving.
+    /// Register a new PV for archiving with default CA protocol.
+    /// Backwards-compatible wrapper around [`register_pv_with_protocol`].
     pub fn register_pv(
         &self,
         pv_name: &str,
         dbr_type: ArchDbType,
         sample_mode: &SampleMode,
         element_count: i32,
+    ) -> anyhow::Result<()> {
+        self.register_pv_with_protocol(
+            pv_name,
+            dbr_type,
+            sample_mode,
+            element_count,
+            Protocol::Ca,
+        )
+    }
+
+    /// Register a new PV for archiving, recording which wire protocol the
+    /// engine should use (CA vs PVA).
+    pub fn register_pv_with_protocol(
+        &self,
+        pv_name: &str,
+        dbr_type: ArchDbType,
+        sample_mode: &SampleMode,
+        element_count: i32,
+        protocol: Protocol,
     ) -> anyhow::Result<()> {
         if !is_valid_pv_name(pv_name) {
             anyhow::bail!("invalid PV name: {pv_name:?}");
@@ -290,9 +358,9 @@ impl PvRegistry {
 
         conn.execute(
             "INSERT OR REPLACE INTO pv_info
-             (pv_name, dbr_type, sample_mode, sample_period, status, element_count, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5, COALESCE((SELECT created_at FROM pv_info WHERE pv_name = ?1), ?6), ?6)",
-            params![pv_name, dbr_type as i32, mode_str, period, element_count, now],
+             (pv_name, dbr_type, sample_mode, sample_period, status, element_count, created_at, updated_at, protocol)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, COALESCE((SELECT created_at FROM pv_info WHERE pv_name = ?1), ?6), ?6, ?7)",
+            params![pv_name, dbr_type as i32, mode_str, period, element_count, now, protocol.as_str()],
         )?;
         Ok(())
     }
@@ -337,7 +405,7 @@ impl PvRegistry {
         conn.query_row(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
                     last_timestamp, created_at, updated_at, prec, egu,
-                    alias_for, archive_fields, policy_name
+                    alias_for, archive_fields, policy_name, protocol
              FROM pv_info WHERE pv_name = ?1",
             params![pv_name],
             row_to_record,
@@ -365,7 +433,7 @@ impl PvRegistry {
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
                     last_timestamp, created_at, updated_at, prec, egu,
-                    alias_for, archive_fields, policy_name
+                    alias_for, archive_fields, policy_name, protocol
              FROM pv_info WHERE status = ?1 ORDER BY pv_name",
         )?;
         let records = stmt
@@ -447,7 +515,7 @@ impl PvRegistry {
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
                     last_timestamp, created_at, updated_at, prec, egu,
-                    alias_for, archive_fields, policy_name
+                    alias_for, archive_fields, policy_name, protocol
              FROM pv_info WHERE created_at >= ?1 AND alias_for IS NULL
              ORDER BY created_at DESC",
         )?;
@@ -464,7 +532,7 @@ impl PvRegistry {
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
                     last_timestamp, created_at, updated_at, prec, egu,
-                    alias_for, archive_fields, policy_name
+                    alias_for, archive_fields, policy_name, protocol
              FROM pv_info WHERE updated_at >= ?1 AND alias_for IS NULL
              ORDER BY updated_at DESC",
         )?;
@@ -502,8 +570,8 @@ impl PvRegistry {
         Ok(rows > 0)
     }
 
-    /// Import a PV with all fields in a single SQL operation.
-    /// Used during config import to atomically set status, created_at, and metadata.
+    /// Import a PV with default CA protocol — backwards-compatible
+    /// wrapper around [`import_pv_with_protocol`].
     #[allow(clippy::too_many_arguments)]
     pub fn import_pv(
         &self,
@@ -518,6 +586,40 @@ impl PvRegistry {
         alias_for: Option<&str>,
         archive_fields: &[String],
         policy_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.import_pv_with_protocol(
+            pv_name,
+            dbr_type,
+            sample_mode,
+            element_count,
+            status,
+            created_at,
+            prec,
+            egu,
+            alias_for,
+            archive_fields,
+            policy_name,
+            Protocol::Ca,
+        )
+    }
+
+    /// Import a PV with all fields in a single SQL operation.
+    /// Used during config import to atomically set status, created_at, and metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_pv_with_protocol(
+        &self,
+        pv_name: &str,
+        dbr_type: ArchDbType,
+        sample_mode: &SampleMode,
+        element_count: i32,
+        status: PvStatus,
+        created_at: Option<&str>,
+        prec: Option<&str>,
+        egu: Option<&str>,
+        alias_for: Option<&str>,
+        archive_fields: &[String],
+        policy_name: Option<&str>,
+        protocol: Protocol,
     ) -> anyhow::Result<()> {
         if !is_valid_pv_name(pv_name) {
             anyhow::bail!("invalid PV name: {pv_name:?}");
@@ -540,8 +642,8 @@ impl PvRegistry {
         conn.execute(
             "INSERT OR REPLACE INTO pv_info
              (pv_name, dbr_type, sample_mode, sample_period, status, element_count,
-              created_at, updated_at, prec, egu, alias_for, archive_fields, policy_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              created_at, updated_at, prec, egu, alias_for, archive_fields, policy_name, protocol)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 pv_name,
                 dbr_type as i32,
@@ -556,6 +658,7 @@ impl PvRegistry {
                 alias_for,
                 archive_fields_json,
                 policy_name,
+                protocol.as_str(),
             ],
         )?;
         Ok(())
@@ -723,7 +826,7 @@ impl PvRegistry {
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
                     last_timestamp, created_at, updated_at, prec, egu,
-                    alias_for, archive_fields, policy_name
+                    alias_for, archive_fields, policy_name, protocol
              FROM pv_info ORDER BY pv_name",
         )?;
         let records = stmt
@@ -744,7 +847,7 @@ impl PvRegistry {
         let mut stmt = conn.prepare(
             "SELECT pv_name, dbr_type, sample_mode, sample_period, status, element_count,
                     last_timestamp, created_at, updated_at, prec, egu,
-                    alias_for, archive_fields, policy_name
+                    alias_for, archive_fields, policy_name, protocol
              FROM pv_info WHERE last_timestamp IS NOT NULL AND last_timestamp < ?1
                             AND alias_for IS NULL
              ORDER BY last_timestamp ASC",
@@ -771,6 +874,13 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<PvRecord> {
     let alias_for: Option<String> = row.get(11).unwrap_or(None);
     let archive_fields_json: Option<String> = row.get(12).unwrap_or(None);
     let policy_name: Option<String> = row.get(13).unwrap_or(None);
+    // Column 14 ("protocol") may be absent on a row written by an
+    // older archiver — `unwrap_or(None)` falls back to default Ca.
+    let protocol_str: Option<String> = row.get(14).unwrap_or(None);
+    let protocol = protocol_str
+        .as_deref()
+        .and_then(Protocol::parse)
+        .unwrap_or_default();
 
     let last_timestamp = last_ts_str.and_then(|s| {
         DateTime::parse_from_rfc3339(&s)
@@ -801,6 +911,7 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<PvRecord> {
         alias_for,
         archive_fields,
         policy_name,
+        protocol,
     })
 }
 

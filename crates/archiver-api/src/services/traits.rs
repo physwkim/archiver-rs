@@ -118,7 +118,12 @@ pub struct PvCountersDto {
 
 #[async_trait]
 pub trait ArchiverCommand: Send + Sync {
-    async fn archive_pv(&self, pv: &str, mode: &SampleMode) -> anyhow::Result<()>;
+    async fn archive_pv(
+        &self,
+        pv: &str,
+        mode: &SampleMode,
+        protocol: archiver_core::registry::Protocol,
+    ) -> anyhow::Result<()>;
     async fn pause_pv(&self, pv: &str) -> anyhow::Result<()>;
     async fn resume_pv(&self, pv: &str) -> anyhow::Result<()>;
     async fn stop_pv(&self, pv: &str) -> anyhow::Result<()>;

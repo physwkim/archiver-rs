@@ -69,7 +69,12 @@ pub async fn append_and_alias_pv(
     }
 
     let mode = parse_sample_mode(q.samplingmethod.as_deref(), q.samplingperiod);
-    if let Err(e) = state.archiver_cmd.archive_pv(&q.pv, &mode).await {
+    let (protocol, pv_norm) = archiver_core::registry::parse_pv_with_protocol(&q.pv);
+    if let Err(e) = state
+        .archiver_cmd
+        .archive_pv(pv_norm, &mode, protocol)
+        .await
+    {
         return ApiError::internal(e).into_response();
     }
     if let Err(e) = state.pv_cmd.add_alias(&q.aliasname, &q.pv) {
