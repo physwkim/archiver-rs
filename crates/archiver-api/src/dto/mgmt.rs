@@ -160,6 +160,11 @@ pub struct PvTypeInfoResponse {
     pub archive_fields: Vec<String>,
     #[serde(rename = "policyName", skip_serializing_if = "Option::is_none")]
     pub policy_name: Option<String>,
+    /// Wire protocol the engine subscribes with for this PV — `"ca"`
+    /// or `"pva"`. Surfaces the registry's protocol column so a
+    /// dashboard can show `ca://mini:current` vs `pva://mini:current`
+    /// without re-deriving from the original archivePV request.
+    pub protocol: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -271,5 +276,6 @@ pub fn record_to_type_info_with_name(
         alias_for: r.alias_for.clone(),
         archive_fields: r.archive_fields.clone(),
         policy_name: r.policy_name.clone(),
+        protocol: r.protocol.as_str().to_string(),
     }
 }

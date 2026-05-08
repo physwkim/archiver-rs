@@ -284,8 +284,10 @@ async function showPvDetail(pv) {
     const r = await api('getPVDetails?pv=' + encodeURIComponent(pv));
     const d = await r.json();
     let html = '';
+    const proto = (d.protocol || 'ca').toLowerCase();
     const fields = [
       ['Status', statusBadge(d.status)],
+      ['Protocol', `${proto}://${esc(d.pvName || '')}`],
       ['DBR Type', d.DBRType],
       ['Sampling Method', d.samplingMethod],
       ['Sampling Period', d.samplingPeriod],
