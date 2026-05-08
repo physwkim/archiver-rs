@@ -29,6 +29,11 @@ struct CachedWriter {
     /// across every cached writer (Java parity is similar — the
     /// `dirty` bit short-circuits the iteration).
     dirty: bool,
+    /// Last access timestamp — the LRU key used by the EMFILE /
+    /// ENFILE recovery path: when `open` returns "too many open
+    /// files", the writer with the smallest `last_used` is evicted
+    /// to free a descriptor and the open is retried.
+    last_used: SystemTime,
 }
 
 /// Wraps a `PbFileReader` and clamps emitted samples to `[start, end]`.
@@ -148,16 +153,14 @@ impl PlainPbStoragePlugin {
     /// because `list_files_for_range` walks the directory). Safe no-op
     /// when nothing matches. Returns true if a writer was evicted.
     pub fn evict_writer_for_path(&self, path: &Path) -> bool {
-        let mut cache = match self.write_cache.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!(
-                    ?path,
-                    "write cache poisoned during evict_writer_for_path: {e}"
-                );
-                return false;
-            }
-        };
+        // Recover from poison rather than skip the eviction — the
+        // contract is "after this returns, no future write goes
+        // through the cached writer for `path`", and a poisoned
+        // mutex shouldn't be a way to break that invariant.
+        let mut cache = self.write_cache.lock().unwrap_or_else(|e| {
+            tracing::warn!(?path, "write cache poisoned at evict_writer_for_path: {e}");
+            e.into_inner()
+        });
         let to_remove: Vec<String> = cache
             .iter()
             .filter(|(_, c)| c.path == path)
@@ -176,10 +179,14 @@ impl PlainPbStoragePlugin {
     fn ensure_parent_dir(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             let needs_create = {
+                // Recover from poison: known_dirs mutations are
+                // single-statement HashSet inserts, so a panicking
+                // thread can't leave half-modified state. Better to
+                // proceed than fail every future write_cached call.
                 let dirs = self
                     .known_dirs
                     .lock()
-                    .map_err(|e| anyhow::anyhow!("dir cache poisoned: {e}"))?;
+                    .unwrap_or_else(|e| e.into_inner());
                 !dirs.contains(parent)
             };
             if needs_create {
@@ -187,7 +194,7 @@ impl PlainPbStoragePlugin {
                 let mut dirs = self
                     .known_dirs
                     .lock()
-                    .map_err(|e| anyhow::anyhow!("dir cache poisoned: {e}"))?;
+                    .unwrap_or_else(|e| e.into_inner());
                 dirs.insert(parent.to_path_buf());
             }
         }
@@ -206,10 +213,9 @@ impl PlainPbStoragePlugin {
         let sample_bytes = writer::encode_sample(dbr_type, sample)?;
         let escaped_sample = codec::escape(&sample_bytes);
 
-        let mut cache = self
-            .write_cache
-            .lock()
-            .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
+        // Recover from poison: cache mutations are atomic at the
+        // HashMap level, so post-panic state stays internally consistent.
+        let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
 
         let path_buf = path.to_path_buf();
 
@@ -249,10 +255,30 @@ impl PlainPbStoragePlugin {
 
         if !cache.contains_key(pv) {
             let needs_header = file_needs_header(path);
-            let file = std::fs::OpenOptions::new()
+            // Open with EMFILE/ENFILE recovery: if the OS file-handle
+            // table is exhausted, evict our LRU cached writer to free
+            // a descriptor and retry once. Without this, every
+            // subsequent write fails until a writer is naturally
+            // evicted (e.g. by partition rollover hours later).
+            let file = match std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)?;
+                .open(path)
+            {
+                Ok(f) => f,
+                Err(e) if is_too_many_open_files(&e) && evict_lru_writer(&mut cache) => {
+                    tracing::warn!(
+                        ?path,
+                        "Hit OS file-handle limit; evicted LRU writer and \
+                         retrying open"
+                    );
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)?
+                }
+                Err(e) => return Err(e.into()),
+            };
             let mut bw = BufWriter::with_capacity(64 * 1024, file);
 
             if needs_header {
@@ -287,11 +313,13 @@ impl PlainPbStoragePlugin {
                     // and then receives no further samples within a
                     // flush_period would never persist its header.
                     dirty: true,
+                    last_used: SystemTime::now(),
                 },
             );
         }
 
         let cached = cache.get_mut(pv).expect("just inserted");
+        cached.last_used = SystemTime::now();
         // Atomic-at-buffer-layer sample frame: a single `write_all`
         // means the BufWriter never splits the sample/newline pair
         // across two internal flushes. OS-level write atomicity is
@@ -303,6 +331,40 @@ impl PlainPbStoragePlugin {
         cached.writer.write_all(&frame)?;
         cached.dirty = true;
         Ok(())
+    }
+}
+
+/// True iff `e` corresponds to a POSIX EMFILE (per-process fd limit)
+/// or ENFILE (system-wide fd limit). Used by write_cached's open
+/// retry to distinguish recoverable resource exhaustion from real
+/// filesystem errors. Codes are POSIX-standard (Linux + macOS:
+/// EMFILE=24, ENFILE=23).
+fn is_too_many_open_files(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(23) | Some(24))
+}
+
+/// Evict the cached writer with the oldest `last_used` to free a
+/// file descriptor. Returns `true` when something was evicted (caller
+/// should retry the failed open), `false` when the cache was empty
+/// (nothing to evict, fail through).
+fn evict_lru_writer(cache: &mut HashMap<String, CachedWriter>) -> bool {
+    let oldest_pv = cache
+        .iter()
+        .min_by_key(|(_, c)| c.last_used)
+        .map(|(pv, _)| pv.clone());
+    match oldest_pv {
+        Some(pv) => {
+            if let Some(mut cached) = cache.remove(&pv) {
+                let _ = cached.writer.flush();
+                tracing::debug!(
+                    pv,
+                    path = ?cached.path,
+                    "LRU evicted to recover file descriptor"
+                );
+            }
+            true
+        }
+        None => false,
     }
 }
 
@@ -340,7 +402,63 @@ fn file_needs_header(path: &Path) -> bool {
         }
         return true;
     }
+    // Header is valid; defend against a tail with a partial sample
+    // (writer killed mid-flush). Truncating to the last NEWLINE
+    // boundary loses at most one record but keeps the file readable
+    // — without this, a reader hits the partial record and stops
+    // returning every sample after that point.
+    if let Err(e) = trim_to_last_newline(path) {
+        tracing::warn!(?path, "Failed to trim partial trailing record: {e}");
+    }
     false
+}
+
+/// Truncate `path` to end at its last NEWLINE byte (inclusive). Used
+/// to drop a partial sample frame at file tail after a crash.
+fn trim_to_last_newline(path: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    // If the very last byte is already a NEWLINE, nothing to trim.
+    file.seek(SeekFrom::End(-1))?;
+    let mut tail = [0u8; 1];
+    file.read_exact(&mut tail)?;
+    if tail[0] == codec::NEWLINE {
+        return Ok(());
+    }
+    // Scan backwards in chunks for the last NEWLINE.
+    const CHUNK: usize = 4096;
+    let mut buf = vec![0u8; CHUNK];
+    let mut window_end = len;
+    while window_end > 0 {
+        let read_len = (window_end as usize).min(CHUNK);
+        let read_start = window_end - read_len as u64;
+        file.seek(SeekFrom::Start(read_start))?;
+        file.read_exact(&mut buf[..read_len])?;
+        if let Some(idx) = buf[..read_len].iter().rposition(|&b| b == codec::NEWLINE) {
+            let new_len = read_start + idx as u64 + 1;
+            tracing::warn!(
+                ?path,
+                old_len = len,
+                new_len,
+                "Trimming partial trailing PB record"
+            );
+            file.set_len(new_len)?;
+            return Ok(());
+        }
+        window_end = read_start;
+    }
+    // No NEWLINE anywhere — file is just one giant un-terminated
+    // record (or single header line that didn't get its newline).
+    // Leave as-is; truncation here would be more destructive than
+    // the corruption we're trying to fix.
+    Ok(())
 }
 
 /// Convert PV name to file path key.
@@ -677,10 +795,9 @@ impl StoragePlugin for PlainPbStoragePlugin {
     }
 
     async fn flush_writes(&self) -> anyhow::Result<()> {
-        let mut cache = self
-            .write_cache
-            .lock()
-            .map_err(|e| anyhow::anyhow!("write cache poisoned: {e}"))?;
+        // Recover from poison: cache mutations are atomic at the
+        // HashMap level, so post-panic state stays internally consistent.
+        let mut cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut to_remove = Vec::new();
         for (pv, cached) in cache.iter_mut() {
             // Skip writers with nothing pending — every `get_data`
@@ -694,6 +811,11 @@ impl StoragePlugin for PlainPbStoragePlugin {
                 Ok(()) => cached.dirty = false,
                 Err(e) => {
                     tracing::warn!(pv, path = ?cached.path, "Failed to flush cached writer: {e}");
+                    metrics::counter!(
+                        "archiver_pb_flush_failures_total",
+                        "tier" => self.plugin_name.clone(),
+                    )
+                    .increment(1);
                     to_remove.push(pv.clone());
                 }
             }
