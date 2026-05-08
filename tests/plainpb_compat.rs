@@ -3,7 +3,7 @@
 use std::time::SystemTime;
 
 use archiver_core::storage::partition::PartitionGranularity;
-use archiver_core::storage::plainpb::PlainPbStoragePlugin;
+use archiver_core::storage::plainpb::{FdBudget, PlainPbStoragePlugin};
 use archiver_core::storage::plainpb::codec;
 use archiver_core::storage::traits::StoragePlugin;
 use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
@@ -637,15 +637,424 @@ async fn injection_ingest_flush_returns_empty_vec_on_success() {
             .unwrap();
     }
 
-    let failed = plugin.flush_ingest_writes().await.unwrap();
+    let outcome = plugin.flush_ingest_writes().await.unwrap();
     assert!(
-        failed.is_empty(),
-        "all healthy writers should flush; got failed: {failed:?}"
+        outcome.failed.is_empty() && outcome.deferred.is_empty(),
+        "all healthy writers should flush; got failed={:?} deferred={:?}",
+        outcome.failed,
+        outcome.deferred,
     );
 
     // Subsequent flush after no new writes — dirty bit clean, still
-    // Ok(empty). Validates that successful flush clears the dirty
-    // flag so the next flush doesn't touch healthy writers again.
-    let failed = plugin.flush_ingest_writes().await.unwrap();
-    assert!(failed.is_empty());
+    // empty failed/deferred. Validates that successful flush clears
+    // the dirty flag so the next flush doesn't touch healthy writers
+    // again.
+    let outcome = plugin.flush_ingest_writes().await.unwrap();
+    assert!(outcome.failed.is_empty() && outcome.deferred.is_empty());
+}
+
+#[tokio::test]
+async fn fd_cap_strict_under_concurrent_appends() {
+    // Atomic CAS reservation: with cap=4 and 32 concurrent
+    // appends to distinct PVs, `open_writer_count` must NEVER
+    // exceed 4 mid-flight (the old fetch_add path could blow
+    // through the cap by N concurrent reservations).
+    use std::sync::Arc;
+    let dir = temp_dir();
+    let plugin = Arc::new(PlainPbStoragePlugin::with_max_open_writers(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+        4,
+    ));
+
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap().into();
+
+    let mut joins = Vec::new();
+    for i in 0..32u32 {
+        let plugin = plugin.clone();
+        let pv = format!("TEST:CapPv{i}");
+        joins.push(tokio::spawn(async move {
+            let s = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(i as f64));
+            plugin
+                .append_event(&pv, ArchDbType::ScalarDouble, &s)
+                .await
+                .unwrap();
+        }));
+    }
+    for j in joins {
+        j.await.unwrap();
+    }
+
+    // After all appends settle, the open count must be at the cap.
+    // The strict invariant we care about is "never exceeded the cap"
+    // — if any reservation had blown past it, the runtime open
+    // count would visibly hit 5+ at some point. Without a sampling
+    // probe we can at minimum assert the post-condition.
+    assert!(
+        plugin.open_writer_count() <= 4,
+        "open_writer_count exceeded cap: {} > 4",
+        plugin.open_writer_count()
+    );
+
+    // Sanity: every PV's data made it to disk despite the LRU
+    // churn from the cap.
+    let outcome = plugin.flush_ingest_writes().await.unwrap();
+    // Some may have been LRU-evicted before flush; that's fine —
+    // their bytes were flushed at eviction time. Failed list must
+    // stay empty (we have a healthy filesystem in tests).
+    assert!(
+        outcome.failed.is_empty(),
+        "no PV should be in failed under healthy fs: {:?}",
+        outcome.failed
+    );
+}
+
+/// Principle 4 — flush truth. A bare `BufWriter::flush()` on a
+/// writer whose underlying file has been unlinked still returns
+/// Ok (bytes go into the page cache for the deleted inode), but
+/// readers will never see them. `flush_dirty_writers` must check
+/// `path.exists()` after the flush and downgrade the writer to
+/// loss when the file is gone — otherwise the flush owner would
+/// commit a stale `last_event` for bytes that no reader can ever
+/// see.
+#[tokio::test]
+async fn flush_to_deleted_inode_records_loss() {
+    let dir = temp_dir();
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 9, 7, 12, 0, 0).unwrap().into();
+    let pv = "TEST:DeletedInode";
+    plugin
+        .append_event(
+            pv,
+            ArchDbType::ScalarDouble,
+            &ArchiverSample::new(ts, ArchiverValue::ScalarDouble(1.0)),
+        )
+        .await
+        .unwrap();
+
+    // Externally delete the file while the writer's fd stays
+    // open. A flush via the open fd will succeed at the syscall
+    // level — but the bytes are not reader-visible.
+    let path = plugin.file_path_for(pv, ts);
+    std::fs::remove_file(&path).unwrap();
+
+    // flush_ingest_writes must catch this via the path.exists()
+    // check and surface PV in failed (bytes lost) rather than
+    // silently mark the writer clean.
+    let outcome = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        outcome.failed.iter().any(|p| p == pv),
+        "flush on a deleted inode must record loss; got failed={:?}",
+        outcome.failed
+    );
+}
+
+/// Ghost-file path: when a cached writer's underlying file
+/// disappears (deleted out from under us by ETL / manual `rm` /
+/// flaky NFS) and a subsequent append re-detects the absence,
+/// `drop_writer_file_gone` must record loss for the PV's dirty
+/// bytes. The next `flush_ingest_writes` surfaces the PV in
+/// `failed` so the global flush owner drops its ts_updates.
+#[tokio::test]
+async fn ghost_file_path_records_loss() {
+    let dir = temp_dir();
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+
+    let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap().into();
+    let ts2 = ts1 + std::time::Duration::from_secs(60);
+    let pv = "TEST:Ghost";
+
+    // First append leaves the writer dirty (BufWriter has bytes;
+    // no explicit flush yet).
+    let s1 = ArchiverSample::new(ts1, ArchiverValue::ScalarDouble(1.0));
+    plugin
+        .append_event(pv, ArchDbType::ScalarDouble, &s1)
+        .await
+        .unwrap();
+
+    // External delete of the on-disk file. `drop_writer_file_gone`
+    // will fire the next time write_cached probes the path.
+    let path = plugin.file_path_for(pv, ts1);
+    std::fs::remove_file(&path).unwrap();
+
+    // Second append: ghost-file branch detects the missing file,
+    // calls drop_writer_file_gone (dirty=true → loss marker).
+    let s2 = ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(2.0));
+    plugin
+        .append_event(pv, ArchDbType::ScalarDouble, &s2)
+        .await
+        .unwrap();
+
+    // Loss marker surfaces via the next ingest flush.
+    let outcome = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        outcome.failed.iter().any(|p| p == pv),
+        "ghost-file path must record loss for {pv}; got failed={:?}",
+        outcome.failed
+    );
+}
+
+/// `evict_writer_for_path`: when ETL removes a `.pb` file and
+/// then evicts its writer, dirty bytes must surface as loss.
+/// Mirrors the ghost-file path but with the writer eviction
+/// driven by an explicit caller rather than detected on next
+/// append.
+#[tokio::test]
+async fn evict_writer_for_path_records_loss_when_dirty() {
+    let dir = temp_dir();
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap().into();
+    let pv = "TEST:EvictByPath";
+    let s = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(1.0));
+    plugin
+        .append_event(pv, ArchDbType::ScalarDouble, &s)
+        .await
+        .unwrap();
+    let path = plugin.file_path_for(pv, ts);
+
+    // ETL caller has just `remove_file`-d the path and now wants
+    // to drop the cached writer.
+    std::fs::remove_file(&path).unwrap();
+    assert!(plugin.evict_writer_for_path(&path));
+
+    // Loss marker on the next ingest flush.
+    let outcome = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        outcome.failed.iter().any(|p| p == pv),
+        "evict_writer_for_path must record loss for dirty writer; got failed={:?}",
+        outcome.failed
+    );
+}
+
+/// `delete_pv_data` records loss for any dirty bytes (file is
+/// about to be deleted; flushing is wasted) AND closes the
+/// concurrent-append race by tombstoning the slot in the cache
+/// during the file-removal window.
+#[tokio::test]
+async fn delete_pv_data_records_loss_and_tombstones() {
+    let dir = temp_dir();
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap().into();
+    let pv = "TEST:Delete";
+    let s = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(1.0));
+    plugin
+        .append_event(pv, ArchDbType::ScalarDouble, &s)
+        .await
+        .unwrap();
+
+    plugin.delete_pv_data(pv).await.unwrap();
+
+    // Loss marker for the dirty writer's bytes.
+    let outcome = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        outcome.failed.iter().any(|p| p == pv),
+        "delete_pv_data must record loss for dirty writer; got failed={:?}",
+        outcome.failed
+    );
+
+    // Phase 3 cleanup: the tombstone slot was removed from the
+    // cache, so a fresh append after delete_pv_data succeeds
+    // (slot_for inserts a fresh non-dead slot). This proves the
+    // tombstone doesn't permanently block legitimate re-archives.
+    let ts2: SystemTime = Utc.with_ymd_and_hms(2026, 9, 3, 13, 0, 0).unwrap().into();
+    let s2 = ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(2.0));
+    plugin
+        .append_event(pv, ArchDbType::ScalarDouble, &s2)
+        .await
+        .expect("post-delete append should succeed on a fresh slot");
+}
+
+/// `rename_pv` source: dirty writer for `from` flushes
+/// successfully (healthy fs), so no loss marker. Verifies the
+/// happy path (loss-on-flush-failure variant requires fault
+/// injection and is exercised by the helper's contract).
+#[tokio::test]
+async fn rename_pv_flushes_source_writer_cleanly() {
+    let dir = temp_dir();
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap().into();
+    let from = "TEST:RenameFrom";
+    let to = "TEST:RenameTo";
+    let s = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(1.0));
+    plugin
+        .append_event(from, ArchDbType::ScalarDouble, &s)
+        .await
+        .unwrap();
+
+    let moved = plugin.rename_pv(from, to).await.unwrap();
+    assert!(moved >= 1, "rename should have moved at least one file");
+
+    // Healthy fs: flush succeeds during drop_dirty_writer, no
+    // loss marker. The next ingest flush has empty failed.
+    let outcome = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        !outcome.failed.iter().any(|p| p == from),
+        "healthy rename must not record loss for source; got failed={:?}",
+        outcome.failed
+    );
+
+    // The renamed file must be readable under `to`.
+    let dest_path = plugin.file_path_for(to, ts);
+    assert!(
+        dest_path.exists(),
+        "rename should have moved bytes to dest path: {dest_path:?}"
+    );
+}
+
+/// Partition rollover: when a sample's partition differs from
+/// the cached writer's path, write_cached calls drop_dirty_writer
+/// on the old writer. Healthy fs → flush succeeds, no loss marker.
+/// Together with the helper's flush-failure path (which records
+/// loss), this covers both branches of the partition-rollover
+/// dirty drop.
+#[tokio::test]
+async fn partition_rollover_clean_drop_no_loss() {
+    let dir = temp_dir();
+    let plugin = PlainPbStoragePlugin::new(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+    );
+
+    let pv = "TEST:Rollover";
+    // First sample in hour H.
+    let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 5, 12, 0, 0).unwrap().into();
+    plugin
+        .append_event(
+            pv,
+            ArchDbType::ScalarDouble,
+            &ArchiverSample::new(ts1, ArchiverValue::ScalarDouble(1.0)),
+        )
+        .await
+        .unwrap();
+
+    // Second sample in hour H+1 — different partition, triggers
+    // the rollover drop path on the cached writer for hour H.
+    let ts2: SystemTime = Utc.with_ymd_and_hms(2026, 9, 5, 13, 0, 0).unwrap().into();
+    plugin
+        .append_event(
+            pv,
+            ArchDbType::ScalarDouble,
+            &ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(2.0)),
+        )
+        .await
+        .unwrap();
+
+    // Healthy fs: rollover's drop_dirty_writer flushes cleanly,
+    // no loss marker.
+    let outcome = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        !outcome.failed.iter().any(|p| p == pv),
+        "healthy partition rollover must not record loss; got failed={:?}",
+        outcome.failed
+    );
+
+    // Both files must exist on disk.
+    assert!(plugin.file_path_for(pv, ts1).exists());
+    assert!(plugin.file_path_for(pv, ts2).exists());
+}
+
+#[tokio::test]
+async fn shared_fd_budget_caps_three_tiers_combined() {
+    // Process-wide fd cap: 3 plugins (STS / MTS / LTS) each
+    // drawing from a SHARED FdBudget(cap=4) must NOT collectively
+    // exceed 4 open writers. With LRU eviction, sequential appends
+    // to many distinct PVs across all 3 tiers can succeed while
+    // the live count stays at-or-below the shared cap.
+    use std::sync::Arc;
+    let dir = temp_dir();
+    let sts_dir = dir.path().join("sts");
+    let mts_dir = dir.path().join("mts");
+    let lts_dir = dir.path().join("lts");
+    std::fs::create_dir_all(&sts_dir).unwrap();
+    std::fs::create_dir_all(&mts_dir).unwrap();
+    std::fs::create_dir_all(&lts_dir).unwrap();
+
+    let shared = FdBudget::new(4);
+    let sts = Arc::new(PlainPbStoragePlugin::with_fd_budget(
+        "sts",
+        sts_dir,
+        PartitionGranularity::Hour,
+        shared.clone(),
+    ));
+    let mts = Arc::new(PlainPbStoragePlugin::with_fd_budget(
+        "mts",
+        mts_dir,
+        PartitionGranularity::Day,
+        shared.clone(),
+    ));
+    let lts = Arc::new(PlainPbStoragePlugin::with_fd_budget(
+        "lts",
+        lts_dir,
+        PartitionGranularity::Year,
+        shared.clone(),
+    ));
+
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap().into();
+
+    // Sequential appends across tiers: each new PV either fits
+    // under the cap or triggers an LRU eviction in whichever
+    // tier currently holds the oldest writer.
+    for round in 0..6 {
+        for tier_idx in 0..3 {
+            let tier: &PlainPbStoragePlugin = match tier_idx {
+                0 => &sts,
+                1 => &mts,
+                _ => &lts,
+            };
+            let pv = format!("TEST:T{tier_idx}Pv{round}");
+            let s = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(round as f64));
+            tier.append_event(&pv, ArchDbType::ScalarDouble, &s)
+                .await
+                .unwrap();
+            // Snapshot AFTER each append: the shared count must
+            // never have exceeded the cap during this append.
+            assert!(
+                shared.count() <= 4,
+                "shared FdBudget exceeded cap mid-append: count={} > 4 \
+                 (round={round} tier={tier_idx} pv={pv})",
+                shared.count()
+            );
+        }
+    }
+
+    // After 18 distinct-PV appends, the live count is at-most cap.
+    assert!(
+        shared.count() <= 4,
+        "shared FdBudget exceeded cap at end: {} > 4",
+        shared.count()
+    );
+    // Each tier reports the shared count.
+    assert_eq!(
+        sts.open_writer_count(),
+        shared.count(),
+        "sts.open_writer_count() should reflect the shared budget"
+    );
+    assert_eq!(mts.open_writer_count(), shared.count());
+    assert_eq!(lts.open_writer_count(), shared.count());
 }

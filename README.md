@@ -143,6 +143,12 @@ Navigate to `http://localhost:17665/mgmt/ui/` in your browser.
 | `tls` | object | *disabled* | TLS certificate configuration |
 | `api_keys` | string[] | *disabled* | API keys for write-endpoint authentication |
 
+### `[storage]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_open_writers_total` | usize | *unset* | Process-wide cap on simultaneously-open `BufWriter` handles, shared across STS/MTS/LTS. When set, all three tiers draw from a single fd permit pool — total open writers across the whole process stays ≤ this number, regardless of which tier is busy. Leave unset to give each tier its own per-tier cap. Set this when you've raised `ulimit -n` for a heavily-loaded site. |
+
 ### `[storage.sts]` / `[storage.mts]` / `[storage.lts]`
 
 | Field | Type | Default | Description |
@@ -151,6 +157,7 @@ Navigate to `http://localhost:17665/mgmt/ui/` in your browser.
 | `partition_granularity` | string | *required* | Time-based file partitioning |
 | `hold` | u32 | `5` | Partitions to keep before ETL moves data to the next tier |
 | `gather` | u32 | `3` | Partitions to move per ETL cycle |
+| `max_open_writers` | usize | STS=`512`, MTS=`64`, LTS=`64` | Per-tier cap on open `BufWriter` handles. Ignored when `storage.max_open_writers_total` is set. `0` disables the cap (lifts to `usize::MAX`). |
 
 **Partition granularity options:** `"5min"`, `"15min"`, `"30min"`, `"hour"`, `"day"`, `"month"`, `"year"`
 
@@ -163,8 +170,11 @@ Recommended setup:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `write_period_secs` | u64 | `10` | How often buffered samples flush to disk |
+| `write_period_secs` | u64 | `10` | Period (seconds) between ticker-driven flushes. The flush owner runs `flush_ingest_writes` + registry timestamp commit on this cadence regardless of sample arrival, so a PV that goes silent still gets its buffered bytes persisted. Must be > 0. |
 | `policy_file` | path | *none* | Path to PV policy TOML file |
+| `server_ioc_drift_secs` | u64 | `1800` | Maximum allowed drift (seconds) between IOC-reported sample timestamps and the appliance's wall clock. Samples outside ±this from `now` are dropped (Java parity `org.epics.archiverappliance.engine.epics.SERVER_IOC_DRIFT_SECONDS`). |
+| `write_shards` | usize | `1` | Number of parallel write-loop shards. `1` keeps the legacy single-worker layout. Sites with many active PVs and a fast STS can raise this to e.g. 4–16; the engine spawns a dispatcher that hashes `pv_name` → fixed shard (per-PV ordering preserved) and N parallel shard append workers feeding a single global flush owner that handles `flush_ingest_writes` + registry commits. Must be > 0. |
+| `per_shard_buffer` | usize | `4096` | mpsc capacity of each shard's input channel (only consulted when `write_shards > 1`). The dispatcher `try_send`s into each shard channel — when one shard is saturated, its overflow is dropped and recorded on the per-PV `buffer_overflow_drops` counter and the `archiver_dispatcher_shard_overflow_drops_total{shard=N}` metric, while OTHER shards keep flowing (per-shard isolation). |
 
 ### `[cluster]`
 

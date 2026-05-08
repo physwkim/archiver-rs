@@ -3,11 +3,29 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 
-use crate::config::StorageConfig;
+use crate::config::{StorageConfig, TierConfig};
 use crate::storage::partition::PartitionGranularity;
-use crate::storage::plainpb::PlainPbStoragePlugin;
+use crate::storage::plainpb::{FdBudget, PlainPbStoragePlugin};
 use crate::storage::traits::{AppendMeta, EventStream, StoragePlugin, StoreSummary};
 use crate::types::{ArchDbType, ArchiverSample};
+
+/// Per-tier defaults for the open-writer cap when neither
+/// [`StorageConfig::max_open_writers_total`] nor
+/// [`TierConfig::max_open_writers`] is set. STS gets the bulk
+/// because it's the live ingest path (every active PV gets a
+/// writer); MTS/LTS are ETL-side and only need a small concurrent
+/// working set.
+const STS_DEFAULT_FD_CAP: usize = 512;
+const MTS_DEFAULT_FD_CAP: usize = 64;
+const LTS_DEFAULT_FD_CAP: usize = 64;
+
+fn tier_fd_cap(tier: &TierConfig, default_cap: usize) -> usize {
+    match tier.max_open_writers {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => default_cap,
+    }
+}
 
 /// 3-tier storage manager: STS (short-term) → MTS (medium-term) → LTS (long-term).
 ///
@@ -21,21 +39,46 @@ pub struct TieredStorage {
 
 impl TieredStorage {
     pub fn from_config(config: &StorageConfig) -> Self {
+        // If the operator opted into a process-wide cap, build ONE
+        // shared FdBudget and clone it into every tier — STS, MTS,
+        // and LTS then draw permits from the same pool, so the
+        // total open-writer count across the whole process stays
+        // at-or-below the cap. Otherwise each tier gets its own
+        // budget at the per-tier configured (or default) cap.
+        let (sts_budget, mts_budget, lts_budget) = match config.max_open_writers_total {
+            Some(0) => (
+                FdBudget::unbounded(),
+                FdBudget::unbounded(),
+                FdBudget::unbounded(),
+            ),
+            Some(total) => {
+                let shared = FdBudget::new(total);
+                (shared.clone(), shared.clone(), shared)
+            }
+            None => (
+                FdBudget::new(tier_fd_cap(&config.sts, STS_DEFAULT_FD_CAP)),
+                FdBudget::new(tier_fd_cap(&config.mts, MTS_DEFAULT_FD_CAP)),
+                FdBudget::new(tier_fd_cap(&config.lts, LTS_DEFAULT_FD_CAP)),
+            ),
+        };
         Self {
-            sts: Arc::new(PlainPbStoragePlugin::new(
+            sts: Arc::new(PlainPbStoragePlugin::with_fd_budget(
                 "STS",
                 config.sts.root_folder.clone(),
                 config.sts.partition_granularity,
+                sts_budget,
             )),
-            mts: Arc::new(PlainPbStoragePlugin::new(
+            mts: Arc::new(PlainPbStoragePlugin::with_fd_budget(
                 "MTS",
                 config.mts.root_folder.clone(),
                 config.mts.partition_granularity,
+                mts_budget,
             )),
-            lts: Arc::new(PlainPbStoragePlugin::new(
+            lts: Arc::new(PlainPbStoragePlugin::with_fd_budget(
                 "LTS",
                 config.lts.root_folder.clone(),
                 config.lts.partition_granularity,
+                lts_budget,
             )),
         }
     }
@@ -160,13 +203,16 @@ impl StoragePlugin for TieredStorage {
         Ok(())
     }
 
-    async fn flush_ingest_writes(&self) -> anyhow::Result<Vec<String>> {
+    async fn flush_ingest_writes(
+        &self,
+    ) -> anyhow::Result<crate::storage::traits::IngestFlushResult> {
         // The engine's write_loop only writes to STS (see
         // `append_event_with_meta`); MTS/LTS writers exist only for
         // ETL. Limiting the ingest-path flush to STS prevents an
         // NFS-stalled long-term store from blocking live archiving.
-        // Per-PV failure list bubbles up so write_loop can drop
-        // those PVs from the pending-timestamp commit.
+        // Per-PV failure/deferred lists bubble up so write_loop can
+        // drop failures from the pending-timestamp commit and keep
+        // deferreds for the next cycle.
         self.sts.flush_ingest_writes().await
     }
 

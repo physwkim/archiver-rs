@@ -53,6 +53,15 @@ pub struct StorageConfig {
     pub sts: TierConfig,
     pub mts: TierConfig,
     pub lts: TierConfig,
+    /// Process-wide cap on open `BufWriter` file handles, shared
+    /// across STS / MTS / LTS. When `Some`, every tier's
+    /// PlainPbStoragePlugin draws from the SAME [`FdBudget`] —
+    /// total open writers across all 3 tiers stays at-or-below
+    /// this number, so the process cannot summed-overflow its
+    /// `ulimit -n` even when each tier is busy. When `None`, each
+    /// tier keeps its own per-tier cap (legacy behavior).
+    #[serde(default)]
+    pub max_open_writers_total: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +74,14 @@ pub struct TierConfig {
     /// Number of partitions to gather (move out) at once.
     #[serde(default = "default_gather")]
     pub gather: u32,
+    /// Per-tier cap on open `BufWriter` file handles. Only
+    /// consulted when [`StorageConfig::max_open_writers_total`] is
+    /// `None`; otherwise all tiers share the global budget. `0`
+    /// disables the cap (lifts to `usize::MAX`); `None` falls back
+    /// to a tier-appropriate default (STS: 512, MTS/LTS: 64 — STS
+    /// gets the bulk because it's the live ingest path).
+    #[serde(default)]
+    pub max_open_writers: Option<usize>,
 }
 
 fn default_hold() -> u32 {
@@ -99,10 +116,10 @@ pub struct EngineConfig {
     #[serde(default = "default_write_shards")]
     pub write_shards: usize,
     /// Per-shard mpsc capacity. Only consulted when `write_shards
-    /// > 1`. The dispatcher `send().await`s into each shard
-    /// channel, so a saturated shard back-pressures the upstream
-    /// main channel (which then makes producer `try_send` fail
-    /// with overflow drops).
+    /// > 1`. The dispatcher `try_send`s into each shard channel —
+    /// when a shard is saturated its overflow is dropped and
+    /// recorded on the per-PV `buffer_overflow_drops` counter,
+    /// while OTHER shards keep flowing (per-shard isolation).
     #[serde(default = "default_per_shard_buffer")]
     pub per_shard_buffer: usize,
 }
@@ -286,6 +303,24 @@ impl ArchiverConfig {
 
     /// Validate configuration values that TOML deserialization alone cannot check.
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.engine.write_period_secs == 0 {
+            // The write_loop drives flushes via tokio::time::interval,
+            // which panics on Duration::ZERO. The legacy elapsed-check
+            // tolerated 0 but the ticker path doesn't, so reject it
+            // at config load instead of letting the engine crash on
+            // first start. 1s is the smallest sensible value (sub-
+            // second flush rates serve no archiving purpose).
+            anyhow::bail!("engine.write_period_secs must be > 0");
+        }
+        if self.engine.write_shards == 0 {
+            anyhow::bail!("engine.write_shards must be > 0 (use 1 for the legacy single-worker layout)");
+        }
+        if self.engine.per_shard_buffer == 0 && self.engine.write_shards > 1 {
+            anyhow::bail!(
+                "engine.per_shard_buffer must be > 0 when write_shards > 1; \
+                 a 0-capacity shard channel would drop every sample"
+            );
+        }
         for (name, tier) in [
             ("sts", &self.storage.sts),
             ("mts", &self.storage.mts),

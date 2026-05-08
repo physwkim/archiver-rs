@@ -41,6 +41,30 @@ pub struct AppendMeta {
     pub headers: Vec<(String, String)>,
 }
 
+/// Outcome of a single `flush_ingest_writes` pass.
+///
+/// `failed` and `deferred` carry **different** semantics for callers
+/// like the engine's write_loop:
+///
+/// * **failed** — the flush errored for this PV; its buffered bytes
+///   have been discarded (writer evicted via `into_parts`). The
+///   caller MUST drop these from any pending timestamp commit AND
+///   from its `ts_updates` map so the registry doesn't claim
+///   `last_event` for samples that never reached disk.
+///
+/// * **deferred** — the writer's per-PV slot was already locked by
+///   an in-flight append. The bytes are still buffered and will be
+///   flushed on the next cycle. The caller MUST skip these from
+///   THIS cycle's commit but MUST keep them in `ts_updates` so the
+///   timestamp commits on a later cycle. Treating deferred as a
+///   permanent failure permanently loses the registry timestamp
+///   for any PV that gets busy and then goes silent.
+#[derive(Debug, Clone, Default)]
+pub struct IngestFlushResult {
+    pub failed: Vec<String>,
+    pub deferred: Vec<String>,
+}
+
 /// Storage plugin trait — the primary interface for reading/writing archived data.
 #[async_trait]
 pub trait StoragePlugin: Send + Sync {
@@ -111,28 +135,22 @@ pub trait StoragePlugin: Send + Sync {
     }
 
     /// Flush only the cached writers used by the *ingest* path (the
-    /// engine's monitor/scan write_loop), returning per-PV failures.
-    ///
-    /// Returns:
-    /// - `Ok(empty Vec)` — every dirty writer flushed cleanly. Caller
-    ///   may safely commit pending registry timestamps for ALL PVs.
-    /// - `Ok(non-empty Vec)` — listed PVs' flushes failed (their
-    ///   buffered bytes are lost, their cached writers were evicted).
-    ///   Caller MUST drop those PVs from any pending timestamp commit
-    ///   so the registry doesn't lie about `last_event` for samples
-    ///   that never reached disk.
-    /// - `Err(...)` — catastrophic / non-per-PV failure (e.g. lock
-    ///   poisoning beyond recovery). Caller should defer all timestamp
-    ///   commits for retry on the next cycle.
+    /// engine's monitor/scan write_loop). See [`IngestFlushResult`]
+    /// for the failed/deferred distinction — `failed` PVs lost
+    /// their buffered bytes, `deferred` PVs are still buffered and
+    /// must be retried on the next cycle.
     ///
     /// Multi-tier implementations should limit scope to the ingest
     /// tier (e.g. STS only) so a slow MTS/LTS mount can't stall the
     /// live archive pipeline. ETL drives MTS/LTS flushing separately.
-    async fn flush_ingest_writes(&self) -> anyhow::Result<Vec<String>> {
+    async fn flush_ingest_writes(&self) -> anyhow::Result<IngestFlushResult> {
         // Default: best-effort fall back to flush_writes. Implementations
-        // that can identify per-PV failures should override.
-        self.flush_writes().await.map(|_| Vec::new())
+        // that can identify per-PV failures/deferrals should override.
+        self.flush_writes()
+            .await
+            .map(|_| IngestFlushResult::default())
     }
+
 
     /// Per-tier summary scoped to a single PV: name, root folder, granularity,
     /// and how many `.pb` files this tier holds for that PV. Total size /

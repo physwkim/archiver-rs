@@ -1,23 +1,60 @@
 listen_addr = "0.0.0.0"
 listen_port = 17665
 
+[storage]
+# Process-wide cap on simultaneously-open `BufWriter` file
+# handles, shared across STS / MTS / LTS. When set, all 3 tiers
+# draw from a single pool — total open writers stays at-or-below
+# this number, regardless of which tiers are busy. Leave unset to
+# give each tier its own per-tier cap (defaults: STS=512,
+# MTS/LTS=64). Use this when you've raised `ulimit -n` for a
+# heavily-loaded site.
+# max_open_writers_total = 4096
+
 [storage.sts]
 root_folder = "/tmp/archiver/sts"
 partition_granularity = "hour"
 hold = 5
 gather = 3
+# Per-tier cap on open `BufWriter` handles. Ignored when
+# `storage.max_open_writers_total` is set. `0` disables the cap
+# (lifts to usize::MAX); leave unset for the tier default.
+# max_open_writers = 512
 
 [storage.mts]
 root_folder = "/tmp/archiver/mts"
 partition_granularity = "day"
 hold = 30
 gather = 10
+# max_open_writers = 64
 
 [storage.lts]
 root_folder = "/tmp/archiver/lts"
 partition_granularity = "year"
 hold = 10
 gather = 5
+# max_open_writers = 64
 
 [engine]
+# Period (seconds) between ticker-driven flushes. The flush owner
+# runs `flush_ingest_writes` + `batch_update_timestamps` on this
+# cadence, regardless of sample arrival, so a PV that goes silent
+# still gets its buffered bytes persisted and its registry
+# `last_event` advanced.
 write_period_secs = 10
+
+# Number of parallel write-loop shards. `1` (the default) keeps
+# the legacy single-worker layout. Sites with many active PVs
+# and a fast STS can raise this to e.g. 4–16; the engine spawns
+# a dispatcher that hashes `pv_name` to a fixed shard so per-PV
+# ordering is preserved while different PVs append concurrently.
+# A single global flush owner consumes append reports from every
+# shard, so failures on shared storage stay correctly attributed.
+# write_shards = 1
+
+# Per-shard mpsc capacity (only consulted when write_shards > 1).
+# The dispatcher `try_send`s into each shard channel — when a
+# shard is saturated its overflow is dropped and recorded on the
+# per-PV `buffer_overflow_drops` counter, while OTHER shards keep
+# flowing (per-shard isolation).
+# per_shard_buffer = 4096

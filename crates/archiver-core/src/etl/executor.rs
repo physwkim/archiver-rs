@@ -214,9 +214,19 @@ impl EtlExecutor {
                     "Failed to remove source after ETL marker found: {e}"
                 );
             }
-            // Drop any open BufWriter on the just-deleted path so the
-            // engine doesn't continue writing into the orphaned inode.
-            self.source.evict_writer_for_path(source_path);
+            // Drop any open BufWriter on the just-deleted path so
+            // the engine doesn't continue writing into the orphaned
+            // inode. `evict_writer_for_path` blocking-locks each
+            // candidate slot to be definitive (principle 3:
+            // externally visible truth has changed; in-memory
+            // owner state must sync), so wrap in spawn_blocking
+            // to keep the runtime worker free during the wait.
+            let source = self.source.clone();
+            let path_for_evict = source_path.to_path_buf();
+            let _ = tokio::task::spawn_blocking(move || {
+                source.evict_writer_for_path(&path_for_evict)
+            })
+            .await;
             if let Err(e) = tokio::fs::remove_file(&marker).await {
                 warn!(?marker, "Failed to remove ETL marker: {e}");
             }
@@ -248,9 +258,16 @@ impl EtlExecutor {
             let marker = source_path.with_extension("pb.etl_done");
             tokio::fs::write(&marker, b"").await?;
             tokio::fs::remove_file(&source_path).await?;
-            // Drop any open BufWriter on the just-deleted path so the
-            // engine doesn't continue writing into the orphaned inode.
-            source.evict_writer_for_path(&source_path);
+            // Drop any open BufWriter on the just-deleted path so
+            // the engine doesn't continue writing into the orphaned
+            // inode. Blocking lock under spawn_blocking — see the
+            // marker-found branch above for the same rationale.
+            let source_for_evict = source.clone();
+            let path_for_evict = source_path.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                source_for_evict.evict_writer_for_path(&path_for_evict)
+            })
+            .await;
             tokio::fs::remove_file(&marker).await.ok();
             metrics::counter!(
                 "archiver_etl_files_moved_total",
