@@ -134,6 +134,8 @@ let activeRange = '1d';
 let customFrom = null;
 let customTo = null;
 let uplot = null;
+let resizeObserver = null;
+let chartAbortController = null;
 let refreshTimer = null;
 let curXRange = null;       // current [min, max] in seconds — drives the x scale
 let originalXRange = null;  // for reset zoom
@@ -409,6 +411,12 @@ async function plotData() {
     lastChartData = chartData;
     lastPlottable = plottable;
 
+    // Tear down the previous chart instance before swapping in a new one.
+    // Without this, auto-refresh accumulates uPlot objects and
+    // ResizeObservers (each holding canvases / closure refs) — a few
+    // dozen MB per hour of idle dashboard time.
+    if (uplot) { uplot.destroy(); uplot = null; }
+    if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
     container.innerHTML = '';
     const width = container.clientWidth;
     const height = Math.max(400, Math.min(600, window.innerHeight - 350));
@@ -440,11 +448,12 @@ async function plotData() {
     document.getElementById('chart-toolbar').style.display = 'flex';
     setupChartInteractions(height);
 
-    // Resize handler
-    const ro = new ResizeObserver(() => {
+    // Resize handler. Tracked on a global so the next plotData() can
+    // disconnect this observer instead of leaking it.
+    resizeObserver = new ResizeObserver(() => {
       if (uplot) uplot.setSize({ width: container.clientWidth, height });
     });
-    ro.observe(container);
+    resizeObserver.observe(container);
 
     // Status
     let totalPoints = 0;
@@ -513,6 +522,8 @@ function clearChart() {
   document.getElementById('status-bar').textContent = '';
   document.getElementById('chart-toolbar').style.display = 'none';
   if (uplot) { uplot.destroy(); uplot = null; }
+  if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
+  if (chartAbortController) { chartAbortController.abort(); chartAbortController = null; }
   lastChartData = null;
   lastPlottable = null;
   originalXRange = null;
@@ -605,6 +616,14 @@ function setXRange(min, max) {
 }
 
 function setupChartInteractions(chartHeight) {
+  // Bind every listener (incl. document-level mousemove/mouseup) to a
+  // fresh AbortController so the next plotData() can yank them all at
+  // once — without this each refresh leaks 4 document listeners that
+  // accumulate forever and add latency to every mouse move.
+  if (chartAbortController) chartAbortController.abort();
+  chartAbortController = new AbortController();
+  const signal = chartAbortController.signal;
+
   const over = uplot.over;
 
   // ── Drag-to-zoom (box select) ──
@@ -616,7 +635,7 @@ function setupChartInteractions(chartHeight) {
   over.addEventListener('mousedown', e => {
     if (e.shiftKey || e.button !== 0) return;
     dragStart = { x: e.clientX, left: e.offsetX };
-  });
+  }, { signal });
 
   document.addEventListener('mousemove', e => {
     if (!dragStart) return;
@@ -626,7 +645,7 @@ function setupChartInteractions(chartHeight) {
     const left = dx > 0 ? dragStart.left : dragStart.left + dx;
     selectBox.style.left = Math.max(0, left) + 'px';
     selectBox.style.width = Math.min(Math.abs(dx), over.clientWidth - Math.max(0, left)) + 'px';
-  });
+  }, { signal });
 
   document.addEventListener('mouseup', e => {
     if (!dragStart) return;
@@ -641,7 +660,7 @@ function setupChartInteractions(chartHeight) {
       setXRange(newMin, newMax);
     }
     dragStart = null;
-  });
+  }, { signal });
 
   // ── Wheel zoom ──
   over.addEventListener('wheel', e => {
@@ -655,7 +674,7 @@ function setupChartInteractions(chartHeight) {
     const newRange = range * factor;
     const ratio = (xVal - min) / range;
     setXRange(xVal - newRange * ratio, xVal + newRange * (1 - ratio));
-  }, { passive: false });
+  }, { passive: false, signal });
 
   // ── Shift+Drag pan ──
   let panStart = null;
@@ -664,7 +683,7 @@ function setupChartInteractions(chartHeight) {
     e.preventDefault();
     over.style.cursor = 'grabbing';
     panStart = { x: e.clientX, range: [...curXRange] };
-  });
+  }, { signal });
 
   document.addEventListener('mousemove', e => {
     if (!panStart) return;
@@ -673,14 +692,14 @@ function setupChartInteractions(chartHeight) {
     const valRange = panStart.range[1] - panStart.range[0];
     const shift = -(dx / pxWidth) * valRange;
     setXRange(panStart.range[0] + shift, panStart.range[1] + shift);
-  });
+  }, { signal });
 
   document.addEventListener('mouseup', () => {
     if (panStart) { over.style.cursor = ''; panStart = null; }
-  });
+  }, { signal });
 
   // ── Double-click reset ──
-  over.addEventListener('dblclick', () => resetZoom());
+  over.addEventListener('dblclick', () => resetZoom(), { signal });
 }
 
 function resetZoom() {

@@ -109,6 +109,9 @@ pub struct PvCountersDto {
     /// Latest CA-reported DBR type when it differed from the archived
     /// type (Java parity 9f2234f). `None` if no mismatch ever observed.
     pub latest_observed_dbr: Option<i32>,
+    /// DBR_CTRL metadata fetches that failed (timeout / transport / no
+    /// DisplayInfo). Useful when PVs persistently show empty PREC/EGU.
+    pub metadata_fetch_failures: u64,
 }
 
 // --- ArchiverCommand (async — write operations on archiver engine) ---

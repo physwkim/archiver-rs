@@ -911,7 +911,14 @@ async fn refresh_ctrl_metadata(
         return;
     };
 
-    let new_prec = display.precision.to_string();
+    // Negative precision is the Java EAA "no precision info" sentinel —
+    // persisting "-1" as the PREC string would surface as a literal -1
+    // in the UI / API. Treat it the same as missing.
+    let new_prec_opt: Option<String> = if display.precision < 0 {
+        None
+    } else {
+        Some(display.precision.to_string())
+    };
     let new_egu_trimmed = display.units.trim();
     let new_egu_opt: Option<&str> = if new_egu_trimmed.is_empty() {
         None
@@ -928,7 +935,12 @@ async fn refresh_ctrl_metadata(
         }
     };
 
-    let prec_changed = stored.prec.as_deref() != Some(new_prec.as_str());
+    let prec_changed = match (stored.prec.as_deref(), new_prec_opt.as_deref()) {
+        (Some(s), Some(n)) => s != n,
+        (None, Some(_)) => true,
+        // Don't overwrite a populated PREC with the "no info" sentinel.
+        _ => false,
+    };
     let egu_changed = match (stored.egu.as_deref(), new_egu_opt) {
         (Some(s), Some(n)) => s != n,
         (None, Some(_)) => true,
@@ -940,7 +952,11 @@ async fn refresh_ctrl_metadata(
         return;
     }
 
-    let prec_arg = prec_changed.then_some(new_prec.as_str());
+    let prec_arg = if prec_changed {
+        new_prec_opt.as_deref()
+    } else {
+        None
+    };
     let egu_arg = if egu_changed { new_egu_opt } else { None };
     if let Err(e) = registry.update_metadata(pv_name, prec_arg, egu_arg) {
         warn!(pv = pv_name, "Failed to persist PREC/EGU: {e}");
@@ -1049,14 +1065,21 @@ async fn monitor_loop(
         // Refresh DBR_CTRL metadata once per (re)connect so the registry's
         // PREC/EGU stay in sync with the IOC. Fire-and-forget so a slow
         // CA stack can't gate `subscribe()` (and therefore the first
-        // sample) on a metadata round-trip.
+        // sample) on a metadata round-trip. The spawned task is bound to
+        // `cancel_token` so it terminates promptly when the PV is
+        // stopped/deleted (otherwise a late metadata write could land on
+        // a deleted-or-re-registered PV row).
         {
             let channel = channel.clone();
             let registry = registry.clone();
             let counters = counters.clone();
             let pv_name = pv_name.clone();
+            let cancel = cancel_token.clone();
             tokio::spawn(async move {
-                refresh_ctrl_metadata(&channel, &registry, &pv_name, &counters).await;
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = refresh_ctrl_metadata(&channel, &registry, &pv_name, &counters) => {}
+                }
             });
         }
 
@@ -1272,12 +1295,18 @@ async fn scan_loop(
             // semantics. The local `metadata_done` flag exists because
             // scan_loop's outer iteration is per-tick (vs monitor_loop's
             // per-reconnect), so we'd otherwise spawn a fetch every tick.
+            // Bound to `cancel_token` so a stopped/deleted PV doesn't get
+            // a stale metadata write from an in-flight task.
             let channel = channel.clone();
             let registry = registry.clone();
             let counters = counters.clone();
             let pv_name = pv_name.clone();
+            let cancel = cancel_token.clone();
             tokio::spawn(async move {
-                refresh_ctrl_metadata(&channel, &registry, &pv_name, &counters).await;
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = refresh_ctrl_metadata(&channel, &registry, &pv_name, &counters) => {}
+                }
             });
             metadata_done = true;
         }

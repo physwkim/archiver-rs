@@ -103,6 +103,7 @@ impl ArchiverQuery for FakeArchiverControl {
                         last_disconnect_unix_secs: None,
                         transient_error_count: 0,
                         latest_observed_dbr: None,
+                        metadata_fetch_failures: 0,
                     },
                 )
             })

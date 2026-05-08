@@ -56,6 +56,7 @@ impl ArchiverQuery for ChannelArchiverControl {
                         last_disconnect_unix_secs: c.last_disconnect_unix_secs,
                         transient_error_count: c.transient_error_count,
                         latest_observed_dbr: c.latest_observed_dbr,
+                        metadata_fetch_failures: c.metadata_fetch_failures,
                     },
                 )
             })
