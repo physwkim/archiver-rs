@@ -3,8 +3,8 @@
 use std::time::SystemTime;
 
 use archiver_core::storage::partition::PartitionGranularity;
-use archiver_core::storage::plainpb::{FdBudget, PlainPbStoragePlugin};
 use archiver_core::storage::plainpb::codec;
+use archiver_core::storage::plainpb::{FdBudget, PlainPbStoragePlugin};
 use archiver_core::storage::traits::StoragePlugin;
 use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
 
@@ -461,11 +461,8 @@ use std::io::Write;
 
 fn pv_path_for(plugin_root: &std::path::Path, pv: &str, ts: SystemTime) -> std::path::PathBuf {
     use std::fs;
-    let plugin = PlainPbStoragePlugin::new(
-        "tmp",
-        plugin_root.to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("tmp", plugin_root.to_path_buf(), PartitionGranularity::Hour);
     let p = plugin.file_path_for(pv, ts);
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -484,11 +481,8 @@ async fn injection_partial_header_recovers_on_next_write() {
     // detect this on first write_cached call, truncate, and recreate.
     std::fs::write(&path, b"\x01\x02\x03\x04\x05").unwrap();
 
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
     let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(42.0));
     plugin
         .append_event("TEST:Pv", ArchDbType::ScalarDouble, &sample)
@@ -512,11 +506,8 @@ async fn injection_partial_trailing_record_gets_trimmed() {
     let ts: SystemTime = Utc.with_ymd_and_hms(2026, 2, 20, 14, 5, 0).unwrap().into();
 
     // First, create a valid file with one real sample via the plugin.
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
     let s1 = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(1.0));
     plugin
         .append_event("TEST:Trim", ArchDbType::ScalarDouble, &s1)
@@ -533,16 +524,14 @@ async fn injection_partial_trailing_record_gets_trimmed() {
         .append(true)
         .open(&path)
         .unwrap();
-    file.write_all(b"not-a-real-sample-bytes-no-newline").unwrap();
+    file.write_all(b"not-a-real-sample-bytes-no-newline")
+        .unwrap();
     drop(file);
 
     // Reopen the plugin and write another sample — the file_needs_header
     // path runs trim_to_last_newline first, dropping the partial bytes.
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
     let ts2: SystemTime = Utc.with_ymd_and_hms(2026, 2, 20, 14, 5, 30).unwrap().into();
     let s2 = ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(2.0));
     plugin
@@ -562,7 +551,11 @@ async fn injection_partial_trailing_record_gets_trimmed() {
             values.push(v);
         }
     }
-    assert_eq!(values, vec![1.0, 2.0], "both samples must be readable after trim");
+    assert_eq!(
+        values,
+        vec![1.0, 2.0],
+        "both samples must be readable after trim"
+    );
 }
 
 #[tokio::test]
@@ -575,11 +568,8 @@ async fn injection_zero_byte_file_treated_as_missing() {
     std::fs::File::create(&path).unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
     let s = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(99.0));
     plugin
         .append_event("TEST:Empty", ArchDbType::ScalarDouble, &s)
@@ -604,13 +594,13 @@ async fn injection_flush_after_no_writes_is_noop() {
     // writers, this would still pass; but it does verify the empty
     // path doesn't error.
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
     plugin.flush_writes().await.expect("empty flush is Ok");
-    plugin.flush_writes().await.expect("empty flush is repeatable");
+    plugin
+        .flush_writes()
+        .await
+        .expect("empty flush is repeatable");
 }
 
 #[tokio::test]
@@ -621,11 +611,8 @@ async fn injection_ingest_flush_returns_empty_vec_on_success() {
     // healthy PVs as "failed", write_loop would orphan their
     // timestamps from the registry commit.
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let ts: SystemTime = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap().into();
     for i in 0..5 {
@@ -721,11 +708,8 @@ async fn fd_cap_strict_under_concurrent_appends() {
 #[tokio::test]
 async fn flush_to_deleted_inode_records_loss() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let ts: SystemTime = Utc.with_ymd_and_hms(2026, 9, 7, 12, 0, 0).unwrap().into();
     let pv = "TEST:DeletedInode";
@@ -764,11 +748,8 @@ async fn flush_to_deleted_inode_records_loss() {
 #[tokio::test]
 async fn ghost_file_path_records_loss() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap().into();
     let ts2 = ts1 + std::time::Duration::from_secs(60);
@@ -812,11 +793,8 @@ async fn ghost_file_path_records_loss() {
 #[tokio::test]
 async fn evict_writer_for_path_records_loss_when_dirty() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let ts: SystemTime = Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap().into();
     let pv = "TEST:EvictByPath";
@@ -848,11 +826,8 @@ async fn evict_writer_for_path_records_loss_when_dirty() {
 #[tokio::test]
 async fn delete_pv_data_records_loss_and_tombstones() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let ts: SystemTime = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap().into();
     let pv = "TEST:Delete";
@@ -891,11 +866,8 @@ async fn delete_pv_data_records_loss_and_tombstones() {
 #[tokio::test]
 async fn rename_pv_flushes_source_writer_cleanly() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let ts: SystemTime = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap().into();
     let from = "TEST:RenameFrom";
@@ -935,11 +907,8 @@ async fn rename_pv_flushes_source_writer_cleanly() {
 #[tokio::test]
 async fn partition_rollover_clean_drop_no_loss() {
     let dir = temp_dir();
-    let plugin = PlainPbStoragePlugin::new(
-        "test",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    );
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
 
     let pv = "TEST:Rollover";
     // First sample in hour H.

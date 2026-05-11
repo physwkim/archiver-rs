@@ -151,7 +151,6 @@ pub trait StoragePlugin: Send + Sync {
             .map(|_| IngestFlushResult::default())
     }
 
-
     /// Per-tier summary scoped to a single PV: name, root folder, granularity,
     /// and how many `.pb` files this tier holds for that PV. Total size /
     /// total files are left None.

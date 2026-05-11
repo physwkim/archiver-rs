@@ -526,13 +526,10 @@ impl ChannelManager {
         // Connect + introspect: a one-shot pvget tells us the value
         // shape. We rely on it instead of a `cainfo` analogue because
         // PVA channels carry their type only via fetched data.
-        let connect = tokio::time::timeout(
-            CA_CONNECT_TIMEOUT,
-            self.pva_client.pvconnect(pv_name),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("PVA connect to {pv_name} timed out"))?
-        .map_err(|e| anyhow::anyhow!("Failed to connect to {pv_name} via PVA: {e}"))?;
+        let connect = tokio::time::timeout(CA_CONNECT_TIMEOUT, self.pva_client.pvconnect(pv_name))
+            .await
+            .map_err(|_| anyhow::anyhow!("PVA connect to {pv_name} timed out"))?
+            .map_err(|e| anyhow::anyhow!("Failed to connect to {pv_name} via PVA: {e}"))?;
         debug!(pv = pv_name, server = %connect, "PVA channel connected");
 
         let initial = tokio::time::timeout(CA_CONNECT_TIMEOUT, self.pva_client.pvget(pv_name))
@@ -560,9 +557,9 @@ impl ChannelManager {
         // to the CA path's DBR_CTRL refresh. Non-fatal on error.
         let (prec, egu) = pv_field_extract_display(&initial);
         if (prec.is_some() || egu.is_some())
-            && let Err(e) =
-                self.registry
-                    .update_metadata(pv_name, prec.as_deref(), egu.as_deref())
+            && let Err(e) = self
+                .registry
+                .update_metadata(pv_name, prec.as_deref(), egu.as_deref())
         {
             debug!(pv = pv_name, "Failed to persist PVA PREC/EGU: {e}");
         }
@@ -804,14 +801,8 @@ impl ChannelManager {
             let cancel = cancel_token.clone();
             let sample_mode = record.sample_mode.clone();
             tokio::spawn(async move {
-                pva_state_watchdog(
-                    pv_name,
-                    conn_info,
-                    counters_for_watch,
-                    cancel,
-                    sample_mode,
-                )
-                .await;
+                pva_state_watchdog(pv_name, conn_info, counters_for_watch, cancel, sample_mode)
+                    .await;
             });
         }
 
@@ -1188,7 +1179,10 @@ async fn refresh_ctrl_metadata(
         Ok(Some(r)) => r,
         Ok(None) => return,
         Err(e) => {
-            debug!(pv = pv_name, "Registry read for metadata compare failed: {e}");
+            debug!(
+                pv = pv_name,
+                "Registry read for metadata compare failed: {e}"
+            );
             return;
         }
     };
@@ -1272,7 +1266,11 @@ fn pva_handle_event(
     let ts = pv_field_extract_timestamp(field);
     if !first_after_connect && !ioc_timestamp_in_window(ts, now, drift_secs) {
         counters.timestamp_drops.fetch_add(1, Ordering::Relaxed);
-        debug!(pv = pv_name, ?ts, "Dropping PVA sample with out-of-window timestamp");
+        debug!(
+            pv = pv_name,
+            ?ts,
+            "Dropping PVA sample with out-of-window timestamp"
+        );
         return;
     }
     let elem_count = match pv_field_element_count(field) {
@@ -1294,7 +1292,9 @@ fn pva_handle_event(
         counters: Some(counters.clone()),
     };
     if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(pv_sample) {
-        counters.buffer_overflow_drops.fetch_add(1, Ordering::Relaxed);
+        counters
+            .buffer_overflow_drops
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1564,9 +1564,7 @@ async fn scan_loop_pva(
             element_count: Some(elem_count),
             counters: Some(counters.clone()),
         };
-        if let Err(rejected) =
-            try_send_with_overflow_count(&tx, pv_sample, &counters).await
-        {
+        if let Err(rejected) = try_send_with_overflow_count(&tx, pv_sample, &counters).await {
             // Channel closed (write_loop down). Cooperative shutdown.
             let _ = rejected;
             return;
@@ -1631,8 +1629,16 @@ async fn pva_metadata_refresh_loop(
         if !prec_changed && !egu_changed {
             continue;
         }
-        let prec_arg = if prec_changed { new_prec.as_deref() } else { None };
-        let egu_arg = if egu_changed { new_egu.as_deref() } else { None };
+        let prec_arg = if prec_changed {
+            new_prec.as_deref()
+        } else {
+            None
+        };
+        let egu_arg = if egu_changed {
+            new_egu.as_deref()
+        } else {
+            None
+        };
         if let Err(e) = registry.update_metadata(&pv_name, prec_arg, egu_arg) {
             warn!(pv = pv_name, "Failed to persist PVA PREC/EGU: {e}");
         } else {
@@ -1663,9 +1669,7 @@ async fn pva_state_watchdog(
     // see stale disconnected status; that's a known limitation.
     let stale_threshold = match sample_mode {
         SampleMode::Monitor => Duration::from_secs(60),
-        SampleMode::Scan { period_secs } => {
-            Duration::from_secs_f64((period_secs * 3.0).max(60.0))
-        }
+        SampleMode::Scan { period_secs } => Duration::from_secs_f64((period_secs * 3.0).max(60.0)),
     };
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     interval.tick().await;
@@ -2478,7 +2482,11 @@ fn pv_field_extract_display(field: &PvField) -> (Option<String>, Option<String>)
     let egu = match disp.get_field("units") {
         Some(PvField::Scalar(ScalarValue::String(u))) => {
             let t = u.trim();
-            if t.is_empty() { None } else { Some(t.to_string()) }
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
         }
         _ => None,
     };
@@ -2648,7 +2656,7 @@ impl Default for ShardedWritePoolConfig {
 use archiver_core::storage::plainpb::shard_for_pv;
 
 /// Run an N-shard write pool: 1 dispatcher (hashes pv_name → shard)
-/// + N parallel `write_loop_with_config` workers. Each shard has
+/// plus N parallel `write_loop_with_config` workers. Each shard has
 /// independent `ts_updates`, an independent flush ticker, and its
 /// own per-PV writer slots inside the shared storage plugin (so
 /// per-PV ordering is naturally preserved by the consistent-hash
@@ -2665,14 +2673,6 @@ pub async fn run_sharded_write_pool(
     cfg: ShardedWritePoolConfig,
 ) {
     let n = cfg.shards.max(1);
-    let WriteLoopConfig {
-        flush_period,
-        append_timeout,
-        flush_timeout,
-        drain_per_sample_timeout,
-        drain_total_budget,
-        shutdown_flush_timeout,
-    } = cfg.write_loop.clone();
 
     // Coalescing per-PV pending-timestamp map shared between the
     // flush owner, every shard worker, and every shard worker's
@@ -2687,10 +2687,7 @@ pub async fn run_sharded_write_pool(
         registry.clone(),
         pending.clone(),
         shutdown.clone(),
-        flush_period,
-        flush_timeout,
-        shutdown_flush_timeout,
-        drain_total_budget,
+        cfg.write_loop.clone(),
     ));
 
     if n == 1 {
@@ -2702,9 +2699,7 @@ pub async fn run_sharded_write_pool(
             rx,
             pending.clone(),
             shutdown.clone(),
-            append_timeout,
-            drain_per_sample_timeout,
-            drain_total_budget,
+            cfg.write_loop.clone(),
         )
         .await;
     } else {
@@ -2717,15 +2712,14 @@ pub async fn run_sharded_write_pool(
             let storage = storage.clone();
             let pending = pending.clone();
             let shard_shutdown = shutdown.clone();
+            let shard_cfg = cfg.write_loop.clone();
             shard_handles.push(tokio::spawn(shard_append_loop(
                 shard_idx,
                 storage,
                 s_rx,
                 pending,
                 shard_shutdown,
-                append_timeout,
-                drain_per_sample_timeout,
-                drain_total_budget,
+                shard_cfg,
             )));
         }
 
@@ -3016,8 +3010,7 @@ async fn run_flush_and_commit(
             let to_commit: Vec<(&str, SystemTime)> = snapshot
                 .iter()
                 .filter(|(pv, _)| {
-                    !failed_set.contains(pv.as_str())
-                        && !deferred_set.contains(pv.as_str())
+                    !failed_set.contains(pv.as_str()) && !deferred_set.contains(pv.as_str())
                 })
                 .map(|(pv, ts)| (pv.as_str(), *ts))
                 .collect();
@@ -3031,11 +3024,10 @@ async fn run_flush_and_commit(
                     // matches the snapshot's. This preserves
                     // concurrent updates that arrived between
                     // snapshot and remove.
-                    let committed_map: std::collections::HashMap<String, SystemTime> =
-                        to_commit
-                            .iter()
-                            .map(|(pv, ts)| ((*pv).to_string(), *ts))
-                            .collect();
+                    let committed_map: std::collections::HashMap<String, SystemTime> = to_commit
+                        .iter()
+                        .map(|(pv, ts)| ((*pv).to_string(), *ts))
+                        .collect();
                     pending.remove_committed(&committed_map);
                 }
                 Err(e) => {
@@ -3155,10 +3147,7 @@ impl PendingReports {
     /// committed. If a concurrent shard advanced an entry to a
     /// newer ts after the snapshot, leave it alone — the next
     /// flush will pick it up.
-    pub fn remove_committed(
-        &self,
-        committed: &std::collections::HashMap<String, SystemTime>,
-    ) {
+    pub fn remove_committed(&self, committed: &std::collections::HashMap<String, SystemTime>) {
         for (pv, &committed_ts) in committed {
             // remove_if applies the predicate atomically inside
             // the DashMap shard lock.
@@ -3239,10 +3228,9 @@ async fn shard_append_loop(
     mut sample_rx: mpsc::Receiver<PvSample>,
     pending: Arc<PendingReports>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-    append_timeout: Duration,
-    drain_per_sample_timeout: Duration,
-    drain_total_budget: Duration,
+    cfg: WriteLoopConfig,
 ) {
+    let append_timeout = cfg.append_timeout;
     info!(shard = shard_idx, "Shard append loop started");
     // Per-PV state for the in-shard sanity drops. The dispatcher's
     // consistent hash keeps each PV in one shard, so these maps
@@ -3274,8 +3262,7 @@ async fn shard_append_loop(
                     &mut sample_rx,
                     &mut last_ts,
                     &mut last_dbr_type,
-                    drain_per_sample_timeout,
-                    drain_total_budget,
+                    &cfg,
                 )
                 .await;
                 break;
@@ -3462,9 +3449,10 @@ async fn shard_drain_on_shutdown(
     sample_rx: &mut mpsc::Receiver<PvSample>,
     last_ts: &mut std::collections::HashMap<String, SystemTime>,
     last_dbr_type: &mut std::collections::HashMap<String, ArchDbType>,
-    drain_per_sample_timeout: Duration,
-    drain_total_budget: Duration,
+    cfg: &WriteLoopConfig,
 ) {
+    let drain_per_sample_timeout = cfg.drain_per_sample_timeout;
+    let drain_total_budget = cfg.drain_total_budget;
     let drain_start = std::time::Instant::now();
     let mut drained_skipped = 0usize;
     while let Ok(pv_sample) = sample_rx.try_recv() {
@@ -3509,11 +3497,12 @@ async fn flush_owner_loop(
     registry: Arc<PvRegistry>,
     pending: Arc<PendingReports>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-    flush_period: Duration,
-    flush_timeout: Duration,
-    shutdown_flush_timeout: Duration,
-    drain_total_budget: Duration,
+    cfg: WriteLoopConfig,
 ) {
+    let flush_period = cfg.flush_period;
+    let flush_timeout = cfg.flush_timeout;
+    let shutdown_flush_timeout = cfg.shutdown_flush_timeout;
+    let drain_total_budget = cfg.drain_total_budget;
     // tokio::time::interval(Duration::ZERO) panics. Config-side
     // validation rejects 0 at load time, but defending in depth
     // here keeps tests and direct callers (which build configs by
@@ -3586,9 +3575,7 @@ async fn flush_owner_loop(
     if !min_grace.is_zero() {
         tokio::time::sleep(min_grace).await;
     }
-    while flush_in_flight.load(Ordering::Acquire)
-        && std::time::Instant::now() < phase2_deadline
-    {
+    while flush_in_flight.load(Ordering::Acquire) && std::time::Instant::now() < phase2_deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     if flush_in_flight.load(Ordering::Acquire) {

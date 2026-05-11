@@ -547,7 +547,7 @@ pub async fn rename_pv(
 mod tests {
     use super::*;
     use crate::dto::mgmt::record_to_type_info;
-    use archiver_core::registry::{PvRecord, PvStatus, SampleMode};
+    use archiver_core::registry::{Protocol, PvRecord, PvStatus, SampleMode};
     use archiver_core::types::ArchDbType;
 
     fn sample_record() -> PvRecord {
@@ -565,6 +565,7 @@ mod tests {
             alias_for: None,
             archive_fields: vec!["HIHI".to_string()],
             policy_name: Some("ring".to_string()),
+            protocol: Protocol::Ca,
         }
     }
 

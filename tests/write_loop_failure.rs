@@ -955,7 +955,12 @@ async fn silent_pv_after_long_flush_still_commits() {
             .unwrap();
     }
     registry
-        .register_pv("late_silent", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .register_pv(
+            "late_silent",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
         .unwrap();
 
     let counters = Arc::new(PvCounters::default());
@@ -1041,7 +1046,9 @@ async fn append_timeout_rejects_older_subsequent_sample() {
     tokio::time::sleep(cfg.append_timeout + Duration::from_millis(50)).await;
     // Now send the older sample. The shard's last_ts should have
     // been bumped to t1 by the timeout branch, so this must drop.
-    tx.send(pv_sample("A", t_old, 9.0, &counters)).await.unwrap();
+    tx.send(pv_sample("A", t_old, 9.0, &counters))
+        .await
+        .unwrap();
     // Let the older sample reach the shard.
     tokio::time::sleep(Duration::from_millis(100)).await;
 

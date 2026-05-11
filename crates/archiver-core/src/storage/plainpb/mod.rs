@@ -321,7 +321,12 @@ impl PlainPbStoragePlugin {
         granularity: PartitionGranularity,
         max_open_writers: usize,
     ) -> Self {
-        Self::with_fd_budget(name, root_folder, granularity, FdBudget::new(max_open_writers))
+        Self::with_fd_budget(
+            name,
+            root_folder,
+            granularity,
+            FdBudget::new(max_open_writers),
+        )
     }
 
     /// Construct using a (possibly-shared) fd permit pool.
@@ -754,18 +759,12 @@ impl PlainPbStoragePlugin {
                 // single-statement HashSet inserts, so a panicking
                 // thread can't leave half-modified state. Better to
                 // proceed than fail every future write_cached call.
-                let dirs = self
-                    .known_dirs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let dirs = self.known_dirs.lock().unwrap_or_else(|e| e.into_inner());
                 !dirs.contains(parent)
             };
             if needs_create {
                 std::fs::create_dir_all(parent)?;
-                let mut dirs = self
-                    .known_dirs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut dirs = self.known_dirs.lock().unwrap_or_else(|e| e.into_inner());
                 dirs.insert(parent.to_path_buf());
             }
         }
@@ -814,9 +813,7 @@ impl PlainPbStoragePlugin {
         // `rename_pv` may have grabbed this Arc and set `dead`.
         // Bail rather than recreate the file we just deleted.
         if slot.dead {
-            anyhow::bail!(
-                "PV `{pv}` was deleted/renamed concurrently; refusing to recreate file"
-            );
+            anyhow::bail!("PV `{pv}` was deleted/renamed concurrently; refusing to recreate file");
         }
 
         // If the cached writer points at a different path, the partition has
@@ -826,10 +823,9 @@ impl PlainPbStoragePlugin {
         // the old partition's last buffered samples).
         if let Some(existing) = slot.writer.as_ref()
             && existing.path != path_buf
+            && let Some(cached) = slot.writer.take()
         {
-            if let Some(cached) = slot.writer.take() {
-                let _ = self.drop_dirty_writer(pv, cached);
-            }
+            let _ = self.drop_dirty_writer(pv, cached);
         }
 
         // Defense-in-depth for ghost-file writes: if the cached writer's
@@ -919,8 +915,7 @@ impl PlainPbStoragePlugin {
                 // Single write_all so the header+newline never split
                 // across BufWriter flushes — same atomicity rationale
                 // as the sample frame below.
-                let mut header_frame =
-                    Vec::with_capacity(escaped_header.len() + 1);
+                let mut header_frame = Vec::with_capacity(escaped_header.len() + 1);
                 header_frame.extend_from_slice(&escaped_header);
                 header_frame.push(codec::NEWLINE);
                 if let Err(e) = bw.write_all(&header_frame) {
@@ -1123,7 +1118,6 @@ impl PlainPbStoragePlugin {
 fn is_too_many_open_files(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(23) | Some(24))
 }
-
 
 /// Decide whether a file at `path` needs a fresh PayloadInfo header
 /// written before sample data is appended. Returns `true` when:
@@ -1580,10 +1574,7 @@ impl StoragePlugin for PlainPbStoragePlugin {
             let is_empty = std::fs::read_dir(&pv_dir)?.next().is_none();
             if is_empty {
                 let _ = tokio::fs::remove_dir(&pv_dir).await;
-                let mut dirs = self
-                    .known_dirs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut dirs = self.known_dirs.lock().unwrap_or_else(|e| e.into_inner());
                 dirs.remove(&pv_dir);
             }
         }
@@ -1793,10 +1784,7 @@ impl StoragePlugin for PlainPbStoragePlugin {
             && std::fs::read_dir(&from_dir)?.next().is_none()
         {
             let _ = std::fs::remove_dir(&from_dir);
-            let mut dirs = self
-                .known_dirs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut dirs = self.known_dirs.lock().unwrap_or_else(|e| e.into_inner());
             dirs.remove(&from_dir);
         }
 

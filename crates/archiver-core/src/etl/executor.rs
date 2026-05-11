@@ -223,10 +223,9 @@ impl EtlExecutor {
             // to keep the runtime worker free during the wait.
             let source = self.source.clone();
             let path_for_evict = source_path.to_path_buf();
-            let _ = tokio::task::spawn_blocking(move || {
-                source.evict_writer_for_path(&path_for_evict)
-            })
-            .await;
+            let _ =
+                tokio::task::spawn_blocking(move || source.evict_writer_for_path(&path_for_evict))
+                    .await;
             if let Err(e) = tokio::fs::remove_file(&marker).await {
                 warn!(?marker, "Failed to remove ETL marker: {e}");
             }

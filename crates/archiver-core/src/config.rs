@@ -93,7 +93,7 @@ fn default_gather() -> u32 {
 }
 
 /// EPICS CA engine configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     /// Write period in seconds — how often buffered samples flush to storage.
     #[serde(default = "default_write_period")]
@@ -115,11 +115,12 @@ pub struct EngineConfig {
     /// can append concurrently.
     #[serde(default = "default_write_shards")]
     pub write_shards: usize,
-    /// Per-shard mpsc capacity. Only consulted when `write_shards
-    /// > 1`. The dispatcher `try_send`s into each shard channel —
-    /// when a shard is saturated its overflow is dropped and
-    /// recorded on the per-PV `buffer_overflow_drops` counter,
-    /// while OTHER shards keep flowing (per-shard isolation).
+    /// Per-shard mpsc capacity. Only consulted when
+    /// `write_shards > 1`. The dispatcher `try_send`s into each
+    /// shard channel — when a shard is saturated its overflow is
+    /// dropped and recorded on the per-PV `buffer_overflow_drops`
+    /// counter, while OTHER shards keep flowing (per-shard
+    /// isolation).
     #[serde(default = "default_per_shard_buffer")]
     pub per_shard_buffer: usize,
 }
@@ -138,6 +139,25 @@ fn default_write_shards() -> usize {
 
 fn default_per_shard_buffer() -> usize {
     4096
+}
+
+impl Default for EngineConfig {
+    // `#[serde(default)]` on the outer `engine` field falls back to
+    // this when the TOML omits `[engine]` entirely. Without a manual
+    // impl, the derived `Default` would zero every numeric field —
+    // notably `write_period_secs = 0`, which then trips
+    // `validate()` ("must be > 0"). Mirror the per-field
+    // `#[serde(default = "...")]` defaults so the no-`[engine]`
+    // and empty-`[engine]` cases behave identically.
+    fn default() -> Self {
+        Self {
+            write_period_secs: default_write_period(),
+            policy_file: None,
+            server_ioc_drift_secs: default_server_ioc_drift_secs(),
+            write_shards: default_write_shards(),
+            per_shard_buffer: default_per_shard_buffer(),
+        }
+    }
 }
 
 /// Security configuration.
@@ -313,7 +333,9 @@ impl ArchiverConfig {
             anyhow::bail!("engine.write_period_secs must be > 0");
         }
         if self.engine.write_shards == 0 {
-            anyhow::bail!("engine.write_shards must be > 0 (use 1 for the legacy single-worker layout)");
+            anyhow::bail!(
+                "engine.write_shards must be > 0 (use 1 for the legacy single-worker layout)"
+            );
         }
         if self.engine.per_shard_buffer == 0 && self.engine.write_shards > 1 {
             anyhow::bail!(

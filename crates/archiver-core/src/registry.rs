@@ -330,13 +330,7 @@ impl PvRegistry {
         sample_mode: &SampleMode,
         element_count: i32,
     ) -> anyhow::Result<()> {
-        self.register_pv_with_protocol(
-            pv_name,
-            dbr_type,
-            sample_mode,
-            element_count,
-            Protocol::Ca,
-        )
+        self.register_pv_with_protocol(pv_name, dbr_type, sample_mode, element_count, Protocol::Ca)
     }
 
     /// Register a new PV for archiving, recording which wire protocol the
