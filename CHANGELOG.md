@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.3.2 — 2026-05-11
+
+### Changed
+
+- **Bumped `epics-rs` 0.15.0 → 0.16.0.** Updates the four
+  upstream crates pinned across the workspace (`epics-base-rs`,
+  `epics-ca-rs`, `epics-macros-rs`, `epics-pva-rs`). Public APIs
+  consumed by the archiver (`CaClient::new`, `CaChannel::subscribe`,
+  `PvaClient::pvmonitor_with_request`, `PvField` /
+  `ScalarValue` / `PvStructure`, `PvRequestBuilder`,
+  `nt::meta::*`, `run_repeater`) remain compatible — no
+  source-level changes were required.
+- **Re-aligned binary and library versions on a single number.**
+  v0.3.1 split `epics-archiver` (0.3.1) from the four library
+  crates (0.3.0). v0.3.2 brings them back together so a single
+  `v0.3.2` tag describes every published crate in the workspace.
+
+### Fixed
+
+- **`EngineConfig::Default` mirrors the per-field
+  `#[serde(default = "...")]` defaults.** Previously, a TOML config
+  with no `[engine]` block fell through to `EngineConfig::default()`
+  (derived), which zeroed `write_period_secs` and tripped
+  `validate()`'s "must be > 0" check at config load. Now the
+  no-`[engine]` and empty-`[engine]` cases behave identically.
+
+### Internal
+
+- Refactored the sharded-write-pool helpers (`shard_append_loop`,
+  `shard_drain_on_shutdown`, `flush_owner_loop`) to take a
+  `WriteLoopConfig` (by value or by reference) instead of plumbing
+  3–4 individual `Duration` fields through each call site. No
+  behavior change — only argument shape.
+- Resolved `clippy::doc_lazy_continuation`, `clippy::collapsible_if`,
+  and `clippy::doc_list_item` regressions surfaced by Rust 1.94.
+
 ## v0.3.1 — 2026-05-08 (binary-only)
 
 ### Added
