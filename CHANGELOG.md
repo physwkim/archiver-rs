@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.4.0 — 2026-05-12
+
+### Added
+
+- **PVA structured-type archival (NTTable, NTNDArray, user-defined
+  NT structures).** Top-level `PvField::Structure` PVs now register
+  as `ArchDbType::V4GenericBytes` instead of being rejected with
+  "structured types not yet supported" at `archive_pv`. The monitor
+  callback wire-encodes the channel's canonical `FieldDesc` plus the
+  value (BigEndian) into a self-describing PB payload — each sample
+  on disk is decodable in isolation, no shared introspection cache
+  needed across day-roll boundaries. Retrieval JSON decodes the V4
+  bytes back into structure JSON via the new
+  `archiver_value_to_json_v4` (archiver-api).
+- **NTEnum special-case mirroring Java archiver.** NTEnum-shaped PVs
+  (`struct_id` starts with `"epics:nt/NTEnum"` AND `value.{index,
+  choices}` shape) collapse to `ArchDbType::ScalarEnum(index)` with
+  `value.choices` cached per-PV under the new `enum_strs` extras
+  key (JSON-encoded string array). The retrieval JSON surfaces
+  `enum_strs` under `meta` so clients can
+  `JSON.parse(meta.enum_strs)` to recover the original array.
+- **Canonical FieldDesc plumb-through (no value-recovery fallback).**
+  Every V4GenericBytes encoding site consumes the channel-INIT
+  descriptor via `pvget_full` / `pvinfo` / `pvmonitor_handle`'s
+  desc-bearing callback. `PvField::descriptor()` value-recovery —
+  which is lossy for `Union` (drops sibling variants), `UnionArray`
+  (empties variants list), and `Variant` (degrades to bare
+  `Variant`) — is no longer reachable from archiver-rs's V4 path.
+  Top-level `UnionArray` PVs and NTNDArray-style multi-variant
+  Unions (the 10 POD variants in the value union) now round-trip
+  wire-faithfully on disk. The invariant is enforced by the type
+  system: helpers take `&FieldDesc` (not `Option`), so omission is
+  a compile error.
+
+### Fixed
+
+- **NTScalarArray waveform PVA archival.** `PvField::ScalarArrayTyped`
+  (pvxs 0.14+ decoder's default output for POD arrays) was rejected
+  by both `pv_field_to_arch_db_type` and
+  `pv_field_scalar_to_archiver`, silently dropping every waveform
+  PVA event since the upstream typed-array migration. Both helpers
+  now handle the typed variant alongside the legacy `ScalarArray`,
+  with widening (i8/i16/i64 → i32) matching the existing CA scalar
+  path.
+
+### Changed
+
+- **Bumped `epics-rs` 0.16.0 → 0.16.2.** Picks up the
+  `PvField::descriptor()` lossy-paths documentation
+  (epics-pva-rs commit 834985a) that names archiver-rs as the
+  canonical client pattern, plus minor doctest / clippy fixes
+  across the upstream workspace.
+
+### Internal
+
+- All PVA reads (`start_archiving_internal_pva` connect-time,
+  `scan_loop_pva`, `live_value` for PVA channels, both
+  `monitor_loop_pva` paths) use descriptor-aware APIs. The
+  `pvmonitor_with_request` path — which doesn't surface a
+  per-event descriptor — pre-fetches one via `pvinfo` before
+  subscribing; a failed `pvinfo` retries instead of degrading to
+  value-recovery.
+- New unit-test module (`channel_manager::pva_mapping_tests`)
+  covers NTTable / NTEnum / NTNDArray Union / UnionArray
+  classification, value extraction, and self-describing
+  round-trip. New integration tests in `tests/plainpb_compat.rs`
+  cover PB storage round-trip for V4GenericBytes payloads
+  end-to-end.
+- New module `crates/archiver-api/src/value_json.rs` decodes
+  V4GenericBytes into structure JSON for the retrieval path,
+  centralised so the three call sites (`pv_data::getDataAtTime`,
+  `pv_data::sample_to_json`, `mgmt/p2.rs` mirroring) stay in
+  lockstep.
+
 ## v0.3.2 — 2026-05-11
 
 ### Changed

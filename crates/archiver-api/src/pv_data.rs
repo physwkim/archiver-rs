@@ -247,7 +247,7 @@ async fn get_data_at_time(
         let entry = match pick {
             Some(s) => {
                 let (year, secs, nanos) = s.decompose_timestamp();
-                let val = archiver_value_to_json(&s.value);
+                let val = archiver_value_to_json_v4(&s.value);
                 // Java parity (9b55268): include a "meta" object carrying the
                 // PB field values (EGU, PREC, cnxlost markers, etc.) so
                 // Phoebus and save-restore clients can interpret the value.
@@ -283,7 +283,7 @@ async fn get_data_at_time(
     axum::Json(serde_json::Value::Object(out)).into_response()
 }
 
-use archiver_core::types::archiver_value_to_json;
+use crate::value_json::archiver_value_to_json_v4;
 
 #[derive(Debug, Deserialize)]
 struct GetDataParams {
@@ -537,7 +537,7 @@ fn sample_to_json(s: &ArchiverSample) -> JsonSample {
     JsonSample {
         secs: dt.timestamp(),
         nanos: dt.timestamp_subsec_nanos() as i32,
-        val: archiver_value_to_json(&s.value),
+        val: archiver_value_to_json_v4(&s.value),
         severity: s.severity,
         status: s.status,
     }

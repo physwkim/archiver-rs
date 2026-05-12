@@ -361,7 +361,7 @@ pub async fn reassign_appliance(
                     samples_json.push(serde_json::json!({
                         "secs": secs,
                         "nanos": nanos,
-                        "value": archiver_value_to_json(&sample.value),
+                        "value": archiver_value_to_json_v4(&sample.value),
                         "severity": sample.severity,
                         "status": sample.status,
                     }));
@@ -567,7 +567,7 @@ pub async fn receive_pv_migration(
     .into_response()
 }
 
-use archiver_core::types::archiver_value_to_json;
+use crate::value_json::archiver_value_to_json_v4;
 
 /// Dest-side: JSON → ArchiverValue. Uses `dbr_type` to choose the
 /// right variant, since the JSON shape (number / string / array)

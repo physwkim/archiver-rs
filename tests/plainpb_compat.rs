@@ -1027,3 +1027,205 @@ async fn shared_fd_budget_caps_three_tiers_combined() {
     assert_eq!(mts.open_writer_count(), shared.count());
     assert_eq!(lts.open_writer_count(), shared.count());
 }
+
+// ── V4 structured-type archival ───────────────────────────────────
+//
+// V4GenericBytes carries a self-describing PVA payload
+// (`type_desc || value`, BigEndian) produced at the archiver-engine
+// monitor callback. These tests verify the PB storage layer
+// preserves those bytes through write→read, and that a typical
+// NTTable / NTNDArray-style Union shape decodes back to the same
+// structure.
+
+use epics_rs::pva::proto::ByteOrder;
+use epics_rs::pva::pvdata::encode::{
+    decode_pv_field, decode_type_desc, encode_pv_field, encode_type_desc,
+};
+use epics_rs::pva::pvdata::{PvField, PvStructure, ScalarValue, TypedScalarArray};
+
+/// Self-describing wire encoding of a top-level [`PvField`]:
+/// `encode_type_desc || encode_pv_field` in BigEndian — same path
+/// that archiver-engine's `encode_pv_field_self_describing` uses.
+fn encode_self_describing(field: &PvField) -> Vec<u8> {
+    let desc = field.descriptor();
+    let mut out = Vec::new();
+    encode_type_desc(&desc, ByteOrder::Big, &mut out);
+    encode_pv_field(field, &desc, ByteOrder::Big, &mut out);
+    out
+}
+
+/// NTTable with two double columns flows through the PB storage
+/// layer unchanged: encoded wire bytes → V4GenericBytes append →
+/// V4GenericBytes read → wire decode → original Structure shape.
+#[tokio::test]
+async fn roundtrip_v4_nttable_through_pb_storage() {
+    let mut table = PvStructure::new("epics:nt/NTTable:1.0");
+    let labels =
+        TypedScalarArray::String(vec!["x".to_string(), "y".to_string()].into_iter().collect());
+    table
+        .fields
+        .push(("labels".into(), PvField::ScalarArrayTyped(labels)));
+    let mut value_inner = PvStructure::new("");
+    value_inner.fields.push((
+        "x".into(),
+        PvField::ScalarArrayTyped(TypedScalarArray::Double(vec![1.0, 2.0, 3.0].into())),
+    ));
+    value_inner.fields.push((
+        "y".into(),
+        PvField::ScalarArrayTyped(TypedScalarArray::Double(vec![4.0, 5.0, 6.0].into())),
+    ));
+    table
+        .fields
+        .push(("value".into(), PvField::Structure(value_inner)));
+    let pv = PvField::Structure(table);
+    let wire = encode_self_describing(&pv);
+
+    let read = roundtrip_one(
+        "TEST:nttable",
+        ArchDbType::V4GenericBytes,
+        ArchiverValue::V4GenericBytes(wire.clone()),
+        PartitionGranularity::Day,
+    )
+    .await;
+    let bytes = match read {
+        ArchiverValue::V4GenericBytes(b) => b,
+        other => panic!("expected V4GenericBytes, got {other:?}"),
+    };
+    assert_eq!(bytes, wire, "PB layer must preserve wire bytes verbatim");
+
+    let mut cur = std::io::Cursor::new(bytes.as_slice());
+    let desc = decode_type_desc(&mut cur, ByteOrder::Big).expect("desc");
+    let decoded = decode_pv_field(&desc, &mut cur, ByteOrder::Big).expect("value");
+    let PvField::Structure(s) = decoded else {
+        panic!("expected Structure root");
+    };
+    assert_eq!(s.struct_id, "epics:nt/NTTable:1.0");
+    let value_sub = s
+        .fields
+        .iter()
+        .find_map(|(n, f)| {
+            if n == "value" {
+                if let PvField::Structure(v) = f {
+                    Some(v)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .expect("value substruct");
+    let x = value_sub
+        .fields
+        .iter()
+        .find_map(|(n, f)| if n == "x" { Some(f) } else { None })
+        .expect("x column");
+    let PvField::ScalarArrayTyped(TypedScalarArray::Double(xs)) = x else {
+        panic!("x column not Double[]");
+    };
+    assert_eq!(xs.as_ref(), &[1.0, 2.0, 3.0]);
+}
+
+/// NTNDArray uses `Union` for the `value` field. The PvField
+/// descriptor() only captures the currently-selected variant — each
+/// archived sample is self-decodable for the variant active at
+/// monitor time. This guards that the common single-variant case
+/// (e.g. doubleValue) round-trips through PB storage.
+#[tokio::test]
+async fn roundtrip_v4_union_single_variant_through_pb_storage() {
+    let mut root = PvStructure::new("epics:nt/NTNDArray:1.0");
+    // Build a Union value whose currently-selected variant is the
+    // `doubleValue` (ScalarArray<Double>) shape.
+    root.fields.push((
+        "value".into(),
+        PvField::Union {
+            selector: 0,
+            variant_name: "doubleValue".into(),
+            value: Box::new(PvField::ScalarArrayTyped(TypedScalarArray::Double(
+                vec![1.5_f64, 2.5, 3.5].into(),
+            ))),
+        },
+    ));
+    // A few normative companion fields.
+    let mut ts = PvStructure::new("time_t");
+    ts.fields.push((
+        "secondsPastEpoch".into(),
+        PvField::Scalar(ScalarValue::Long(42)),
+    ));
+    ts.fields
+        .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(7))));
+    root.fields
+        .push(("timeStamp".into(), PvField::Structure(ts)));
+    let pv = PvField::Structure(root);
+    let wire = encode_self_describing(&pv);
+
+    let read = roundtrip_one(
+        "TEST:ntndarray",
+        ArchDbType::V4GenericBytes,
+        ArchiverValue::V4GenericBytes(wire.clone()),
+        PartitionGranularity::Day,
+    )
+    .await;
+    let bytes = match read {
+        ArchiverValue::V4GenericBytes(b) => b,
+        other => panic!("expected V4GenericBytes, got {other:?}"),
+    };
+
+    let mut cur = std::io::Cursor::new(bytes.as_slice());
+    let desc = decode_type_desc(&mut cur, ByteOrder::Big).expect("desc");
+    let decoded = decode_pv_field(&desc, &mut cur, ByteOrder::Big).expect("value");
+    let PvField::Structure(s) = decoded else {
+        panic!("expected Structure root");
+    };
+    let value = s
+        .fields
+        .iter()
+        .find_map(|(n, f)| if n == "value" { Some(f) } else { None })
+        .expect("value");
+    let PvField::Union {
+        selector,
+        variant_name,
+        value: inner,
+    } = value
+    else {
+        panic!("expected Union, got {value:?}");
+    };
+    assert_eq!(*selector, 0, "selected variant index");
+    assert_eq!(variant_name, "doubleValue");
+    let PvField::ScalarArrayTyped(TypedScalarArray::Double(arr)) = inner.as_ref() else {
+        panic!("expected Double[]");
+    };
+    assert_eq!(arr.as_ref(), &[1.5_f64, 2.5, 3.5]);
+
+    let ts_sub = s
+        .fields
+        .iter()
+        .find_map(|(n, f)| {
+            if n == "timeStamp" {
+                if let PvField::Structure(v) = f {
+                    Some(v)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .expect("timeStamp substruct");
+    let secs = ts_sub
+        .fields
+        .iter()
+        .find_map(|(n, f)| {
+            if n == "secondsPastEpoch" {
+                if let PvField::Scalar(ScalarValue::Long(v)) = f {
+                    Some(*v)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .expect("secondsPastEpoch");
+    assert_eq!(secs, 42);
+}

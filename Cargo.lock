@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-api"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "archiver-core",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-core"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "archiver-proto",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-engine"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "archiver-core",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "archiver-proto"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -509,7 +509,7 @@ checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
 
 [[package]]
 name = "epics-archiver"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "archiver-api",
@@ -540,9 +540,9 @@ dependencies = [
 
 [[package]]
 name = "epics-base-rs"
-version = "0.16.0"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d9e9de133a6c6262a0fe5f743b4e128dcf5b513733e8949d8e0b24edf95e86f"
+checksum = "97bbb561564d8973ecc1e8fff10fa79b863770c82e3c20c082b63a3d7edc83af"
 dependencies = [
  "bytes",
  "chrono",
@@ -560,9 +560,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.16.0"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20b03e23eb398bf05316b13cbefb3a37a8fc128547cc6782dc875372890c9646"
+checksum = "7d6ac7856e791227781ea380e37376211012c6f52998b8949f8dfeb56b78cda9"
 dependencies = [
  "async-trait",
  "chrono",
@@ -580,9 +580,9 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.16.0"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b000d2f72375cd04f73ab5d5cdbdb780d121cb4f41cce78eda8ee714cab25011"
+checksum = "798271d567a954f43fa70e18fc61f19c9084cf27b6d6986ebd8957decec30912"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -592,9 +592,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.16.0"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc6c84f6602429cbe8592e4cfbfd770abe9a5030d6a2be33f32b57f9d2c66a23"
+checksum = "d621c1dca896a0ea0089d225176d4f6ed315f5cfd201ea7a0fedc50713db1535"
 dependencies = [
  "bytes",
  "chrono",
@@ -620,9 +620,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
-version = "0.16.0"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7817d18115a52bc428a719482d1ead10b7c03ac46321b39173b7aeb7edcd3294"
+checksum = "b3b7ca4f89e3b8d07a4b8d80d5fc4719bc2a9fb69ad50b916d7b31dd2e0d4d60"
 dependencies = [
  "epics-base-rs",
  "epics-ca-rs",

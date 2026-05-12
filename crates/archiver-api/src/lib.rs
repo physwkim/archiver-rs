@@ -10,6 +10,7 @@ pub mod services;
 mod state;
 pub mod ui;
 pub mod usecases;
+pub mod value_json;
 
 pub use state::{AppState, FailoverState};
 

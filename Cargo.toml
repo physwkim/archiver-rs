@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -74,7 +74,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
 
 # EPICS Channel Access
-epics-rs = { version = "0.16.0", features = ["pva"] }
+epics-rs = { version = "0.16.2", features = ["pva"] }
 
 # URL encoding
 urlencoding = "2"
@@ -87,20 +87,20 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 # Internal crates
-archiver-proto = { path = "crates/archiver-proto", version = "0.3.2" }
-archiver-core = { path = "crates/archiver-core", version = "0.3.2" }
-archiver-engine = { path = "crates/archiver-engine", version = "0.3.2" }
-archiver-api = { path = "crates/archiver-api", version = "0.3.2" }
+archiver-proto = { path = "crates/archiver-proto", version = "0.4.0" }
+archiver-core = { path = "crates/archiver-core", version = "0.4.0" }
+archiver-engine = { path = "crates/archiver-engine", version = "0.4.0" }
+archiver-api = { path = "crates/archiver-api", version = "0.4.0" }
 
 [package]
 name = "epics-archiver"
 # Decoupled from workspace.package.version so the binary can ship
 # bug-fix releases (e.g. CLI ergonomics) without churning the four
-# library crates whose code is unchanged. For v0.3.2 the binary and
-# the four library crates re-align on a single version (epics-rs
-# 0.16.0 dep bump touches every crate); future binary-only patch
-# releases may diverge again.
-version = "0.3.2"
+# library crates whose code is unchanged. v0.4.0 keeps binary and
+# the four library crates aligned (PVA structured-type archival +
+# epics-rs 0.16.2 bump touches every crate); future binary-only
+# patch releases may diverge again.
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

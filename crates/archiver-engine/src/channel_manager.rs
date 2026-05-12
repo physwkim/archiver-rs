@@ -7,7 +7,9 @@ use epics_rs::base::server::snapshot::DbrClass;
 use epics_rs::base::types::{DbFieldType, EpicsValue};
 use epics_rs::ca::client::{CaChannel, CaClient, ConnectionEvent};
 use epics_rs::pva::client_native::PvaClient;
-use epics_rs::pva::pvdata::{PvField, ScalarValue};
+use epics_rs::pva::proto::ByteOrder;
+use epics_rs::pva::pvdata::encode::{encode_pv_field, encode_type_desc};
+use epics_rs::pva::pvdata::{PvField, ScalarType, ScalarValue, TypedScalarArray};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -532,15 +534,19 @@ impl ChannelManager {
             .map_err(|e| anyhow::anyhow!("Failed to connect to {pv_name} via PVA: {e}"))?;
         debug!(pv = pv_name, server = %connect, "PVA channel connected");
 
-        let initial = tokio::time::timeout(CA_CONNECT_TIMEOUT, self.pva_client.pvget(pv_name))
+        // pvget_full (not pvget) so the introspection round-trips
+        // alongside the value: every PVA read in this crate goes
+        // through a desc-aware API, matching the no-fallback invariant
+        // enforced by `pv_field_scalar_to_archiver`. The same op_get
+        // wire op underlies both, so this is a free strengthening.
+        let initial = tokio::time::timeout(CA_CONNECT_TIMEOUT, self.pva_client.pvget_full(pv_name))
             .await
             .map_err(|_| anyhow::anyhow!("PVA pvget for {pv_name} timed out"))?
             .map_err(|e| anyhow::anyhow!("Failed to pvget {pv_name}: {e}"))?;
-        let (dbr_type, element_count) = pv_field_to_arch_db_type(&initial).ok_or_else(|| {
-            anyhow::anyhow!(
-                "PV {pv_name}: PVA value is not a scalar/scalar-array; structured types not yet supported"
-            )
-        })?;
+        let (dbr_type, element_count) =
+            pv_field_to_arch_db_type(&initial.value).ok_or_else(|| {
+                anyhow::anyhow!("PV {pv_name}: empty PVA scalar-array; cannot infer element type")
+            })?;
 
         // Register with Pva flag.
         self.registry.register_pv_with_protocol(
@@ -555,7 +561,7 @@ impl ChannelManager {
         }
         // Persist PREC/EGU extracted from the same pvget — equivalent
         // to the CA path's DBR_CTRL refresh. Non-fatal on error.
-        let (prec, egu) = pv_field_extract_display(&initial);
+        let (prec, egu) = pv_field_extract_display(&initial.value);
         if (prec.is_some() || egu.is_some())
             && let Err(e) = self
                 .registry
@@ -1058,13 +1064,16 @@ impl ChannelManager {
     ) -> Option<anyhow::Result<ArchiverValue>> {
         let channel_opt = self.channels.get(pv_name)?.channel.clone();
         let Some(channel) = channel_opt else {
-            // PVA-acquired PV — live_value via pva_client.pvget.
+            // PVA-acquired PV — live_value via pvget_full so we get
+            // the canonical channel descriptor alongside the value;
+            // V4GenericBytes encoding then preserves Union / Variant
+            // schemas instead of using lossy value-recovery.
             let pva = self.pva_client.clone();
             let name = pv_name.to_string();
-            let res = tokio::time::timeout(timeout, pva.pvget(&name)).await;
+            let res = tokio::time::timeout(timeout, pva.pvget_full(&name)).await;
             return Some(match res {
-                Ok(Ok(field)) => pv_field_scalar_to_archiver(&field)
-                    .ok_or_else(|| anyhow::anyhow!("PVA value not a scalar")),
+                Ok(Ok(result)) => pv_field_scalar_to_archiver(&result.value, &result.introspection)
+                    .ok_or_else(|| anyhow::anyhow!("PVA value has no archiver mapping")),
                 Ok(Err(e)) => Err(anyhow::anyhow!("PVA get failed: {e}")),
                 Err(_) => Err(anyhow::anyhow!("PVA get timed out after {timeout:?}")),
             });
@@ -1225,9 +1234,18 @@ async fn refresh_ctrl_metadata(
 /// (`pvmonitor_handle` takes `(FieldDesc, PvField)`,
 /// `pvmonitor_with_request` takes `(PvField)`). Lifted out so we
 /// can write the once-per-event logic in one place.
+///
+/// `canonical_desc` is the channel-INIT introspection descriptor —
+/// required at every callsite. The fast-path callback receives one
+/// per event from the pvxs reactor; the custom-request path
+/// pre-fetches it once via `pvinfo` and reuses the same `Arc`
+/// across every event in a subscribe generation (a failed `pvinfo`
+/// aborts subscribe + retries rather than degrading to lossy
+/// value-recovery, so the on-disk invariant always holds).
 #[allow(clippy::too_many_arguments)]
 fn pva_handle_event(
     field: &PvField,
+    canonical_desc: &epics_rs::pva::pvdata::FieldDesc,
     pv_name: &str,
     dbr_type: ArchDbType,
     tx: &mpsc::Sender<PvSample>,
@@ -1257,9 +1275,9 @@ fn pva_handle_event(
     }
     counters.events_received.fetch_add(1, Ordering::Relaxed);
 
-    let Some(value) = pv_field_scalar_to_archiver(field) else {
+    let Some(value) = pv_field_scalar_to_archiver(field, canonical_desc) else {
         counters.type_change_drops.fetch_add(1, Ordering::Relaxed);
-        debug!(pv = pv_name, "PVA event has non-scalar value; dropping");
+        debug!(pv = pv_name, "PVA event has no archiver mapping; dropping");
         return;
     };
 
@@ -1277,6 +1295,7 @@ fn pva_handle_event(
         0 => 1,
         n => n,
     };
+    refresh_nt_enum_extras(field, extras);
     for (field_name, path) in extras_paths {
         if let Some(PvField::Scalar(s)) = pv_field_walk_path(field, path) {
             extras.insert(field_name.clone(), scalar_value_to_string(s));
@@ -1354,18 +1373,41 @@ async fn monitor_loop_pva(
     // since that's the simpler path for the common case.
     loop {
         if let Some(ref req) = request_expr {
-            // Custom-request path: 1-arg callback. pvmonitor_with_request
-            // returns a future that runs to completion; race it against
-            // the cancel signal.
+            // Custom-request path: 1-arg callback. `pvmonitor_with_request`
+            // does not surface the channel's FieldDesc per event, so we
+            // pre-fetch it once via `pvinfo` and reuse the Arc across
+            // every event in this subscription generation. A failed
+            // pvinfo aborts this subscribe attempt and retries — the
+            // archiver invariant is that every V4 sample on disk
+            // carries the channel-INIT descriptor, so degrading to
+            // value-recovery is not allowed.
+            let canonical = match pva_client.pvinfo(&pv_name).await {
+                Ok(d) => Arc::new(d),
+                Err(e) => {
+                    counters
+                        .transient_error_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        pv = pv_name,
+                        "PVA pvinfo failed: {e}; cannot capture canonical descriptor — retrying subscribe"
+                    );
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => return,
+                        _ = tokio::time::sleep(CA_RETRY_DELAY) => continue,
+                    }
+                }
+            };
             let pv_name_cb = pv_name.clone();
             let tx_cb = tx.clone();
             let conn_info_cb = conn_info.clone();
             let counters_cb = counters.clone();
             let extras_cb = extras.clone();
             let extras_paths_cb = extras_paths.clone();
+            let canonical_cb = canonical.clone();
             let cb = move |field: &PvField| {
                 pva_handle_event(
                     field,
+                    &canonical_cb,
                     &pv_name_cb,
                     dbr_type,
                     &tx_cb,
@@ -1402,16 +1444,21 @@ async fn monitor_loop_pva(
         } else {
             // Empty-request fast path: 2-arg callback. Keep the
             // SubscriptionHandle so the inner reactor task lives
-            // until our explicit drop.
+            // until our explicit drop. The per-event FieldDesc the
+            // reactor hands us IS the channel-INIT descriptor (pvxs
+            // refreshes only on type-change, which forces reconnect
+            // upstream), so it's wire-faithful for Union / Variant
+            // shapes that `PvField::descriptor()` would degrade.
             let pv_name_cb = pv_name.clone();
             let tx_cb = tx.clone();
             let conn_info_cb = conn_info.clone();
             let counters_cb = counters.clone();
             let extras_cb = extras.clone();
             let extras_paths_cb = extras_paths.clone();
-            let cb = move |_desc: &epics_rs::pva::pvdata::FieldDesc, field: &PvField| {
+            let cb = move |desc: &epics_rs::pva::pvdata::FieldDesc, field: &PvField| {
                 pva_handle_event(
                     field,
+                    desc,
                     &pv_name_cb,
                     dbr_type,
                     &tx_cb,
@@ -1477,9 +1524,13 @@ async fn scan_loop_pva(
             _ = interval.tick() => {}
         }
 
-        let res = tokio::time::timeout(pvget_timeout, pva_client.pvget(&pv_name)).await;
-        let field = match res {
-            Ok(Ok(f)) => f,
+        // pvget_full carries the channel's canonical FieldDesc alongside
+        // the value, so V4GenericBytes encoding can preserve Union /
+        // UnionArray / Variant schemas that `PvField::descriptor()`
+        // would otherwise degrade.
+        let res = tokio::time::timeout(pvget_timeout, pva_client.pvget_full(&pv_name)).await;
+        let (field, canonical) = match res {
+            Ok(Ok(r)) => (r.value, r.introspection),
             Ok(Err(e)) => {
                 let was_connected = {
                     let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
@@ -1534,9 +1585,12 @@ async fn scan_loop_pva(
                 .ok();
         }
 
-        let Some(value) = pv_field_scalar_to_archiver(&field) else {
+        let Some(value) = pv_field_scalar_to_archiver(&field, &canonical) else {
             counters.type_change_drops.fetch_add(1, Ordering::Relaxed);
-            debug!(pv = pv_name, "PVA scan returned non-scalar value; dropping");
+            debug!(
+                pv = pv_name,
+                "PVA scan value has no archiver mapping; dropping"
+            );
             continue;
         };
         // Scan mode: timestamp the sample at receive time (no IOC
@@ -1550,6 +1604,7 @@ async fn scan_loop_pva(
         // Refresh extras from this scan's pvget result (the pvget
         // returns the full NTScalar so all sub-fields are available
         // for free — no extra channel spawn needed).
+        refresh_nt_enum_extras(&field, &extras);
         for (field_name, path) in &extras_paths {
             if let Some(PvField::Scalar(s)) = pv_field_walk_path(&field, path) {
                 extras.insert(field_name.clone(), scalar_value_to_string(s));
@@ -2343,48 +2398,267 @@ fn scalar_value_to_archiver(s: &ScalarValue) -> ArchiverValue {
     }
 }
 
-/// Extract a scalar `ArchiverValue` from a top-level PVA value (which
-/// may be an NTScalar wrapper). Returns `None` for array/struct types
-/// that don't reduce to a scalar.
-fn pv_field_scalar_to_archiver(field: &PvField) -> Option<ArchiverValue> {
+/// Extract an `ArchiverValue` from a top-level PVA value. NTScalar /
+/// NTScalarArray are unwrapped via `value`; NTEnum collapses to
+/// `ScalarEnum(index)` (Java archiver parity — choices land in the
+/// monitor callback's extras cache); bare Structure roots (NTTable,
+/// NTNDArray, user-defined NTs) wire-encode the whole root as opaque
+/// [`ArchiverValue::V4GenericBytes`] so retrieval can reconstruct the
+/// full structure.
+///
+/// `canonical_desc` is the channel-INIT descriptor that producers
+/// (monitor/scan/live_value callsites) plumb through so
+/// [`encode_pv_field_self_describing`] preserves Union / UnionArray
+/// / Variant shapes that [`PvField::descriptor()`] would degrade.
+/// Required at every callsite — there is no value-recovery fallback.
+fn pv_field_scalar_to_archiver(
+    field: &PvField,
+    canonical_desc: &epics_rs::pva::pvdata::FieldDesc,
+) -> Option<ArchiverValue> {
+    // NTEnum special-case: take the `value.index` int as the scalar
+    // sample. Must run before `pv_value_field` peeling, because
+    // peeling on an NTEnum returns the inner `enum_t` Structure,
+    // which would fall through to the V4GenericBytes path.
+    if let Some((index, _)) = nt_enum_parts(field) {
+        return Some(ArchiverValue::ScalarEnum(index));
+    }
     match pv_value_field(field) {
         PvField::Scalar(s) => Some(scalar_value_to_archiver(s)),
-        _ => None,
+        PvField::ScalarArrayTyped(arr) => Some(typed_scalar_array_to_archiver(arr)),
+        PvField::ScalarArray(items) => {
+            // Legacy untyped scalar-array path (rare with pvxs 0.14+,
+            // which decodes into `ScalarArrayTyped`). Promote to the
+            // typed form so a single converter covers both.
+            let st = items.first()?.scalar_type();
+            let typed = TypedScalarArray::from_scalar_values(items, st)?;
+            Some(typed_scalar_array_to_archiver(&typed))
+        }
+        // Any other shape — NTTable (`value` is itself a Structure of
+        // column arrays), NTNDArray, user-defined NTs — archive the
+        // root PvField (NOT the unwrapped value, which would lose
+        // labels / alarm / timeStamp) as opaque V4GenericBytes.
+        _ => Some(ArchiverValue::V4GenericBytes(
+            encode_pv_field_self_describing(field, canonical_desc),
+        )),
     }
 }
 
 /// Pick the `(ArchDbType, element_count)` to record at archive_pv time
-/// from an NTScalar / NTScalarArray's introspection-pvget result.
-/// Returns `None` for unsupported (struct / union / variant) shapes.
+/// from a PVA introspection-pvget result.
+///
+/// - NTScalar / NTScalarArray: typed by the unwrapped `value` field.
+/// - Bare scalar / scalar-array root: typed directly.
+/// - Anything else (NTTable, NTNDArray, user-defined NT structures):
+///   archived as [`ArchDbType::V4GenericBytes`] with element_count = 1
+///   (the structure as a whole is one sample; inner cardinality is
+///   carried inside the wire-encoded bytes).
 fn pv_field_to_arch_db_type(field: &PvField) -> Option<(ArchDbType, i32)> {
+    // NTEnum: register as ScalarEnum (the index is the archived
+    // value); choices live in extras_cache rather than the dbr_type.
+    if nt_enum_parts(field).is_some() {
+        return Some((ArchDbType::ScalarEnum, 1));
+    }
     let value = pv_value_field(field);
     Some(match value {
-        PvField::Scalar(s) => (
-            match s {
-                ScalarValue::Boolean(_) => ArchDbType::ScalarEnum,
-                ScalarValue::Byte(_) | ScalarValue::UByte(_) => ArchDbType::ScalarByte,
-                ScalarValue::Short(_) | ScalarValue::UShort(_) => ArchDbType::ScalarShort,
-                ScalarValue::Int(_)
-                | ScalarValue::UInt(_)
-                | ScalarValue::Long(_)
-                | ScalarValue::ULong(_) => ArchDbType::ScalarInt,
-                ScalarValue::Float(_) => ArchDbType::ScalarFloat,
-                ScalarValue::Double(_) => ArchDbType::ScalarDouble,
-                ScalarValue::String(_) => ArchDbType::ScalarString,
-            },
-            1,
-        ),
-        // Array variants — keep the corresponding scalar element type but
-        // bump element_count. write_loop / PB encoder doesn't currently
-        // serialise PVA arrays, so callers should reject these for now.
+        PvField::Scalar(s) => (scalar_value_to_arch_db_type(s), 1),
         PvField::ScalarArray(arr) => {
             let elem = arr.first()?;
-            let inner = PvField::Scalar(elem.clone());
-            let (t, _) = pv_field_to_arch_db_type(&inner)?;
-            (t, arr.len() as i32)
+            (
+                scalar_type_to_waveform(elem.scalar_type()),
+                arr.len() as i32,
+            )
         }
-        _ => return None,
+        PvField::ScalarArrayTyped(arr) => {
+            (scalar_type_to_waveform(arr.scalar_type()), arr.len() as i32)
+        }
+        _ => (ArchDbType::V4GenericBytes, 1),
     })
+}
+
+/// Scalar-form ArchDbType for a [`ScalarValue`].
+fn scalar_value_to_arch_db_type(s: &ScalarValue) -> ArchDbType {
+    match s {
+        ScalarValue::Boolean(_) => ArchDbType::ScalarEnum,
+        ScalarValue::Byte(_) | ScalarValue::UByte(_) => ArchDbType::ScalarByte,
+        ScalarValue::Short(_) | ScalarValue::UShort(_) => ArchDbType::ScalarShort,
+        ScalarValue::Int(_)
+        | ScalarValue::UInt(_)
+        | ScalarValue::Long(_)
+        | ScalarValue::ULong(_) => ArchDbType::ScalarInt,
+        ScalarValue::Float(_) => ArchDbType::ScalarFloat,
+        ScalarValue::Double(_) => ArchDbType::ScalarDouble,
+        ScalarValue::String(_) => ArchDbType::ScalarString,
+    }
+}
+
+/// Waveform-form ArchDbType for a [`ScalarType`].
+fn scalar_type_to_waveform(st: ScalarType) -> ArchDbType {
+    match st {
+        ScalarType::Boolean => ArchDbType::WaveformEnum,
+        ScalarType::Byte | ScalarType::UByte => ArchDbType::WaveformByte,
+        ScalarType::Short | ScalarType::UShort => ArchDbType::WaveformShort,
+        ScalarType::Int | ScalarType::UInt | ScalarType::Long | ScalarType::ULong => {
+            ArchDbType::WaveformInt
+        }
+        ScalarType::Float => ArchDbType::WaveformFloat,
+        ScalarType::Double => ArchDbType::WaveformDouble,
+        ScalarType::String => ArchDbType::WaveformString,
+    }
+}
+
+/// Convert a [`TypedScalarArray`] into the matching [`ArchiverValue`]
+/// vector variant. Widening (i8/i16/i64 → i32) mirrors the scalar path
+/// in [`scalar_value_to_archiver`], so a waveform of `Long` stores as
+/// `VectorInt` (out-of-range values truncate, same caveat as the CA
+/// `DbFieldType::Int64` mapping).
+fn typed_scalar_array_to_archiver(arr: &TypedScalarArray) -> ArchiverValue {
+    match arr {
+        TypedScalarArray::Boolean(a) => {
+            ArchiverValue::VectorEnum(a.iter().map(|&b| b as i32).collect())
+        }
+        TypedScalarArray::Byte(a) => {
+            ArchiverValue::VectorChar(a.iter().map(|&v| v as u8).collect())
+        }
+        TypedScalarArray::UByte(a) => ArchiverValue::VectorChar(a.to_vec()),
+        TypedScalarArray::Short(a) => {
+            ArchiverValue::VectorShort(a.iter().map(|&v| v as i32).collect())
+        }
+        TypedScalarArray::UShort(a) => {
+            ArchiverValue::VectorShort(a.iter().map(|&v| v as i32).collect())
+        }
+        TypedScalarArray::Int(a) => ArchiverValue::VectorInt(a.to_vec()),
+        TypedScalarArray::UInt(a) => {
+            ArchiverValue::VectorInt(a.iter().map(|&v| v as i32).collect())
+        }
+        TypedScalarArray::Long(a) => {
+            ArchiverValue::VectorInt(a.iter().map(|&v| v as i32).collect())
+        }
+        TypedScalarArray::ULong(a) => {
+            ArchiverValue::VectorInt(a.iter().map(|&v| v as i32).collect())
+        }
+        TypedScalarArray::Float(a) => ArchiverValue::VectorFloat(a.to_vec()),
+        TypedScalarArray::Double(a) => ArchiverValue::VectorDouble(a.to_vec()),
+        TypedScalarArray::String(a) => ArchiverValue::VectorString(a.to_vec()),
+    }
+}
+
+/// NTEnum shape detection. Returns `Some((index, choices))` when
+/// `field` is a Structure whose `struct_id` starts with
+/// `"epics:nt/NTEnum"` AND carries a `value` substructure of the
+/// `enum_t` shape (`index: integer`, `choices: string[]`). Java
+/// archiver follows the same dual gate — explicit normative ID +
+/// shape match — to avoid mis-classifying user structs that happen
+/// to expose an `index` field.
+///
+/// `choices` is `None` when the substructure omits the field; the
+/// monitor callback then leaves the prior cached value in place.
+fn nt_enum_parts(field: &PvField) -> Option<(i32, Option<Vec<String>>)> {
+    let PvField::Structure(root) = field else {
+        return None;
+    };
+    if !root.struct_id.starts_with("epics:nt/NTEnum") {
+        return None;
+    }
+    let PvField::Structure(inner) = root.get_field("value")? else {
+        return None;
+    };
+    let index = match inner.get_field("index")? {
+        PvField::Scalar(ScalarValue::Int(v)) => *v,
+        PvField::Scalar(ScalarValue::Long(v)) => *v as i32,
+        PvField::Scalar(ScalarValue::Short(v)) => *v as i32,
+        PvField::Scalar(ScalarValue::UInt(v)) => *v as i32,
+        PvField::Scalar(ScalarValue::ULong(v)) => *v as i32,
+        PvField::Scalar(ScalarValue::UShort(v)) => *v as i32,
+        _ => return None,
+    };
+    let choices = match inner.get_field("choices") {
+        Some(PvField::ScalarArrayTyped(TypedScalarArray::String(arr))) => Some(arr.to_vec()),
+        Some(PvField::ScalarArray(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for s in items {
+                if let ScalarValue::String(c) = s {
+                    out.push(c.clone());
+                } else {
+                    return None; // mixed-type choices array — reject
+                }
+            }
+            Some(out)
+        }
+        Some(_) => return None,
+        None => None,
+    };
+    Some((index, choices))
+}
+
+/// Encode NTEnum `choices` (UTF-8 strings) into the extras-cache
+/// payload that lands in `field_values` per sample. JSON-array form
+/// so retrieval clients can `JSON.parse(meta.enum_strs)` directly —
+/// pipe/comma delimiters would break on choice names that contain
+/// those characters. Hand-rolled to avoid pulling `serde_json` into
+/// archiver-engine for a single string.
+fn nt_enum_choices_to_extras(choices: &[String]) -> String {
+    let mut out = String::with_capacity(2 + choices.iter().map(|s| s.len() + 3).sum::<usize>());
+    out.push('[');
+    for (i, c) in choices.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        for ch in c.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    use std::fmt::Write;
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
+/// Refresh the extras cache for an NTEnum-shaped monitor event so
+/// downstream retrieval can surface `enum_strs` alongside the
+/// archived index. No-op when `field` is not an NTEnum or its
+/// `choices` substructure is absent (cached value from the last
+/// successful event stays put).
+fn refresh_nt_enum_extras(field: &PvField, extras: &ExtraFieldsCache) {
+    if let Some((_, Some(choices))) = nt_enum_parts(field) {
+        extras.insert("enum_strs".to_string(), nt_enum_choices_to_extras(&choices));
+    }
+}
+
+/// Serialize a top-level [`PvField`] (NTTable, NTNDArray, user-defined
+/// structures) as the self-describing payload stored under
+/// [`ArchDbType::V4GenericBytes`]. Layout is `type_desc || value` in
+/// PVA wire format (BigEndian), so each sample on disk is decodable
+/// in isolation — no shared introspection cache needed across the
+/// archive day-roll boundary.
+///
+/// `canonical_desc` is the channel's introspection descriptor captured
+/// at INIT (via `pvinfo` / `pvget_full` / per-event `pvmonitor_handle`
+/// callback). It is **required**: `PvField::descriptor()` recovery
+/// is lossy for `Union` (drops sibling variants), `UnionArray`
+/// (empties variants list), and `Variant` (degrades to bare
+/// `Variant`) — see epics-pva-rs `structure.rs:descriptor` doc. The
+/// archiver invariant is that every V4 sample on disk preserves the
+/// channel-level descriptor, so callers must plumb it through rather
+/// than relying on value-recovery.
+fn encode_pv_field_self_describing(
+    field: &PvField,
+    canonical_desc: &epics_rs::pva::pvdata::FieldDesc,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    encode_type_desc(canonical_desc, ByteOrder::Big, &mut out);
+    encode_pv_field(field, canonical_desc, ByteOrder::Big, &mut out);
+    out
 }
 
 /// Map a CA field name (`HIHI`, `LOLO`, `EGU`, …) to the dotted
@@ -3604,4 +3878,410 @@ async fn flush_owner_loop(
         .await;
     }
     info!("Flush owner exiting");
+}
+
+#[cfg(test)]
+mod pva_mapping_tests {
+    use super::*;
+    use epics_rs::pva::pvdata::PvStructure;
+    use epics_rs::pva::pvdata::encode::{decode_pv_field, decode_type_desc};
+    use std::io::Cursor;
+
+    /// Build a synthetic NTTable with two double columns. Mirrors what
+    /// a live IOC publishes for a typical waveform-table channel.
+    fn make_nttable() -> PvField {
+        let mut table = PvStructure::new("epics:nt/NTTable:1.0");
+        let labels =
+            TypedScalarArray::String(vec!["x".to_string(), "y".to_string()].into_iter().collect());
+        table
+            .fields
+            .push(("labels".into(), PvField::ScalarArrayTyped(labels)));
+        let mut value_inner = PvStructure::new("");
+        value_inner.fields.push((
+            "x".into(),
+            PvField::ScalarArrayTyped(TypedScalarArray::Double(vec![1.0, 2.0, 3.0].into())),
+        ));
+        value_inner.fields.push((
+            "y".into(),
+            PvField::ScalarArrayTyped(TypedScalarArray::Double(vec![4.0, 5.0, 6.0].into())),
+        ));
+        table
+            .fields
+            .push(("value".into(), PvField::Structure(value_inner)));
+        PvField::Structure(table)
+    }
+
+    #[test]
+    fn nttable_classifies_as_v4_generic_bytes() {
+        let pv = make_nttable();
+        let (db, ec) = pv_field_to_arch_db_type(&pv).expect("classified");
+        assert_eq!(db, ArchDbType::V4GenericBytes);
+        assert_eq!(ec, 1);
+    }
+
+    #[test]
+    fn nttable_round_trips_through_self_describing_bytes() {
+        let pv = make_nttable();
+        let av = pv_field_scalar_to_archiver(&pv, &pv.descriptor()).expect("converted");
+        let bytes = match av {
+            ArchiverValue::V4GenericBytes(b) => b,
+            other => panic!("expected V4GenericBytes, got {:?}", other.db_type()),
+        };
+        let mut cur = Cursor::new(bytes.as_slice());
+        let desc = decode_type_desc(&mut cur, ByteOrder::Big).expect("desc decode");
+        let decoded = decode_pv_field(&desc, &mut cur, ByteOrder::Big).expect("value decode");
+        let PvField::Structure(s) = decoded else {
+            panic!("expected Structure after decode");
+        };
+        assert_eq!(s.struct_id, "epics:nt/NTTable:1.0");
+        // labels column survives + value substructure has 2 columns.
+        let labels = s
+            .fields
+            .iter()
+            .find_map(|(n, f)| if n == "labels" { Some(f) } else { None })
+            .expect("labels");
+        let Some(PvField::ScalarArrayTyped(TypedScalarArray::String(arr))) = Some(labels) else {
+            panic!("labels not a string array");
+        };
+        assert_eq!(arr.len(), 2);
+        let value = s
+            .fields
+            .iter()
+            .find_map(|(n, f)| {
+                if n == "value" {
+                    if let PvField::Structure(v) = f {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .expect("value substruct");
+        assert_eq!(value.fields.len(), 2);
+    }
+
+    /// NTScalarArray of doubles should classify as WaveformDouble and
+    /// convert to VectorDouble — this is the pre-existing PVA waveform
+    /// path that was silently broken by the missing ScalarArrayTyped
+    /// branch.
+    #[test]
+    fn nt_scalar_array_double_classifies_as_waveform() {
+        let mut wrapper = PvStructure::new("epics:nt/NTScalarArray:1.0");
+        wrapper.fields.push((
+            "value".into(),
+            PvField::ScalarArrayTyped(TypedScalarArray::Double(vec![1.5, 2.5, 3.5].into())),
+        ));
+        let pv = PvField::Structure(wrapper);
+
+        let (db, ec) = pv_field_to_arch_db_type(&pv).expect("classified");
+        assert_eq!(db, ArchDbType::WaveformDouble);
+        assert_eq!(ec, 3);
+        let av = pv_field_scalar_to_archiver(&pv, &pv.descriptor()).expect("converted");
+        match av {
+            ArchiverValue::VectorDouble(v) => assert_eq!(v, vec![1.5, 2.5, 3.5]),
+            other => panic!("expected VectorDouble, got {:?}", other.db_type()),
+        }
+    }
+
+    /// NTEnum: classification short-circuits to ScalarEnum (Java
+    /// archiver parity — store the index, not the whole enum_t
+    /// structure as opaque V4 bytes).
+    #[test]
+    fn nt_enum_classifies_as_scalar_enum() {
+        let pv = make_nt_enum(2, &["Zero", "One", "Two"]);
+        let (db, ec) = pv_field_to_arch_db_type(&pv).expect("classified");
+        assert_eq!(db, ArchDbType::ScalarEnum);
+        assert_eq!(ec, 1);
+    }
+
+    /// NTEnum: value extraction yields ScalarEnum(index).
+    #[test]
+    fn nt_enum_value_is_index() {
+        let pv = make_nt_enum(2, &["Off", "On"]);
+        let av = pv_field_scalar_to_archiver(&pv, &pv.descriptor()).expect("converted");
+        match av {
+            ArchiverValue::ScalarEnum(i) => assert_eq!(i, 2),
+            other => panic!("expected ScalarEnum, got {:?}", other.db_type()),
+        }
+    }
+
+    /// NTEnum: monitor callback feeds choices into the extras cache
+    /// under the `enum_strs` key as a JSON-encoded string array.
+    /// Downstream `attach_extras` then mirrors it into the sample's
+    /// `field_values`, which the retrieval JSON surfaces under `meta`.
+    #[test]
+    fn nt_enum_extras_carries_json_choices() {
+        let pv = make_nt_enum(1, &["Off", "On", "Trip"]);
+        let extras: ExtraFieldsCache = DashMap::new();
+        refresh_nt_enum_extras(&pv, &extras);
+        let stored = extras
+            .get("enum_strs")
+            .map(|s| s.value().clone())
+            .expect("enum_strs cached");
+        assert_eq!(stored, r#"["Off","On","Trip"]"#);
+    }
+
+    /// Top-level `UnionArray` PV: with the canonical channel
+    /// descriptor plumbed through (per epics-rs `descriptor()` doc
+    /// guidance), wire encoding preserves the variants list and the
+    /// values round-trip. The archiver invariant requires the
+    /// canonical descriptor at every callsite — there is no
+    /// value-recovery fallback path to contrast against any more.
+    #[test]
+    fn union_array_roundtrips_with_canonical_descriptor() {
+        use epics_rs::pva::pvdata::encode::{decode_pv_field, decode_type_desc};
+        use epics_rs::pva::pvdata::{FieldDesc, UnionItem};
+        use std::io::Cursor;
+
+        let variants_desc = vec![
+            ("intVal".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+            ("dblVal".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+        ];
+        let canonical = FieldDesc::UnionArray {
+            struct_id: String::new(),
+            variants: variants_desc.clone(),
+        };
+        let items = vec![
+            UnionItem {
+                selector: 0,
+                variant_name: "intVal".into(),
+                value: PvField::Scalar(ScalarValue::Int(42)),
+            },
+            UnionItem {
+                selector: 1,
+                variant_name: "dblVal".into(),
+                value: PvField::Scalar(ScalarValue::Double(1.5)),
+            },
+        ];
+        let field = PvField::UnionArray(items);
+
+        let wire = encode_pv_field_self_describing(&field, &canonical);
+        let mut cur = Cursor::new(wire.as_slice());
+        let desc_back = decode_type_desc(&mut cur, ByteOrder::Big).expect("desc");
+        let val_back = decode_pv_field(&desc_back, &mut cur, ByteOrder::Big).expect("value");
+        let PvField::UnionArray(items_back) = val_back else {
+            panic!("expected UnionArray, got {val_back:?}");
+        };
+        assert_eq!(items_back.len(), 2);
+        assert_eq!(items_back[0].selector, 0);
+        assert!(matches!(
+            items_back[0].value,
+            PvField::Scalar(ScalarValue::Int(42))
+        ));
+        assert_eq!(items_back[1].selector, 1);
+        match &items_back[1].value {
+            PvField::Scalar(ScalarValue::Double(d)) => assert!((*d - 1.5).abs() < 1e-9),
+            other => panic!("variant 1 not Double, got {other:?}"),
+        }
+
+        // Descriptor's variants list survives the wire round-trip
+        // (this is what was lost in the pre-plumb-through behaviour).
+        match desc_back {
+            FieldDesc::UnionArray { variants, .. } => {
+                assert_eq!(variants.len(), 2);
+                assert_eq!(variants[0].0, "intVal");
+                assert!(matches!(variants[0].1, FieldDesc::Scalar(ScalarType::Int)));
+                assert_eq!(variants[1].0, "dblVal");
+                assert!(matches!(
+                    variants[1].1,
+                    FieldDesc::Scalar(ScalarType::Double)
+                ));
+            }
+            other => panic!("expected UnionArray descriptor, got {other:?}"),
+        }
+    }
+
+    /// NTNDArray-style root: `value` is a `Union` over ten POD scalar
+    /// array variants (one for each NT-spec POD type). Live PVA only
+    /// ever ships ONE variant per sample, but the channel-INIT
+    /// descriptor advertises all ten — and the archiver invariant
+    /// requires every V4GenericBytes sample to carry the channel-INIT
+    /// descriptor verbatim. This test pushes a `PvField` shaped like
+    /// a live monitor event through `pv_field_scalar_to_archiver`
+    /// using a multi-variant canonical descriptor, then decodes the
+    /// resulting wire bytes and confirms ALL ten variant slots
+    /// survive on disk. Previously (descriptor-recovery fallback)
+    /// only the active variant would round-trip — regression guard
+    /// for that bug.
+    #[test]
+    fn nt_nd_array_union_preserves_all_variants_via_canonical_desc() {
+        use epics_rs::pva::pvdata::FieldDesc;
+        use epics_rs::pva::pvdata::encode::{decode_pv_field, decode_type_desc};
+        use std::io::Cursor;
+
+        // The ten NT-spec POD variants for NTNDArray::value.
+        let variant_specs: &[(&str, ScalarType)] = &[
+            ("booleanValue", ScalarType::Boolean),
+            ("byteValue", ScalarType::Byte),
+            ("shortValue", ScalarType::Short),
+            ("intValue", ScalarType::Int),
+            ("longValue", ScalarType::Long),
+            ("ubyteValue", ScalarType::UByte),
+            ("ushortValue", ScalarType::UShort),
+            ("uintValue", ScalarType::UInt),
+            ("ulongValue", ScalarType::ULong),
+            ("floatValue", ScalarType::Float),
+            ("doubleValue", ScalarType::Double),
+        ];
+        // Build the inner union descriptor with all eleven variants.
+        let union_variants: Vec<(String, FieldDesc)> = variant_specs
+            .iter()
+            .map(|(n, st)| (n.to_string(), FieldDesc::ScalarArray(*st)))
+            .collect();
+        let canonical = FieldDesc::Structure {
+            struct_id: "epics:nt/NTNDArray:1.0".into(),
+            fields: vec![(
+                "value".into(),
+                FieldDesc::Union {
+                    struct_id: String::new(),
+                    variants: union_variants.clone(),
+                },
+            )],
+        };
+
+        // Build the runtime value: union currently holds the
+        // `doubleValue` variant (selector index 10) — a typical live
+        // sample shape.
+        let mut root = PvStructure::new("epics:nt/NTNDArray:1.0");
+        root.fields.push((
+            "value".into(),
+            PvField::Union {
+                selector: 10,
+                variant_name: "doubleValue".into(),
+                value: Box::new(PvField::ScalarArrayTyped(TypedScalarArray::Double(
+                    vec![1.0, 2.0, 3.0].into(),
+                ))),
+            },
+        ));
+        let pv = PvField::Structure(root);
+
+        // Push through the V4 archiver pipeline.
+        let av = pv_field_scalar_to_archiver(&pv, &canonical).expect("converted");
+        let bytes = match av {
+            ArchiverValue::V4GenericBytes(b) => b,
+            other => panic!("expected V4GenericBytes, got {:?}", other.db_type()),
+        };
+
+        // Decode and confirm:
+        //   (a) the active variant carries the live value;
+        //   (b) the descriptor advertises all eleven variants (the
+        //       sibling variants that descriptor-recovery would lose).
+        let mut cur = Cursor::new(bytes.as_slice());
+        let desc_back = decode_type_desc(&mut cur, ByteOrder::Big).expect("desc");
+        let decoded = decode_pv_field(&desc_back, &mut cur, ByteOrder::Big).expect("value");
+        let PvField::Structure(s) = decoded else {
+            panic!("expected Structure root");
+        };
+        let value = s
+            .fields
+            .iter()
+            .find_map(|(n, f)| if n == "value" { Some(f) } else { None })
+            .expect("value");
+        let PvField::Union {
+            selector,
+            variant_name,
+            value: inner,
+        } = value
+        else {
+            panic!("expected Union, got {value:?}");
+        };
+        assert_eq!(*selector, 10);
+        assert_eq!(variant_name, "doubleValue");
+        let PvField::ScalarArrayTyped(TypedScalarArray::Double(arr)) = inner.as_ref() else {
+            panic!("expected Double[]");
+        };
+        assert_eq!(arr.as_ref(), &[1.0, 2.0, 3.0]);
+
+        // The decoded descriptor's union variants list survived.
+        let value_field_desc = match &desc_back {
+            FieldDesc::Structure { fields, .. } => fields
+                .iter()
+                .find_map(|(n, f)| if n == "value" { Some(f) } else { None })
+                .expect("value field in desc"),
+            other => panic!("expected Structure descriptor, got {other:?}"),
+        };
+        let FieldDesc::Union {
+            variants: v_back, ..
+        } = value_field_desc
+        else {
+            panic!("expected Union descriptor for value");
+        };
+        assert_eq!(
+            v_back.len(),
+            variant_specs.len(),
+            "all sibling Union variants must survive the wire round-trip — \
+             this is what value-recovery descriptor would have dropped"
+        );
+        for (i, (expected_name, expected_st)) in variant_specs.iter().enumerate() {
+            assert_eq!(&v_back[i].0, expected_name);
+            assert!(matches!(v_back[i].1, FieldDesc::ScalarArray(st) if st == *expected_st));
+        }
+    }
+
+    /// User-defined Structure that LOOKS like NTEnum but lacks the
+    /// `epics:nt/NTEnum` struct_id is NOT treated as one — falls
+    /// through to V4GenericBytes. Guards against false positives on
+    /// custom structs that happen to use `index`/`choices` field
+    /// names.
+    #[test]
+    fn structure_without_nt_enum_id_is_v4_bytes() {
+        let mut inner = PvStructure::new("");
+        inner
+            .fields
+            .push(("index".into(), PvField::Scalar(ScalarValue::Int(1))));
+        inner.fields.push((
+            "choices".into(),
+            PvField::ScalarArrayTyped(TypedScalarArray::String(
+                vec!["a".to_string(), "b".to_string()].into_iter().collect(),
+            )),
+        ));
+        let mut root = PvStructure::new("my:custom/Thing:1.0");
+        root.fields
+            .push(("value".into(), PvField::Structure(inner)));
+        let pv = PvField::Structure(root);
+        let (db, _) = pv_field_to_arch_db_type(&pv).expect("classified");
+        assert_eq!(db, ArchDbType::V4GenericBytes);
+    }
+
+    fn make_nt_enum(index: i32, choices: &[&str]) -> PvField {
+        let mut inner = PvStructure::new("enum_t");
+        inner
+            .fields
+            .push(("index".into(), PvField::Scalar(ScalarValue::Int(index))));
+        let arr = TypedScalarArray::String(
+            choices
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        inner
+            .fields
+            .push(("choices".into(), PvField::ScalarArrayTyped(arr)));
+        let mut root = PvStructure::new("epics:nt/NTEnum:1.0");
+        root.fields
+            .push(("value".into(), PvField::Structure(inner)));
+        PvField::Structure(root)
+    }
+
+    /// Bare NTScalar of doubles still classifies as ScalarDouble and
+    /// converts to ScalarDouble — regression guard for the pre-existing
+    /// path that earlier callers depended on.
+    #[test]
+    fn nt_scalar_double_still_scalar() {
+        let mut wrapper = PvStructure::new("epics:nt/NTScalar:1.0");
+        wrapper
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(42.5))));
+        let pv = PvField::Structure(wrapper);
+        let (db, ec) = pv_field_to_arch_db_type(&pv).expect("classified");
+        assert_eq!(db, ArchDbType::ScalarDouble);
+        assert_eq!(ec, 1);
+        match pv_field_scalar_to_archiver(&pv, &pv.descriptor()).expect("converted") {
+            ArchiverValue::ScalarDouble(v) => assert!((v - 42.5).abs() < 1e-9),
+            other => panic!("expected ScalarDouble, got {:?}", other.db_type()),
+        }
+    }
 }
