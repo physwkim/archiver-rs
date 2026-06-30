@@ -281,6 +281,12 @@ pub struct PlainPbStoragePlugin {
     /// write_loop drops these PVs from `ts_updates` instead of
     /// silently committing a stale timestamp.
     evicted_with_loss: Mutex<Vec<String>>,
+    /// When `true`, every dirty-writer flush also `sync_all`s the
+    /// file to disk before reporting success, so a committed
+    /// `last_event` can never outlive its bytes across a power loss.
+    /// `false` (default) = page-cache durability only (Java parity).
+    /// See [`crate::config::StorageConfig::fsync_on_flush`].
+    fsync_on_flush: bool,
 }
 
 impl PlainPbStoragePlugin {
@@ -326,7 +332,31 @@ impl PlainPbStoragePlugin {
             known_dirs: Mutex::new(HashSet::new()),
             fd_budget,
             evicted_with_loss: Mutex::new(Vec::new()),
+            fsync_on_flush: false,
         }
+    }
+
+    /// Enable/disable `sync_all` after every dirty-writer flush. Off by
+    /// default (page-cache durability, Java parity); on trades write
+    /// throughput for power-loss durability. Builder-style so it
+    /// composes with any constructor:
+    /// `PlainPbStoragePlugin::with_fd_budget(..).with_fsync_on_flush(true)`.
+    pub fn with_fsync_on_flush(mut self, on: bool) -> Self {
+        self.fsync_on_flush = on;
+        self
+    }
+
+    /// Flush a dirty cached writer, then `sync_all` it to disk when
+    /// `fsync_on_flush` is set. A single fallible step so callers get
+    /// one `io::Result` to classify: a flush OR fsync failure is
+    /// treated identically (the bytes may not be durable). No-op fsync
+    /// (and zero syscall) when the flag is off.
+    fn flush_and_maybe_sync(&self, cached: &mut CachedWriter) -> std::io::Result<()> {
+        cached.writer.flush()?;
+        if self.fsync_on_flush {
+            cached.writer.get_ref().sync_all()?;
+        }
+        Ok(())
     }
 
     /// Snapshot of the current open-writer count for the budget
@@ -416,7 +446,7 @@ impl PlainPbStoragePlugin {
             if !cached.dirty {
                 continue;
             }
-            match cached.writer.flush() {
+            match self.flush_and_maybe_sync(cached) {
                 Ok(()) => {
                     // Principle 4 (flush truth): flush succeeded
                     // at the syscall level, but if the underlying
@@ -448,7 +478,7 @@ impl PlainPbStoragePlugin {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(pv, path = ?cached.path, "Failed to flush cached writer: {e}");
+                    tracing::warn!(pv, path = ?cached.path, "Failed to flush/fsync cached writer: {e}");
                     metrics::counter!(
                         "archiver_pb_flush_failures_total",
                         "tier" => self.plugin_name.clone(),
@@ -521,7 +551,20 @@ impl PlainPbStoragePlugin {
             last_used: _,
             _fd_guard,
         } = cached;
-        let flush_res = if dirty { writer.flush() } else { Ok(()) };
+        let flush_res = if dirty {
+            // Flush to page cache, then sync_all to disk when enabled.
+            // A rolled-over / evicted partition's tail must be as
+            // durable as the flush cycle's: its sample timestamps can
+            // already be committed to the registry, so leaving the
+            // bytes page-cache-only would let `last_event` outlive
+            // them across a power loss.
+            match writer.flush() {
+                Ok(()) if self.fsync_on_flush => writer.get_ref().sync_all(),
+                other => other,
+            }
+        } else {
+            Ok(())
+        };
         // Discard the BufWriter without invoking its Drop — keeps
         // a failed flush from re-firing as a drop-time auto-flush.
         let (_file, _buffered) = writer.into_parts();

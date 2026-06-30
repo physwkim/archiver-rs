@@ -1363,3 +1363,51 @@ async fn roundtrip_v4_union_single_variant_through_pb_storage() {
         .expect("secondsPastEpoch");
     assert_eq!(secs, 42);
 }
+
+#[tokio::test]
+async fn fsync_on_flush_persists_through_ingest_flush() {
+    // fsync_on_flush=true makes flush_ingest_writes sync_all each dirty
+    // writer to disk. Functionally the data must still flush + read
+    // back correctly (the fsync is a durability syscall, invisible to a
+    // same-process read), so this guards the fsync flush path against
+    // regressions — it must not error or lose any PV.
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour)
+            .with_fsync_on_flush(true);
+
+    let base = Utc.with_ymd_and_hms(2024, 6, 15, 10, 0, 0).unwrap();
+    for i in 0..5i64 {
+        let ts: SystemTime = (base + chrono::Duration::seconds(i)).into();
+        let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(i as f64));
+        plugin
+            .append_event("SIM:Fsync", ArchDbType::ScalarDouble, &sample)
+            .await
+            .unwrap();
+    }
+
+    // Ingest flush must sync to disk and report no loss / deferral.
+    let res = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        res.failed.is_empty(),
+        "fsync flush must not lose any PV: {:?}",
+        res.failed
+    );
+    assert!(
+        res.deferred.is_empty(),
+        "no PV should defer: {:?}",
+        res.deferred
+    );
+
+    // All 5 samples read back from disk.
+    let start: SystemTime = base.into();
+    let end: SystemTime = (base + chrono::Duration::hours(1)).into();
+    let mut streams = plugin.get_data("SIM:Fsync", start, end).await.unwrap();
+    let mut count = 0;
+    for stream in streams.iter_mut() {
+        while stream.next_event().unwrap().is_some() {
+            count += 1;
+        }
+    }
+    assert_eq!(count, 5, "all fsync'd samples must read back");
+}

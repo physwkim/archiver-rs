@@ -61,25 +61,40 @@ impl TieredStorage {
                 FdBudget::new(tier_fd_cap(&config.lts, LTS_DEFAULT_FD_CAP)),
             ),
         };
+        // One durability mode for the whole appliance: when
+        // fsync_on_flush is set, every tier's flush syncs to disk.
+        // STS is the live ingest path the operator opts in for; MTS/
+        // LTS get the same treatment for free (their ETL flushes are
+        // infrequent) so the guarantee is uniform across tiers.
+        let fsync = config.fsync_on_flush;
         Self {
-            sts: Arc::new(PlainPbStoragePlugin::with_fd_budget(
-                "STS",
-                config.sts.root_folder.clone(),
-                config.sts.partition_granularity,
-                sts_budget,
-            )),
-            mts: Arc::new(PlainPbStoragePlugin::with_fd_budget(
-                "MTS",
-                config.mts.root_folder.clone(),
-                config.mts.partition_granularity,
-                mts_budget,
-            )),
-            lts: Arc::new(PlainPbStoragePlugin::with_fd_budget(
-                "LTS",
-                config.lts.root_folder.clone(),
-                config.lts.partition_granularity,
-                lts_budget,
-            )),
+            sts: Arc::new(
+                PlainPbStoragePlugin::with_fd_budget(
+                    "STS",
+                    config.sts.root_folder.clone(),
+                    config.sts.partition_granularity,
+                    sts_budget,
+                )
+                .with_fsync_on_flush(fsync),
+            ),
+            mts: Arc::new(
+                PlainPbStoragePlugin::with_fd_budget(
+                    "MTS",
+                    config.mts.root_folder.clone(),
+                    config.mts.partition_granularity,
+                    mts_budget,
+                )
+                .with_fsync_on_flush(fsync),
+            ),
+            lts: Arc::new(
+                PlainPbStoragePlugin::with_fd_budget(
+                    "LTS",
+                    config.lts.root_folder.clone(),
+                    config.lts.partition_granularity,
+                    lts_budget,
+                )
+                .with_fsync_on_flush(fsync),
+            ),
         }
     }
 

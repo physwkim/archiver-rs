@@ -62,6 +62,16 @@ pub struct StorageConfig {
     /// tier keeps its own per-tier cap (legacy behavior).
     #[serde(default)]
     pub max_open_writers_total: Option<usize>,
+    /// When `true`, every ingest/ETL flush also `sync_all`s the
+    /// flushed file to disk before returning, so the registry's
+    /// `last_event` is never committed for bytes that are only in the
+    /// OS page cache. This trades write throughput (an fsync per dirty
+    /// file per flush cycle — costly on NFS / with many active PVs)
+    /// for power-loss durability. Defaults to `false`: page-cache
+    /// durability only, matching Java EAA (data survives a process
+    /// crash but not an OS crash / power loss).
+    #[serde(default)]
+    pub fsync_on_flush: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
