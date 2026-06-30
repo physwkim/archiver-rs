@@ -964,6 +964,125 @@ async fn partition_rollover_clean_drop_no_loss() {
     assert!(plugin.file_path_for(pv, ts2).exists());
 }
 
+/// ETL E1/E3/E5 closure — `remove_moved_partition` deletes a NON-LIVE
+/// partition (no open writer; already flushed on rollover) under the
+/// slot lock and reports `Ok(true)`, leaving the live partition intact.
+#[tokio::test]
+async fn remove_moved_partition_deletes_non_live() {
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let pv = "TEST:MoveNonLive";
+
+    let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap().into();
+    let ts2: SystemTime = Utc.with_ymd_and_hms(2026, 9, 4, 13, 30, 0).unwrap().into();
+    for ts in [ts1, ts2] {
+        plugin
+            .append_event(
+                pv,
+                ArchDbType::ScalarDouble,
+                &ArchiverSample::new(ts, ArchiverValue::ScalarDouble(1.0)),
+            )
+            .await
+            .unwrap();
+    }
+    // Rollover dropped+flushed the ts1 writer; ts1 is non-live, ts2 is
+    // the live partition (writer open on it).
+    let old = plugin.file_path_for(pv, ts1);
+    let live = plugin.file_path_for(pv, ts2);
+    assert!(old.exists() && live.exists());
+
+    assert!(
+        plugin.remove_moved_partition(&old).unwrap(),
+        "non-live partition must be removable"
+    );
+    assert!(!old.exists(), "moved partition file must be gone");
+    assert!(live.exists(), "live partition must be untouched");
+    assert!(
+        plugin.take_loss_markers().is_empty(),
+        "a clean move must not record any loss"
+    );
+}
+
+/// ETL backstop — `remove_moved_partition` REFUSES to delete a partition
+/// whose writer is still open and DIRTY (un-copied buffered bytes):
+/// returns `Ok(false)` and leaves the file, so a still-live partition's
+/// tail can never be destroyed by the mover.
+#[tokio::test]
+async fn remove_moved_partition_refuses_dirty_live() {
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let pv = "TEST:MoveDirtyLive";
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 9, 5, 12, 0, 0).unwrap().into();
+
+    // One append, no flush → the writer is open and dirty.
+    plugin
+        .append_event(
+            pv,
+            ArchDbType::ScalarDouble,
+            &ArchiverSample::new(ts, ArchiverValue::ScalarDouble(7.0)),
+        )
+        .await
+        .unwrap();
+    let path = plugin.file_path_for(pv, ts);
+
+    assert!(
+        !plugin.remove_moved_partition(&path).unwrap(),
+        "a dirty live partition must NOT be deleted"
+    );
+    assert!(path.exists(), "refused partition file must remain on disk");
+    assert!(
+        plugin.take_loss_markers().is_empty(),
+        "refusing to delete must not record loss — the bytes are safe"
+    );
+}
+
+/// ETL consolidate path — `remove_moved_partition` drops a CLEAN open
+/// writer (its bytes are already on disk after a flush) and deletes the
+/// file, returning `Ok(true)`. This is how `consolidate_pv` drains a
+/// quiesced PV's live partition without loss.
+#[tokio::test]
+async fn remove_moved_partition_drops_clean_live_and_deletes() {
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let pv = "TEST:MoveCleanLive";
+    let ts: SystemTime = Utc.with_ymd_and_hms(2026, 9, 6, 12, 0, 0).unwrap().into();
+
+    plugin
+        .append_event(
+            pv,
+            ArchDbType::ScalarDouble,
+            &ArchiverSample::new(ts, ArchiverValue::ScalarDouble(3.0)),
+        )
+        .await
+        .unwrap();
+    // Flush → writer is open but CLEAN; its bytes are on disk.
+    plugin.flush_writes().await.unwrap();
+    let path = plugin.file_path_for(pv, ts);
+
+    assert!(
+        plugin.remove_moved_partition(&path).unwrap(),
+        "a clean (already-durable) live partition must be removable"
+    );
+    assert!(!path.exists(), "drained partition file must be gone");
+    assert!(plugin.take_loss_markers().is_empty());
+
+    // The slot must accept a fresh append afterwards (no orphaned
+    // writer left pointing at the unlinked inode).
+    let ts2: SystemTime = Utc.with_ymd_and_hms(2026, 9, 6, 14, 0, 0).unwrap().into();
+    plugin
+        .append_event(
+            pv,
+            ArchDbType::ScalarDouble,
+            &ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(4.0)),
+        )
+        .await
+        .unwrap();
+    assert!(plugin.file_path_for(pv, ts2).exists());
+}
+
 #[tokio::test]
 async fn shared_fd_budget_caps_three_tiers_combined() {
     // Process-wide fd cap: 3 plugins (STS / MTS / LTS) each

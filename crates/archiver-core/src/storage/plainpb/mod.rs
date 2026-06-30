@@ -659,7 +659,13 @@ impl PlainPbStoragePlugin {
     /// encoding. Returns `Some(pv_name)` for any path under the
     /// storage root whose filename matches the
     /// `{pv_key}:{partition}.pb` layout.
-    fn pv_name_from_path(&self, path: &Path) -> Option<String> {
+    ///
+    /// Public so the ETL executor can group a tier's partition files
+    /// by their true PV name (the same key the writer slots use)
+    /// rather than a coarser path heuristic — getting this exact for
+    /// multi-segment PV names is what lets ETL guarantee it never
+    /// moves a PV's live partition.
+    pub fn pv_name_from_path(&self, path: &Path) -> Option<String> {
         let rel = path.strip_prefix(&self.root_folder).ok()?;
         let s = rel.to_str()?;
         // Strip the trailing partition+extension (everything from
@@ -749,6 +755,89 @@ impl PlainPbStoragePlugin {
             }
         }
         removed
+    }
+
+    /// Unlink a `.pb` file, treating an already-absent file as success
+    /// (another mover/recovery pass, or a manual `rm`, got there first).
+    fn unlink_idempotent(path: &Path) -> std::io::Result<bool> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Delete a partition file that ETL has finished copying to another
+    /// tier, **under the per-PV slot lock**. This is the only sanctioned
+    /// way for ETL to unlink a source-tier `.pb` file; it replaces the
+    /// old "remove_file then evict_writer_for_path" ordering whose gap
+    /// let an append land in the just-deleted inode.
+    ///
+    /// Returns:
+    /// - `Ok(true)`  — the file is gone (deleted now, or already
+    ///   absent). If a CLEAN writer was still cached on this exact path
+    ///   its bytes are already on disk, so it is dropped first (via
+    ///   `into_parts`, no drop-time auto-flush) and the next append for
+    ///   the PV opens a fresh file instead of writing into the unlinked
+    ///   inode.
+    /// - `Ok(false)` — a DIRTY writer is open on this path: it holds
+    ///   buffered bytes that were NOT part of the copy. The file is left
+    ///   intact so those bytes can never be lost. This means a still-live
+    ///   partition reached the mover — periodic ETL selection must exclude
+    ///   the live partition, and `consolidate_pv` must pause the PV first.
+    /// - `Err(e)` — the unlink syscall itself failed.
+    ///
+    /// Holding the slot lock across the liveness check and the unlink is
+    /// what closes the orphaned-inode race: a concurrent `append` for
+    /// this PV serializes on the same mutex, so it cannot open a writer
+    /// on `path` between the check and the delete. Once the file is gone
+    /// and the lock released, the next append computes a newer partition
+    /// path (timestamps move forward) and never targets the removed file.
+    ///
+    /// Sync (blocking slot lock + unlink). ETL wraps it in
+    /// `spawn_blocking` so a runtime worker isn't held during the wait.
+    pub fn remove_moved_partition(&self, path: &Path) -> std::io::Result<bool> {
+        // A path that doesn't decode to a known PV layout cannot be held
+        // by any slot — just unlink it.
+        let Some(pv) = self.pv_name_from_path(path) else {
+            return Self::unlink_idempotent(path);
+        };
+
+        let slot_arc = {
+            let cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.get(&pv).cloned()
+        };
+        let Some(arc) = slot_arc else {
+            // No slot for this PV → nothing is writing the path.
+            return Self::unlink_idempotent(path);
+        };
+
+        let mut slot = arc.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = slot.writer.as_ref()
+            && cached.path == path
+        {
+            if cached.dirty {
+                // Live partition with un-copied buffered bytes — never
+                // delete it; the caller's selection should have excluded
+                // it (or consolidate should have paused the PV).
+                return Ok(false);
+            }
+            // Clean writer on this exact path: its bytes are already
+            // durable on disk. Drop it before the unlink so the fd is
+            // closed and BufWriter's drop-time auto-flush can't re-fire
+            // into the soon-to-be-unlinked inode.
+            if let Some(taken) = slot.writer.take() {
+                let (_file, _buffered) = taken.writer.into_parts();
+            }
+        }
+
+        // Unlink while STILL holding the slot lock: a concurrent append
+        // for this PV is blocked on this mutex and cannot open a writer
+        // on `path` between the liveness check above and this unlink.
+        // Leaving an empty slot (writer == None) in the cache is
+        // harmless — flush_dirty_writers skips it and the next append
+        // reuses it.
+        Self::unlink_idempotent(path)
     }
 
     /// Ensure a parent directory exists, using a cached set to skip repeated syscalls.

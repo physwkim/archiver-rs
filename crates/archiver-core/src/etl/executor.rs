@@ -104,38 +104,29 @@ impl EtlExecutor {
             return Ok(());
         }
 
-        let mut pb_files = list_pb_files(source_root)?;
-        pb_files.sort();
+        let pb_files = list_pb_files(source_root)?;
 
-        if pb_files.len() <= self.hold as usize {
-            debug!(
-                count = pb_files.len(),
-                hold = self.hold,
-                "Not enough partitions to trigger ETL"
-            );
-            return Ok(());
+        // Group every source partition by its TRUE PV name — the same
+        // key the writer slots use (`pv_name_from_path`) — so per-PV
+        // hold/gather and the live-partition exclusion are applied PER
+        // PV. The old path globally sorted one flat file list and took
+        // the lexicographically smallest, which let a PV whose name
+        // sorts early surrender even its live (newest) partition to ETL.
+        let mut grouped: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for file in pb_files {
+            match self.source.pv_name_from_path(&file) {
+                Some(pv) => grouped.entry(pv).or_default().push(file),
+                None => warn!(?file, "ETL: could not derive PV name from path; skipping"),
+            }
         }
 
-        let files_to_move = pb_files
-            .len()
-            .saturating_sub(self.hold as usize)
-            .min(self.gather as usize);
-
-        // Group files by PV name for coherent per-PV transfers.
-        let files_subset: Vec<PathBuf> = pb_files.into_iter().take(files_to_move).collect();
-        let grouped = group_files_by_pv(&files_subset);
-
         // Java parity (92db337): skip files whose owning PV is paused.
-        // Compute the set of paused-PV file keys once per tick instead of
-        // per-file to keep the registry lookup off the hot path.
-        let paused_keys: HashSet<String> = match self.pv_registry.as_ref() {
+        // Keyed by PV name now (matching `grouped`), computed once per
+        // tick to keep the registry lookup off the per-file path.
+        let paused: HashSet<String> = match self.pv_registry.as_ref() {
             Some(reg) => reg
                 .pvs_by_status(PvStatus::Paused)
-                .map(|recs| {
-                    recs.into_iter()
-                        .map(|r| crate::storage::plainpb::pv_name_to_key(&r.pv_name))
-                        .collect()
-                })
+                .map(|recs| recs.into_iter().map(|r| r.pv_name).collect())
                 .unwrap_or_else(|e| {
                     warn!("ETL: failed to read paused PVs from registry: {e}");
                     HashSet::new()
@@ -143,13 +134,23 @@ impl EtlExecutor {
             None => HashSet::new(),
         };
 
-        for (pv_key, files) in &grouped {
-            if paused_keys.contains(pv_key) {
-                debug!(pv = pv_key, "ETL skipping paused PV");
+        let hold = self.hold as usize;
+        let gather = self.gather as usize;
+
+        for (pv, mut files) in grouped {
+            if paused.contains(&pv) {
+                debug!(pv, "ETL skipping paused PV");
                 continue;
             }
-            debug!(pv = pv_key, count = files.len(), "ETL processing PV group");
-            for file in files {
+            // Chronological within the PV: `{prefix}:{YYYY_MM_DD_HH}.pb`
+            // sorts lexicographically == by time.
+            files.sort();
+            let movable = select_movable(&files, hold, gather);
+            if movable.is_empty() {
+                continue;
+            }
+            debug!(pv, count = movable.len(), "ETL processing PV group");
+            for file in movable {
                 info!(?file, dest = self.dest.name(), "ETL moving file");
                 if let Err(e) = self.move_file(file).await {
                     warn!(?file, "ETL failed to move file: {e}");
@@ -199,33 +200,47 @@ impl EtlExecutor {
     }
 
     /// Move a single PB file from source to destination tier.
-    /// Uses copy → verify → marker → delete for crash-safe idempotency.
+    /// Uses copy → durable dest → marker → slot-locked delete for
+    /// crash-safe idempotency.
     async fn move_file(&self, source_path: &Path) -> anyhow::Result<()> {
-        // Check for a marker from a previous incomplete cleanup (crash after copy).
+        // Marker from a previous incomplete cleanup (crash after the
+        // copy was made durable). The marker is written ONLY after the
+        // destination flush below, so its presence proves the dest tier
+        // already holds this partition's data — recovery deletes the
+        // source without re-copying.
         let marker = source_path.with_extension("pb.etl_done");
         if marker.exists() {
             info!(
                 ?source_path,
-                "Found ETL marker — previous copy completed, cleaning up"
+                "Found ETL marker — previous copy is durable in dest, cleaning up"
             );
-            if let Err(e) = tokio::fs::remove_file(source_path).await {
-                warn!(
-                    ?source_path,
-                    "Failed to remove source after ETL marker found: {e}"
-                );
-            }
-            // Drop any open BufWriter on the just-deleted path so
-            // the engine doesn't continue writing into the orphaned
-            // inode. `evict_writer_for_path` blocking-locks each
-            // candidate slot to be definitive (principle 3:
-            // externally visible truth has changed; in-memory
-            // owner state must sync), so wrap in spawn_blocking
-            // to keep the runtime worker free during the wait.
+            // Delete the source under the per-PV slot lock so no append
+            // can land in the just-deleted inode, and a still-live/dirty
+            // partition is never destroyed.
             let source = self.source.clone();
-            let path_for_evict = source_path.to_path_buf();
-            let _ =
-                tokio::task::spawn_blocking(move || source.evict_writer_for_path(&path_for_evict))
-                    .await;
+            let path = source_path.to_path_buf();
+            match tokio::task::spawn_blocking(move || source.remove_moved_partition(&path)).await {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    // Source is the live partition with un-copied bytes —
+                    // leave it AND the marker; a later cycle cleans up
+                    // once it rolls over to non-live. Never delete a
+                    // live, dirty partition.
+                    warn!(
+                        ?source_path,
+                        "ETL marker recovery: source is still live/dirty; deferring delete"
+                    );
+                    return Ok(());
+                }
+                Ok(Err(e)) => warn!(
+                    ?source_path,
+                    "ETL marker recovery: failed to remove source: {e}"
+                ),
+                Err(e) => warn!(
+                    ?source_path,
+                    "ETL marker recovery: evict task panicked: {e}"
+                ),
+            }
             if let Err(e) = tokio::fs::remove_file(&marker).await {
                 warn!(?marker, "Failed to remove ETL marker: {e}");
             }
@@ -247,34 +262,66 @@ impl EtlExecutor {
             let desc = reader.description().clone();
             let dbr_type = desc.db_type;
 
-            // Copy all samples to destination.
+            // Copy all samples to the destination tier.
             while let Some(sample) = reader.next_event()? {
                 dest.append_event(&desc.pv_name, dbr_type, &sample).await?;
             }
 
-            // Write marker before deleting source — if we crash here, next run
-            // will see the marker and skip re-copy (preventing duplicate data).
+            // Durability BEFORE delete: flush the destination tier so the
+            // copy is in the page cache and survives a process crash
+            // BEFORE we write the marker or touch the source. Only after
+            // this does the marker mean "dest durably has it". Without
+            // it, a crash after deleting the source but before dest's
+            // BufWriter drained would lose the partition outright — and
+            // the marker-recovery branch would then delete a source whose
+            // data never reached dest.
+            dest.flush_writes().await?;
+
+            // Marker AFTER dest is durable — a crash here lets the next
+            // run clean up the source without re-copying.
             let marker = source_path.with_extension("pb.etl_done");
             tokio::fs::write(&marker, b"").await?;
-            tokio::fs::remove_file(&source_path).await?;
-            // Drop any open BufWriter on the just-deleted path so
-            // the engine doesn't continue writing into the orphaned
-            // inode. Blocking lock under spawn_blocking — see the
-            // marker-found branch above for the same rationale.
+
+            // Slot-locked delete: remove the source under the per-PV slot
+            // lock with a live-writer guard. No append can target the
+            // inode between the liveness check and the unlink, and a
+            // still-dirty live partition is never destroyed.
             let source_for_evict = source.clone();
             let path_for_evict = source_path.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                source_for_evict.evict_writer_for_path(&path_for_evict)
+            let removed = tokio::task::spawn_blocking(move || {
+                source_for_evict.remove_moved_partition(&path_for_evict)
             })
             .await;
-            tokio::fs::remove_file(&marker).await.ok();
-            metrics::counter!(
-                "archiver_etl_files_moved_total",
-                "source" => source_name,
-                "dest" => dest_name,
-            )
-            .increment(1);
-            anyhow::Ok(())
+            match removed {
+                Ok(Ok(true)) => {
+                    tokio::fs::remove_file(&marker).await.ok();
+                    metrics::counter!(
+                        "archiver_etl_files_moved_total",
+                        "source" => source_name,
+                        "dest" => dest_name,
+                    )
+                    .increment(1);
+                    anyhow::Ok(())
+                }
+                Ok(Ok(false)) => {
+                    // Still-live/dirty partition reached the mover
+                    // (selection should exclude it; consolidate must
+                    // pause the PV first). Leave BOTH source and marker:
+                    // the dest copy is durable, and a later cycle's
+                    // marker-recovery deletes the source once it rolls
+                    // over to non-live. No re-copy, no loss.
+                    Err(anyhow::anyhow!(
+                        "ETL refused to delete still-live/dirty partition {source_path:?}; \
+                         dest copy is durable, source deferred to a later cycle"
+                    ))
+                }
+                Ok(Err(e)) => Err(anyhow::anyhow!(
+                    "ETL source delete failed for {source_path:?}: {e}"
+                )),
+                Err(e) => Err(anyhow::anyhow!(
+                    "ETL source-delete task panicked for {source_path:?}: {e}"
+                )),
+            }
         })
         .await
         .map_err(|_| {
@@ -285,37 +332,20 @@ impl EtlExecutor {
     }
 }
 
-/// Group files by PV name. The PV name is derived from the file path structure.
-/// File path pattern: {root}/{pv_prefix}/{pv_suffix}:{partition}.pb
-fn group_files_by_pv(files: &[PathBuf]) -> HashMap<String, Vec<&PathBuf>> {
-    let mut groups: HashMap<String, Vec<&PathBuf>> = HashMap::new();
-    for file in files {
-        let pv_key = extract_pv_key(file);
-        groups.entry(pv_key).or_default().push(file);
+/// Per-PV ETL selection over one PV's chronologically-sorted partition
+/// files. Keeps the newest `hold.max(1)` partitions in the source tier
+/// and returns the oldest movable ones, at most `gather`.
+///
+/// The `.max(1)` is the structural live-partition guard: the newest
+/// partition is the one the writer may still be appending to, so it is
+/// NEVER offered for a move regardless of `hold` (including `hold == 0`).
+fn select_movable(sorted: &[PathBuf], hold: usize, gather: usize) -> &[PathBuf] {
+    let keep = hold.max(1);
+    if sorted.len() <= keep {
+        return &[];
     }
-    groups
-}
-
-/// Extract PV key from a PB file path.
-/// Given path like `.../SIM/Sine:2024_03_15_09.pb`, returns "SIM/Sine".
-fn extract_pv_key(path: &Path) -> String {
-    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-        // file_name is like "Sine:2024_03.pb"
-        let stem = file_name.strip_suffix(".pb").unwrap_or(file_name);
-        if let Some(colon_pos) = stem.find(':') {
-            let leaf = &stem[..colon_pos];
-            // Combine with parent directory name for full PV key.
-            if let Some(parent) = path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-            {
-                return format!("{parent}/{leaf}");
-            }
-            return leaf.to_string();
-        }
-    }
-    path.to_string_lossy().to_string()
+    let movable = &sorted[..sorted.len() - keep];
+    &movable[..movable.len().min(gather)]
 }
 
 /// Recursively list all .pb files under a directory.
@@ -339,22 +369,66 @@ fn list_pb_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_extract_pv_key() {
-        let path = PathBuf::from("/data/sts/SIM/Sine:2024_03_15_09.pb");
-        assert_eq!(extract_pv_key(&path), "SIM/Sine");
+    fn p(part: &str) -> PathBuf {
+        PathBuf::from(format!("/data/SIM/Sine:{part}.pb"))
     }
 
     #[test]
-    fn test_group_files_by_pv() {
+    fn select_movable_keeps_newest_hold_and_excludes_live() {
+        // 4 partitions, oldest→newest. hold=2 keeps the newest 2; the
+        // oldest 2 are movable.
         let files = vec![
-            PathBuf::from("/data/SIM/Sine:2024_03_01.pb"),
-            PathBuf::from("/data/SIM/Sine:2024_03_02.pb"),
-            PathBuf::from("/data/SIM/Cosine:2024_03_01.pb"),
+            p("2024_03_01"),
+            p("2024_03_02"),
+            p("2024_03_03"),
+            p("2024_03_04"),
         ];
-        let grouped = group_files_by_pv(&files);
-        assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped["SIM/Sine"].len(), 2);
-        assert_eq!(grouped["SIM/Cosine"].len(), 1);
+        let movable = select_movable(&files, 2, 10);
+        assert_eq!(movable, &files[..2], "oldest two are movable");
+        assert!(
+            !movable.contains(&p("2024_03_04")),
+            "newest/live partition must never be movable"
+        );
+    }
+
+    #[test]
+    fn select_movable_clamps_hold_zero_to_keep_live() {
+        // hold=0 would move everything — but the live (newest)
+        // partition must still be kept. keep == max(0,1) == 1.
+        let files = vec![p("2024_03_01"), p("2024_03_02"), p("2024_03_03")];
+        let movable = select_movable(&files, 0, 10);
+        assert_eq!(movable, &files[..2], "all but the newest are movable");
+        assert!(!movable.contains(&p("2024_03_03")));
+    }
+
+    #[test]
+    fn select_movable_caps_at_gather() {
+        let files = vec![
+            p("2024_03_01"),
+            p("2024_03_02"),
+            p("2024_03_03"),
+            p("2024_03_04"),
+            p("2024_03_05"),
+        ];
+        // hold=1 leaves 4 movable, gather caps to the oldest 2.
+        let movable = select_movable(&files, 1, 2);
+        assert_eq!(movable, &files[..2]);
+    }
+
+    #[test]
+    fn select_movable_empty_when_at_or_below_hold() {
+        let files = vec![p("2024_03_01"), p("2024_03_02")];
+        assert!(
+            select_movable(&files, 2, 10).is_empty(),
+            "<= hold partitions: nothing moves"
+        );
+        assert!(
+            select_movable(&files, 5, 10).is_empty(),
+            "fewer than hold: nothing moves"
+        );
+        assert!(
+            select_movable(&[], 1, 10).is_empty(),
+            "no partitions: nothing moves"
+        );
     }
 }
