@@ -1623,7 +1623,7 @@ async fn scan_loop_pva(
             element_count: Some(elem_count),
             counters: Some(counters.clone()),
         };
-        if let Err(rejected) = try_send_with_overflow_count(&tx, pv_sample, &counters).await {
+        if let Err(rejected) = send_with_backpressure(&tx, pv_sample).await {
             // Channel closed (write_loop down). Cooperative shutdown.
             let _ = rejected;
             return;
@@ -1974,13 +1974,7 @@ async fn monitor_loop(
                                 element_count: Some(element_count),
                                 counters: Some(counters.clone()),
                             };
-                            if let Err(pv_sample) = try_send_with_overflow_count(
-                                &tx,
-                                pv_sample,
-                                &counters,
-                            )
-                            .await
-                            {
+                            if let Err(pv_sample) = send_with_backpressure(&tx, pv_sample).await {
                                 let _ = pv_sample;
                                 return; // Write loop shut down
                             }
@@ -2021,23 +2015,28 @@ fn unix_secs(t: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
-/// Send a sample and count buffer-overflow events. Tries non-blocking
-/// first; if the bounded channel is full we increment the counter and
-/// fall back to a blocking send so backpressure still works.
-async fn try_send_with_overflow_count(
+/// Send a sample, applying backpressure when the bounded channel is
+/// full. Tries non-blocking first; on a full channel it falls back to
+/// a blocking `send().await`, so the producer stalls until the writer
+/// drains space — the sample is delivered, NOT dropped.
+///
+/// The saturation event is surfaced as
+/// `archiver_write_channel_backpressure_stalls_total` so operators can
+/// see the writer falling behind. It MUST NOT touch
+/// `buffer_overflow_drops`: that counter means *dropped* samples, and
+/// counting a delivered-after-stall sample as a drop was a dual
+/// meaning that inflated the dropped-events report with samples that
+/// were never lost.
+async fn send_with_backpressure(
     tx: &mpsc::Sender<PvSample>,
     pv_sample: PvSample,
-    counters: &PvCounters,
 ) -> Result<(), PvSample> {
     match tx.try_send(pv_sample) {
         Ok(()) => Ok(()),
         Err(tokio::sync::mpsc::error::TrySendError::Full(pv_sample)) => {
-            counters
-                .buffer_overflow_drops
-                .fetch_add(1, Ordering::Relaxed);
-            // Backpressure to the producer; this awaits until the writer
-            // drains some space. We count the saturation event but don't
-            // actually drop the sample.
+            metrics::counter!("archiver_write_channel_backpressure_stalls_total").increment(1);
+            // Backpressure: await until the writer drains space. The
+            // sample is delivered, not dropped — so no drop counter.
             tx.send(pv_sample).await.map_err(|e| e.0)
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(pv_sample)) => Err(pv_sample),
@@ -2151,10 +2150,7 @@ async fn scan_loop(
                     element_count: Some(element_count),
                     counters: Some(counters.clone()),
                 };
-                if try_send_with_overflow_count(&tx, pv_sample, &counters)
-                    .await
-                    .is_err()
-                {
+                if send_with_backpressure(&tx, pv_sample).await.is_err() {
                     return;
                 }
             }
