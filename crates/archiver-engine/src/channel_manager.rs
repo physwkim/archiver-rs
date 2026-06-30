@@ -2964,13 +2964,28 @@ impl Default for ShardedWritePoolConfig {
     }
 }
 
-// PV-to-shard hash lives in `archiver_core::storage::plainpb` so
-// the engine's dispatcher and PlainPB's
-// `flush_ingest_writes_for_shard` agree on which shard owns which
-// PV. Two definitions would mean shard 0's flush could iterate
-// PVs the dispatcher routed to shard 1, re-introducing the
-// misattribution bug.
-use archiver_core::storage::plainpb::shard_for_pv;
+/// Hash a PV name to a shard index in `0..n` — the dispatcher's
+/// consistent-hash router. Pinning each PV to one shard keeps its
+/// samples ordered and its per-PV writer slot touched by a single
+/// shard worker. The flush owner is global and keyed by PV name
+/// (not by shard), so this hash has no storage-side counterpart to
+/// stay in lock-step with; it lives next to its only caller, the
+/// dispatcher.
+///
+/// `DefaultHasher` is fine for in-process partitioning; hash quality
+/// across restarts is irrelevant because the on-disk layout is keyed
+/// by PV name, not shard.
+fn shard_for_pv(pv: &str, n: usize) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    debug_assert!(n > 0);
+    if n <= 1 {
+        return 0;
+    }
+    let mut h = DefaultHasher::new();
+    pv.hash(&mut h);
+    (h.finish() % n as u64) as usize
+}
 
 /// Run an N-shard write pool: 1 dispatcher (hashes pv_name → shard)
 /// plus N parallel `write_loop_with_config` workers. Each shard has

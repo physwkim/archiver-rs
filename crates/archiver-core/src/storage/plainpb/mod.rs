@@ -10,28 +10,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-/// Hash a PV name to a shard index in `0..n`. Pub so the engine's
-/// dispatcher AND PlainPB's `flush_ingest_writes_for_shard` agree
-/// on which shard owns which PV — without a shared definition the
-/// engine could route PV-X to shard A while PlainPB filters PV-X
-/// into shard B's flush set, re-introducing the misattribution
-/// bug we're trying to close.
-///
-/// `DefaultHasher` is stable enough for in-process partitioning;
-/// hash quality across process restarts doesn't matter because
-/// the on-disk file layout is keyed by PV name, not shard.
-pub fn shard_for_pv(pv: &str, n: usize) -> usize {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    debug_assert!(n > 0);
-    if n <= 1 {
-        return 0;
-    }
-    let mut h = DefaultHasher::new();
-    pv.hash(&mut h);
-    (h.finish() % n as u64) as usize
-}
-
 /// Default cap on simultaneously-open `BufWriter` file handles across
 /// all PVs in one PlainPB tier. Sized to stay well clear of the
 /// typical Linux process fd ulimit (1024) so the storage plugin can
