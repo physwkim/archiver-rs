@@ -118,6 +118,25 @@ pub async fn consolidate_data_for_pv(
         return resp;
     }
 
+    // Force-consolidation must not race a live writer. A PV that is
+    // still archiving has an un-rolled live partition that the move
+    // path (correctly) refuses to relocate, so "consolidate
+    // everything" would silently leave the tail behind. Require the PV
+    // paused — the precondition Java's consolidate endpoint enforces,
+    // matching the retype / rename / meta-field edit guards.
+    let record = match state.pv_query.get_pv(&canonical) {
+        Ok(Some(r)) => r,
+        Ok(None) => return ApiError::NotFound(format!("PV '{}' not found", q.pv)).into_response(),
+        Err(e) => return ApiError::internal(e).into_response(),
+    };
+    if record.status != archiver_core::registry::PvStatus::Paused {
+        return ApiError::Conflict(format!(
+            "PV '{}' must be paused before consolidating its data",
+            q.pv
+        ))
+        .into_response();
+    }
+
     // Walk the etl_chain in order, running each executor up to (and including)
     // the one whose dest matches the requested tier. The chain is
     // [STS→MTS, MTS→LTS]; consolidating to MTS runs only the first, to LTS

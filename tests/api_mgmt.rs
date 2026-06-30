@@ -1198,7 +1198,9 @@ async fn test_get_appliance_metrics_shape() {
 
 #[tokio::test]
 async fn test_consolidate_data_for_pv() {
-    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    let (app, reg, _dir) = build_test_app_with_pvs().await;
+    // Consolidation requires the PV paused (no live writer to race).
+    reg.set_status("SIM:Sine", PvStatus::Paused).unwrap();
     let req = get_request("/mgmt/bpl/consolidateDataForPV?pv=SIM:Sine&storage=sts");
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1206,6 +1208,16 @@ async fn test_consolidate_data_for_pv() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["pv"], "SIM:Sine");
     assert!(body["tiers"].is_array());
+}
+
+#[tokio::test]
+async fn test_consolidate_data_for_pv_rejects_unpaused() {
+    let (app, _reg, _dir) = build_test_app_with_pvs().await;
+    // SIM:Sine is registered active (not paused). Force-consolidation
+    // must refuse rather than silently leave the live partition behind.
+    let req = get_request("/mgmt/bpl/consolidateDataForPV?pv=SIM:Sine&storage=sts");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
