@@ -1177,7 +1177,11 @@ async fn refresh_ctrl_metadata(
     } else {
         Some(display.precision.to_string())
     };
-    let new_egu_trimmed = display.units.trim();
+    // `units` is a byte-preserving `PvString`; render it lossily for the
+    // text EGU slot (the registry column is UTF-8 text). Bind the `Cow`
+    // first so the trimmed `&str` borrow outlives this scope.
+    let new_egu_units = display.units.as_str_lossy();
+    let new_egu_trimmed = new_egu_units.trim();
     let new_egu_opt: Option<&str> = if new_egu_trimmed.is_empty() {
         None
     } else {
@@ -1930,7 +1934,7 @@ async fn monitor_loop(
                             };
                             if !first_after_connect
                                 && !ioc_timestamp_in_window(
-                                    snapshot.timestamp,
+                                    snapshot.timestamp.into(),
                                     now,
                                     server_ioc_drift_secs,
                                 )
@@ -1954,7 +1958,8 @@ async fn monitor_loop(
                                 Ordering::Relaxed,
                             );
                             let archiver_val = epics_value_to_archiver(&snapshot.value);
-                            let mut sample = ArchiverSample::new(snapshot.timestamp, archiver_val);
+                            let mut sample =
+                                ArchiverSample::new(snapshot.timestamp.into(), archiver_val);
                             attach_extras(&extras, &mut sample);
                             if first_after_connect {
                                 let lost_secs = counters
@@ -2201,13 +2206,18 @@ fn attach_extras(extras: &ExtraFieldsCache, sample: &mut ArchiverSample) {
 /// archiver writes into PVTypeInfo's `archiveFields` blob (a string map).
 fn epics_value_to_field_string(val: &EpicsValue) -> String {
     match val {
-        EpicsValue::String(s) => s.clone(),
+        EpicsValue::String(s) => s.to_string(),
         EpicsValue::Short(v) => v.to_string(),
         EpicsValue::Float(v) => v.to_string(),
         EpicsValue::Enum(v) => v.to_string(),
+        // Transient NTEnum carrier: render the index, same as `Enum`.
+        EpicsValue::EnumWithChoices { index, .. } => index.to_string(),
         EpicsValue::Char(v) => v.to_string(),
         EpicsValue::Long(v) => v.to_string(),
         EpicsValue::Int64(v) => v.to_string(),
+        EpicsValue::UInt64(v) => v.to_string(),
+        EpicsValue::UShort(v) => v.to_string(),
+        EpicsValue::ULong(v) => v.to_string(),
         EpicsValue::Double(v) => v.to_string(),
         EpicsValue::ShortArray(v) => format!("{v:?}"),
         EpicsValue::FloatArray(v) => format!("{v:?}"),
@@ -2215,6 +2225,9 @@ fn epics_value_to_field_string(val: &EpicsValue) -> String {
         EpicsValue::DoubleArray(v) => format!("{v:?}"),
         EpicsValue::LongArray(v) => format!("{v:?}"),
         EpicsValue::Int64Array(v) => format!("{v:?}"),
+        EpicsValue::UInt64Array(v) => format!("{v:?}"),
+        EpicsValue::UShortArray(v) => format!("{v:?}"),
+        EpicsValue::ULongArray(v) => format!("{v:?}"),
         EpicsValue::CharArray(v) => String::from_utf8_lossy(v).into_owned(),
         EpicsValue::StringArray(v) => format!("{v:?}"),
     }
@@ -2394,7 +2407,7 @@ fn scalar_value_to_archiver(s: &ScalarValue) -> ArchiverValue {
         ScalarValue::ULong(v) => ArchiverValue::ScalarInt(*v as i32),
         ScalarValue::Float(v) => ArchiverValue::ScalarFloat(*v),
         ScalarValue::Double(v) => ArchiverValue::ScalarDouble(*v),
-        ScalarValue::String(s) => ArchiverValue::ScalarString(s.clone()),
+        ScalarValue::String(s) => ArchiverValue::ScalarString(s.to_string()),
     }
 }
 
@@ -2538,7 +2551,9 @@ fn typed_scalar_array_to_archiver(arr: &TypedScalarArray) -> ArchiverValue {
         }
         TypedScalarArray::Float(a) => ArchiverValue::VectorFloat(a.to_vec()),
         TypedScalarArray::Double(a) => ArchiverValue::VectorDouble(a.to_vec()),
-        TypedScalarArray::String(a) => ArchiverValue::VectorString(a.to_vec()),
+        TypedScalarArray::String(a) => {
+            ArchiverValue::VectorString(a.iter().map(|s| s.to_string()).collect())
+        }
     }
 }
 
@@ -2572,12 +2587,14 @@ fn nt_enum_parts(field: &PvField) -> Option<(i32, Option<Vec<String>>)> {
         _ => return None,
     };
     let choices = match inner.get_field("choices") {
-        Some(PvField::ScalarArrayTyped(TypedScalarArray::String(arr))) => Some(arr.to_vec()),
+        Some(PvField::ScalarArrayTyped(TypedScalarArray::String(arr))) => {
+            Some(arr.iter().map(|s| s.to_string()).collect())
+        }
         Some(PvField::ScalarArray(items)) => {
             let mut out = Vec::with_capacity(items.len());
             for s in items {
                 if let ScalarValue::String(c) = s {
-                    out.push(c.clone());
+                    out.push(c.to_string());
                 } else {
                     return None; // mixed-type choices array — reject
                 }
@@ -2720,7 +2737,7 @@ fn scalar_value_to_string(s: &ScalarValue) -> String {
         ScalarValue::ULong(v) => v.to_string(),
         ScalarValue::Float(v) => v.to_string(),
         ScalarValue::Double(v) => v.to_string(),
-        ScalarValue::String(s) => s.clone(),
+        ScalarValue::String(s) => s.to_string(),
     }
 }
 
@@ -2755,7 +2772,9 @@ fn pv_field_extract_display(field: &PvField) -> (Option<String>, Option<String>)
     };
     let egu = match disp.get_field("units") {
         Some(PvField::Scalar(ScalarValue::String(u))) => {
-            let t = u.trim();
+            // Byte-preserving `PvString` → lossy text for the EGU slot.
+            let lossy = u.as_str_lossy();
+            let t = lossy.trim();
             if t.is_empty() {
                 None
             } else {
@@ -2802,8 +2821,14 @@ fn dbr_field_to_arch_type(field_type: DbFieldType) -> ArchDbType {
         DbFieldType::Char => ArchDbType::ScalarByte,
         DbFieldType::Long => ArchDbType::ScalarInt,
         // PB PayloadType has no SCALAR_LONG (i64) — values outside i32 range
-        // are truncated by the i32 cast in epics_value_to_archiver.
-        DbFieldType::Int64 => ArchDbType::ScalarInt,
+        // are truncated by the i32 cast in epics_value_to_archiver. The
+        // unsigned 64/32-bit EPICS-internal types fold into the same i32
+        // slot the way their `EpicsValue` samples do (UInt64/ULong → ScalarInt),
+        // keeping the registered ArchDbType in lockstep with the per-sample
+        // ArchiverValue produced by `epics_value_to_archiver`.
+        DbFieldType::Int64 | DbFieldType::UInt64 | DbFieldType::ULong => ArchDbType::ScalarInt,
+        // DBF_USHORT mirrors the PVA `ScalarValue::UShort` → ScalarShort path.
+        DbFieldType::UShort => ArchDbType::ScalarShort,
         DbFieldType::Double => ArchDbType::ScalarDouble,
     }
 }
@@ -2811,13 +2836,20 @@ fn dbr_field_to_arch_type(field_type: DbFieldType) -> ArchDbType {
 /// Convert epics-base-rs EpicsValue to archiver ArchiverValue.
 fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
     match val {
-        EpicsValue::String(s) => ArchiverValue::ScalarString(s.clone()),
+        EpicsValue::String(s) => ArchiverValue::ScalarString(s.to_string()),
         EpicsValue::Short(v) => ArchiverValue::ScalarShort(*v as i32),
         EpicsValue::Float(v) => ArchiverValue::ScalarFloat(*v),
         EpicsValue::Enum(v) => ArchiverValue::ScalarEnum(*v as i32),
+        // Transient NTEnum carrier: archive the index, same as `Enum`.
+        EpicsValue::EnumWithChoices { index, .. } => ArchiverValue::ScalarEnum(*index as i32),
         EpicsValue::Char(v) => ArchiverValue::ScalarByte(vec![*v]),
         EpicsValue::Long(v) => ArchiverValue::ScalarInt(*v),
+        // i64/u64/u32 fold into the i32 ScalarInt slot (out-of-range values
+        // truncate) — matches the `DbFieldType` registration mapping above.
         EpicsValue::Int64(v) => ArchiverValue::ScalarInt(*v as i32),
+        EpicsValue::UInt64(v) => ArchiverValue::ScalarInt(*v as i32),
+        EpicsValue::ULong(v) => ArchiverValue::ScalarInt(*v as i32),
+        EpicsValue::UShort(v) => ArchiverValue::ScalarShort(*v as i32),
         EpicsValue::Double(v) => ArchiverValue::ScalarDouble(*v),
         EpicsValue::ShortArray(v) => {
             ArchiverValue::VectorShort(v.iter().map(|x| *x as i32).collect())
@@ -2831,8 +2863,19 @@ fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
         EpicsValue::Int64Array(v) => {
             ArchiverValue::VectorInt(v.iter().map(|x| *x as i32).collect())
         }
+        EpicsValue::UInt64Array(v) => {
+            ArchiverValue::VectorInt(v.iter().map(|x| *x as i32).collect())
+        }
+        EpicsValue::ULongArray(v) => {
+            ArchiverValue::VectorInt(v.iter().map(|x| *x as i32).collect())
+        }
+        EpicsValue::UShortArray(v) => {
+            ArchiverValue::VectorShort(v.iter().map(|x| *x as i32).collect())
+        }
         EpicsValue::CharArray(v) => ArchiverValue::VectorChar(v.clone()),
-        EpicsValue::StringArray(v) => ArchiverValue::VectorString(v.clone()),
+        EpicsValue::StringArray(v) => {
+            ArchiverValue::VectorString(v.iter().map(|s| s.to_string()).collect())
+        }
     }
 }
 
@@ -3891,8 +3934,7 @@ mod pva_mapping_tests {
     /// a live IOC publishes for a typical waveform-table channel.
     fn make_nttable() -> PvField {
         let mut table = PvStructure::new("epics:nt/NTTable:1.0");
-        let labels =
-            TypedScalarArray::String(vec!["x".to_string(), "y".to_string()].into_iter().collect());
+        let labels = TypedScalarArray::String(["x", "y"].iter().map(|s| (*s).into()).collect());
         table
             .fields
             .push(("labels".into(), PvField::ScalarArrayTyped(labels)));
@@ -4044,16 +4086,16 @@ mod pva_mapping_tests {
             variants: variants_desc.clone(),
         };
         let items = vec![
-            UnionItem {
+            Some(UnionItem {
                 selector: 0,
                 variant_name: "intVal".into(),
                 value: PvField::Scalar(ScalarValue::Int(42)),
-            },
-            UnionItem {
+            }),
+            Some(UnionItem {
                 selector: 1,
                 variant_name: "dblVal".into(),
                 value: PvField::Scalar(ScalarValue::Double(1.5)),
-            },
+            }),
         ];
         let field = PvField::UnionArray(items);
 
@@ -4065,13 +4107,12 @@ mod pva_mapping_tests {
             panic!("expected UnionArray, got {val_back:?}");
         };
         assert_eq!(items_back.len(), 2);
-        assert_eq!(items_back[0].selector, 0);
-        assert!(matches!(
-            items_back[0].value,
-            PvField::Scalar(ScalarValue::Int(42))
-        ));
-        assert_eq!(items_back[1].selector, 1);
-        match &items_back[1].value {
+        let item0 = items_back[0].as_ref().expect("union element 0 present");
+        assert_eq!(item0.selector, 0);
+        assert!(matches!(item0.value, PvField::Scalar(ScalarValue::Int(42))));
+        let item1 = items_back[1].as_ref().expect("union element 1 present");
+        assert_eq!(item1.selector, 1);
+        match &item1.value {
             PvField::Scalar(ScalarValue::Double(d)) => assert!((*d - 1.5).abs() < 1e-9),
             other => panic!("variant 1 not Double, got {other:?}"),
         }
@@ -4234,7 +4275,7 @@ mod pva_mapping_tests {
         inner.fields.push((
             "choices".into(),
             PvField::ScalarArrayTyped(TypedScalarArray::String(
-                vec!["a".to_string(), "b".to_string()].into_iter().collect(),
+                ["a", "b"].iter().map(|s| (*s).into()).collect(),
             )),
         ));
         let mut root = PvStructure::new("my:custom/Thing:1.0");
@@ -4250,13 +4291,7 @@ mod pva_mapping_tests {
         inner
             .fields
             .push(("index".into(), PvField::Scalar(ScalarValue::Int(index))));
-        let arr = TypedScalarArray::String(
-            choices
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .into(),
-        );
+        let arr = TypedScalarArray::String(choices.iter().map(|s| (*s).into()).collect());
         inner
             .fields
             .push(("choices".into(), PvField::ScalarArrayTyped(arr)));

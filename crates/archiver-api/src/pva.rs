@@ -58,7 +58,11 @@ pub fn build_archiver_pva_source(
         // handler.
         let desc = response_table().build();
         let initial = response_table().create();
-        pv.open(desc, initial);
+        // Infallible here: a freshly-created PV is never already open, and the
+        // descriptor + initial value come from the same `response_table()`
+        // builder so the value fits the descriptor by construction.
+        pv.open(desc, initial)
+            .expect("response_table() descriptor and initial value match");
 
         let storage = storage.clone();
         let pv_query = pv_query.clone();
@@ -73,7 +77,9 @@ pub fn build_archiver_pva_source(
         let pv = SharedPV::new();
         let desc = response_table().build();
         let initial = response_table().create();
-        pv.open(desc, initial);
+        // Infallible for the same reason as `archappl/getData` above.
+        pv.open(desc, initial)
+            .expect("response_table() descriptor and initial value match");
 
         let storage = storage.clone();
         let pv_query = pv_query.clone();
@@ -108,13 +114,15 @@ pub fn start_pva_retrieval_server(
     source: Arc<SharedSource>,
     bind_port: u16,
     udp_port: u16,
-) -> PvaServer {
+) -> anyhow::Result<PvaServer> {
     let config = PvaServerConfig {
         tcp_port: bind_port,
         udp_port,
         ..PvaServerConfig::default()
     };
-    PvaServer::start(source, config)
+    // `PvaServer::start` is now fallible (binds the TCP/UDP sockets eagerly);
+    // surface a bind failure to the caller instead of panicking.
+    PvaServer::start(source, config).map_err(|e| anyhow::anyhow!("PVA server start error: {e}"))
 }
 
 /// NTTable column shape for archiver responses. Five columns: epoch
@@ -138,7 +146,7 @@ fn query_string_field(req: &PvField, name: &str) -> String {
         if fname == name
             && let PvField::Scalar(ScalarValue::String(s)) = fval
         {
-            return s.clone();
+            return s.to_string();
         }
     }
     String::new()
@@ -308,7 +316,7 @@ fn build_table_value(samples: &[ArchiverSample]) -> PvField {
     let mut root = PvStructure::new("epics:nt/NTTable:1.0");
     let labels: Vec<ScalarValue> = ["Time (s)", "Time (ns)", "Value", "Severity", "Status"]
         .iter()
-        .map(|s| ScalarValue::String((*s).to_string()))
+        .map(|s| ScalarValue::String((*s).into()))
         .collect();
     root.fields
         .push(("labels".into(), PvField::ScalarArray(labels)));
@@ -333,7 +341,7 @@ fn build_table_value(samples: &[ArchiverSample]) -> PvField {
         .push(("value".into(), PvField::Structure(value_struct)));
     root.fields.push((
         "descriptor".into(),
-        PvField::Scalar(ScalarValue::String(String::new())),
+        PvField::Scalar(ScalarValue::String("".into())),
     ));
     root.fields
         .push(("alarm".into(), epics_rs::pva::nt::meta::alarm_default()));
@@ -462,7 +470,9 @@ mod tests {
         q.fields.push((
             "from".into(),
             PvField::Scalar(ScalarValue::String(
-                chrono::DateTime::<chrono::Utc>::from(SystemTime::from(year_start)).to_rfc3339(),
+                chrono::DateTime::<chrono::Utc>::from(SystemTime::from(year_start))
+                    .to_rfc3339()
+                    .into(),
             )),
         ));
         q.fields.push((
@@ -471,7 +481,8 @@ mod tests {
                 chrono::DateTime::<chrono::Utc>::from(SystemTime::from(
                     year_start + chrono::Duration::seconds(60),
                 ))
-                .to_rfc3339(),
+                .to_rfc3339()
+                .into(),
             )),
         ));
         let mut root = PvStructure::new("epics:nt/NTURI:1.0");

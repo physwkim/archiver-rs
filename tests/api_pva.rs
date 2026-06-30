@@ -55,7 +55,7 @@ async fn pva_rpc_get_data_end_to_end() {
     // ── PVA server ──
     let pv_query = Arc::new(RegistryRepository::new(registry.clone()));
     let source = build_archiver_pva_source(storage.clone(), pv_query.clone());
-    let server = PvaServer::isolated(source);
+    let server = PvaServer::isolated(source).expect("isolated PVA server starts");
 
     // ── Client built against the isolated server ──
     let client = server.client_config();
@@ -75,7 +75,9 @@ async fn pva_rpc_get_data_end_to_end() {
     query.fields.push((
         "from".into(),
         PvField::Scalar(ScalarValue::String(
-            chrono::DateTime::<chrono::Utc>::from(SystemTime::from(year_start)).to_rfc3339(),
+            chrono::DateTime::<chrono::Utc>::from(SystemTime::from(year_start))
+                .to_rfc3339()
+                .into(),
         )),
     ));
     query.fields.push((
@@ -84,7 +86,8 @@ async fn pva_rpc_get_data_end_to_end() {
             chrono::DateTime::<chrono::Utc>::from(SystemTime::from(
                 year_start + chrono::Duration::seconds(60),
             ))
-            .to_rfc3339(),
+            .to_rfc3339()
+            .into(),
         )),
     ));
     let mut root = PvStructure::new("epics:nt/NTURI:1.0");
@@ -94,7 +97,7 @@ async fn pva_rpc_get_data_end_to_end() {
     ));
     root.fields.push((
         "authority".into(),
-        PvField::Scalar(ScalarValue::String(String::new())),
+        PvField::Scalar(ScalarValue::String("".into())),
     ));
     root.fields.push((
         "path".into(),

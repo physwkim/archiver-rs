@@ -56,9 +56,14 @@ fn pv_field_to_json(f: &PvField) -> Value {
             }
             Value::Object(obj)
         }
+        // Each element is `Option<PvStructure>`: `None` is a pvxs null
+        // (absent) element, rendered as JSON null.
         PvField::StructureArray(arr) => Value::Array(
             arr.iter()
-                .map(|s| pv_field_to_json(&PvField::Structure(s.clone())))
+                .map(|s| match s {
+                    Some(s) => pv_field_to_json(&PvField::Structure(s.clone())),
+                    None => Value::Null,
+                })
                 .collect(),
         ),
         // Union / Variant: render the chosen variant's value if present
@@ -77,16 +82,25 @@ fn pv_field_to_json(f: &PvField) -> Value {
         }
         PvField::UnionArray(arr) => Value::Array(arr.iter().map(union_item_to_json).collect()),
         PvField::Variant(v) => variant_to_json(v),
-        PvField::VariantArray(arr) => Value::Array(arr.iter().map(variant_to_json).collect()),
+        // `None` is a pvxs null (absent) element, rendered as JSON null.
+        PvField::VariantArray(arr) => Value::Array(
+            arr.iter()
+                .map(|v| match v {
+                    Some(v) => variant_to_json(v),
+                    None => Value::Null,
+                })
+                .collect(),
+        ),
         PvField::Null => Value::Null,
     }
 }
 
-fn union_item_to_json(item: &UnionItem) -> Value {
-    if item.selector < 0 {
-        Value::Null
-    } else {
-        pv_field_to_json(&item.value)
+/// A union-array element: `None` (pvxs null/absent) and a present element
+/// with a negative selector both render as JSON null.
+fn union_item_to_json(item: &Option<UnionItem>) -> Value {
+    match item {
+        Some(i) if i.selector >= 0 => pv_field_to_json(&i.value),
+        _ => Value::Null,
     }
 }
 
@@ -103,7 +117,7 @@ fn scalar_value_to_json(s: &ScalarValue) -> Value {
         ScalarValue::ULong(v) => (*v).into(),
         ScalarValue::Float(v) => finite_or_null(*v as f64),
         ScalarValue::Double(v) => finite_or_null(*v),
-        ScalarValue::String(s) => Value::String(s.clone()),
+        ScalarValue::String(s) => Value::String(s.to_string()),
     }
 }
 
@@ -123,7 +137,7 @@ fn typed_array_to_json(arr: &TypedScalarArray) -> Value {
         }
         TypedScalarArray::Double(a) => Value::Array(a.iter().map(|&v| finite_or_null(v)).collect()),
         TypedScalarArray::String(a) => {
-            Value::Array(a.iter().map(|s| Value::String(s.clone())).collect())
+            Value::Array(a.iter().map(|s| Value::String(s.to_string())).collect())
         }
     }
 }
@@ -149,8 +163,7 @@ mod tests {
     #[test]
     fn nttable_v4_bytes_decode_roundtrip() {
         let mut table = PvStructure::new("epics:nt/NTTable:1.0");
-        let labels =
-            TypedScalarArray::String(vec!["x".to_string(), "y".to_string()].into_iter().collect());
+        let labels = TypedScalarArray::String(["x", "y"].iter().map(|s| (*s).into()).collect());
         table
             .fields
             .push(("labels".into(), PvField::ScalarArrayTyped(labels)));

@@ -1060,8 +1060,7 @@ fn encode_self_describing(field: &PvField) -> Vec<u8> {
 #[tokio::test]
 async fn roundtrip_v4_nttable_through_pb_storage() {
     let mut table = PvStructure::new("epics:nt/NTTable:1.0");
-    let labels =
-        TypedScalarArray::String(vec!["x".to_string(), "y".to_string()].into_iter().collect());
+    let labels = TypedScalarArray::String(["x", "y"].iter().map(|s| (*s).into()).collect());
     table
         .fields
         .push(("labels".into(), PvField::ScalarArrayTyped(labels)));

@@ -358,7 +358,7 @@ async fn main() -> anyhow::Result<()> {
             source,
             pva_cfg.tcp_port,
             pva_cfg.udp_port,
-        ))
+        )?)
     } else {
         None
     };
