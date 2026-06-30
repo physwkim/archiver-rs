@@ -64,6 +64,15 @@ struct InjectingStorage {
     appends: Mutex<Vec<AppendRecord>>,
     flush_calls: AtomicUsize,
     flush_ingest_calls: AtomicUsize,
+    /// Accumulated dirty-write loss markers, mirroring PlainPB's
+    /// `evicted_with_loss`. `flush_ingest_writes` does NOT touch this;
+    /// only `take_loss_markers` drains it — exactly the production
+    /// contract the W1 over-commit fix relies on.
+    loss_queue: Mutex<Vec<String>>,
+    /// Number of times `take_loss_markers` was invoked. Lets the
+    /// regression test assert the owner drains markers ONLY on the
+    /// observed-success path (never on a flush timeout/panic).
+    take_loss_calls: AtomicUsize,
 }
 
 impl InjectingStorage {
@@ -79,7 +88,19 @@ impl InjectingStorage {
             appends: Mutex::new(Vec::new()),
             flush_calls: AtomicUsize::new(0),
             flush_ingest_calls: AtomicUsize::new(0),
+            loss_queue: Mutex::new(Vec::new()),
+            take_loss_calls: AtomicUsize::new(0),
         })
+    }
+
+    /// Push a dirty-write loss marker, simulating a loss recorded
+    /// outside a flush pass (LRU eviction, ghost-file, etc.).
+    fn push_loss(&self, pv: &str) {
+        self.loss_queue.lock().unwrap().push(pv.to_string());
+    }
+
+    fn take_loss_call_count(&self) -> usize {
+        self.take_loss_calls.load(Ordering::SeqCst)
     }
 
     fn set_flush_failed(&self, pvs: Vec<String>) {
@@ -225,6 +246,11 @@ impl StoragePlugin for InjectingStorage {
             failed: self.flush_failed_pvs.lock().unwrap().clone(),
             deferred: self.flush_deferred_pvs.lock().unwrap().clone(),
         })
+    }
+
+    fn take_loss_markers(&self) -> Vec<String> {
+        self.take_loss_calls.fetch_add(1, Ordering::SeqCst);
+        std::mem::take(&mut *self.loss_queue.lock().unwrap())
     }
 
     fn stores_for_pv(&self, _pv: &str) -> anyhow::Result<Vec<StoreSummary>> {
@@ -769,6 +795,122 @@ async fn failed_pv_drops_post_snapshot_pending_entry() {
         y_rec.last_timestamp,
         Some(t_y),
         "Y was in the snapshot and not in failed; it must commit"
+    );
+
+    shutdown(sd_tx, join).await;
+}
+
+/// W1 regression: a flush **timeout** must NOT consume the storage
+/// loss queue, and the queued loss must still drop the PV from the
+/// registry commit on the next clean flush — never over-commit.
+///
+/// Bug this closes: the loss-queue drain used to live inside
+/// `flush_ingest_writes`, which the owner runs in a `spawn_blocking`
+/// task it abandons on timeout. The abandoned task kept running,
+/// drained the queue late, and its lost-PV result was discarded — so
+/// the owner never learned the PV lost bytes, and the next clean
+/// flush committed a stale `last_event`. The fix moves the drain to
+/// `take_loss_markers`, which the owner calls ONLY on observed
+/// success, atomically with applying the drop.
+///
+/// Timeline:
+///   t0: Y reported; ticker snapshots {Y}; flush starts, hangs past
+///       flush_timeout.
+///   t1: P injected (after snapshot → survives the timeout's
+///       conservative `remove_committed(&snapshot)`) and a loss
+///       marker for P is queued (its bytes were lost).
+///   t2: owner times out. It must NOT drain the loss queue
+///       (`take_loss_calls == 0`), so the P marker survives.
+///   t3: hang cleared; next clean flush drains the marker via
+///       `take_loss_markers`, reports P failed, drops pending[P].
+/// Result: P never commits; Y commits normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flush_timeout_does_not_consume_loss_markers_then_no_overcommit() {
+    let cfg = WriteLoopConfig {
+        flush_period: Duration::from_millis(80),
+        append_timeout: Duration::from_millis(300),
+        flush_timeout: Duration::from_millis(200),
+        drain_per_sample_timeout: Duration::from_millis(300),
+        drain_total_budget: Duration::from_secs(2),
+        shutdown_flush_timeout: Duration::from_millis(500),
+    };
+
+    let storage = InjectingStorage::new();
+    // Hang the first flush past flush_timeout so the owner abandons
+    // it. Long enough to outlive flush_timeout, short enough that the
+    // abandoned tokio::sleep isn't still parked at runtime teardown.
+    storage.set_flush_hang(cfg.flush_timeout + Duration::from_millis(200));
+
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    for pv in ["P", "Y"] {
+        registry
+            .register_pv(pv, ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+    }
+
+    let counters = Arc::new(PvCounters::default());
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry.clone(), cfg.clone());
+
+    // Step 1: report Y, then wait for the ticker to snapshot {Y} and
+    // enter its hang.
+    let t_y = ts(100);
+    tx.send(pv_sample("Y", t_y, 1.0, &counters)).await.unwrap();
+    tokio::time::sleep(cfg.flush_period + Duration::from_millis(40)).await;
+    assert!(
+        storage.flush_ingest_call_count() >= 1,
+        "ticker flush should have started before we inject P"
+    );
+
+    // Step 2: inject P AFTER the snapshot (so the timeout branch's
+    // remove_committed(&snapshot) can't drop it), and queue a loss
+    // marker for P's bytes.
+    let t_p = ts(200);
+    tx.send(pv_sample("P", t_p, 9.0, &counters)).await.unwrap();
+    storage.push_loss("P");
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // Step 3: let the flush time out, then assert the owner did NOT
+    // touch the loss queue on the timeout path. (take_loss_markers
+    // is only ever called on observed success — there has been none
+    // yet, so the count must still be zero.)
+    tokio::time::sleep(cfg.flush_timeout + Duration::from_millis(60)).await;
+    assert_eq!(
+        storage.take_loss_call_count(),
+        0,
+        "a flush timeout must NOT drain the loss queue; markers must \
+         re-surface on the next clean flush instead of being silently \
+         consumed by the abandoned flush task"
+    );
+
+    // Step 4: clear the hang so subsequent flushes succeed and the
+    // owner drains the still-queued P marker. Re-report Y at a newer
+    // ts: Y was in the timed-out snapshot, so the owner's conservative
+    // timeout policy (`remove_committed(&snapshot)`) already dropped
+    // it — re-reporting gives the contrast PV a clean entry to commit.
+    storage.clear_flush_hang();
+    let t_y2 = ts(250);
+    tx.send(pv_sample("Y", t_y2, 1.0, &counters)).await.unwrap();
+    for _ in 0..6 {
+        tokio::time::sleep(cfg.flush_period + Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        storage.take_loss_call_count() >= 1,
+        "owner must drain the loss queue on a clean flush"
+    );
+
+    let p_rec = registry.get_pv("P").unwrap().unwrap();
+    let y_rec = registry.get_pv("Y").unwrap().unwrap();
+    assert_eq!(
+        p_rec.last_timestamp, None,
+        "P's bytes were lost (loss marker); its post-snapshot pending \
+         entry must be dropped on the clean flush — the registry must \
+         NOT commit a stale t_p"
+    );
+    assert_eq!(
+        y_rec.last_timestamp,
+        Some(t_y2),
+        "Y has no loss marker; its re-reported ts must commit normally"
     );
 
     shutdown(sd_tx, join).await;

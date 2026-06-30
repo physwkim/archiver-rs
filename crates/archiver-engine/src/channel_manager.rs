@@ -3275,6 +3275,26 @@ async fn run_flush_and_commit(
     });
     match tokio::time::timeout(flush_timeout, flush_join).await {
         Ok(Ok(Ok(IngestFlushResult { failed, deferred }))) => {
+            // Observed success: NOW — and only now — drain the
+            // storage loss queue, in the owner's own context,
+            // atomically with acting on it below. A timed-out or
+            // panicked flush never reaches this branch, so it can
+            // never consume a loss marker the owner won't apply.
+            // This closes the over-commit hole where an abandoned
+            // spawn_blocking flush task drained the queue late and
+            // its result (the lost-PV list) was discarded — the
+            // next clean flush would then commit a stale
+            // `last_event` for bytes that never reached disk.
+            //
+            // The drained markers carry losses recorded outside this
+            // pass (LRU dirty-eviction, partition rollover,
+            // ghost-file, ETL evict-by-path, read-side flush
+            // failures). Merge them with this pass's own `failed`
+            // and dedupe.
+            let mut failed = failed;
+            failed.extend(storage.take_loss_markers());
+            failed.sort();
+            failed.dedup();
             // Failed PVs: bytes lost. Drop every failed PV's
             // pending entry UNCONDITIONALLY — regardless of
             // whether the snapshot's value still matches.

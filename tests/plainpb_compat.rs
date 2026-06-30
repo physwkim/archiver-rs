@@ -688,12 +688,17 @@ async fn fd_cap_strict_under_concurrent_appends() {
     // churn from the cap.
     let outcome = plugin.flush_ingest_writes().await.unwrap();
     // Some may have been LRU-evicted before flush; that's fine —
-    // their bytes were flushed at eviction time. Failed list must
-    // stay empty (we have a healthy filesystem in tests).
+    // their bytes were flushed at eviction time. Both this-pass
+    // failures AND the accumulated loss queue must stay empty
+    // (healthy filesystem ⇒ every eviction flush succeeded).
     assert!(
         outcome.failed.is_empty(),
         "no PV should be in failed under healthy fs: {:?}",
         outcome.failed
+    );
+    assert!(
+        plugin.take_loss_markers().is_empty(),
+        "no PV should have lost bytes under healthy fs / LRU churn"
     );
 }
 
@@ -776,12 +781,15 @@ async fn ghost_file_path_records_loss() {
         .await
         .unwrap();
 
-    // Loss marker surfaces via the next ingest flush.
-    let outcome = plugin.flush_ingest_writes().await.unwrap();
+    // The loss was queued when the ghost-file branch dropped the
+    // dirty writer (before this flush), so it surfaces via the
+    // owner's `take_loss_markers` drain — `flush_ingest_writes`
+    // reports only this pass's own flush failures.
+    let _ = plugin.flush_ingest_writes().await.unwrap();
+    let losses = plugin.take_loss_markers();
     assert!(
-        outcome.failed.iter().any(|p| p == pv),
-        "ghost-file path must record loss for {pv}; got failed={:?}",
-        outcome.failed
+        losses.iter().any(|p| p == pv),
+        "ghost-file path must record loss for {pv}; got losses={losses:?}"
     );
 }
 
@@ -810,12 +818,13 @@ async fn evict_writer_for_path_records_loss_when_dirty() {
     std::fs::remove_file(&path).unwrap();
     assert!(plugin.evict_writer_for_path(&path));
 
-    // Loss marker on the next ingest flush.
-    let outcome = plugin.flush_ingest_writes().await.unwrap();
+    // The loss was queued at evict time (before this flush); the
+    // owner surfaces it via `take_loss_markers`.
+    let _ = plugin.flush_ingest_writes().await.unwrap();
+    let losses = plugin.take_loss_markers();
     assert!(
-        outcome.failed.iter().any(|p| p == pv),
-        "evict_writer_for_path must record loss for dirty writer; got failed={:?}",
-        outcome.failed
+        losses.iter().any(|p| p == pv),
+        "evict_writer_for_path must record loss for dirty writer; got losses={losses:?}"
     );
 }
 
@@ -839,12 +848,14 @@ async fn delete_pv_data_records_loss_and_tombstones() {
 
     plugin.delete_pv_data(pv).await.unwrap();
 
-    // Loss marker for the dirty writer's bytes.
-    let outcome = plugin.flush_ingest_writes().await.unwrap();
+    // Loss marker for the dirty writer's bytes was queued at delete
+    // time (before this flush); the owner surfaces it via
+    // `take_loss_markers`.
+    let _ = plugin.flush_ingest_writes().await.unwrap();
+    let losses = plugin.take_loss_markers();
     assert!(
-        outcome.failed.iter().any(|p| p == pv),
-        "delete_pv_data must record loss for dirty writer; got failed={:?}",
-        outcome.failed
+        losses.iter().any(|p| p == pv),
+        "delete_pv_data must record loss for dirty writer; got losses={losses:?}"
     );
 
     // Phase 3 cleanup: the tombstone slot was removed from the
@@ -881,13 +892,16 @@ async fn rename_pv_flushes_source_writer_cleanly() {
     let moved = plugin.rename_pv(from, to).await.unwrap();
     assert!(moved >= 1, "rename should have moved at least one file");
 
-    // Healthy fs: flush succeeds during drop_dirty_writer, no
-    // loss marker. The next ingest flush has empty failed.
+    // Healthy fs: flush succeeds during drop_dirty_writer, no loss
+    // marker queued. Assert via the loss queue (`take_loss_markers`)
+    // since that — not `flush_ingest_writes().failed` — is where a
+    // rename-time drop loss would surface.
     let outcome = plugin.flush_ingest_writes().await.unwrap();
+    assert!(outcome.failed.is_empty());
+    let losses = plugin.take_loss_markers();
     assert!(
-        !outcome.failed.iter().any(|p| p == from),
-        "healthy rename must not record loss for source; got failed={:?}",
-        outcome.failed
+        !losses.iter().any(|p| p == from),
+        "healthy rename must not record loss for source; got losses={losses:?}"
     );
 
     // The renamed file must be readable under `to`.
@@ -934,13 +948,15 @@ async fn partition_rollover_clean_drop_no_loss() {
         .await
         .unwrap();
 
-    // Healthy fs: rollover's drop_dirty_writer flushes cleanly,
-    // no loss marker.
+    // Healthy fs: rollover's drop_dirty_writer flushes cleanly, no
+    // loss marker queued. Assert via the loss queue
+    // (`take_loss_markers`), where a rollover-drop loss would surface.
     let outcome = plugin.flush_ingest_writes().await.unwrap();
+    assert!(outcome.failed.is_empty());
+    let losses = plugin.take_loss_markers();
     assert!(
-        !outcome.failed.iter().any(|p| p == pv),
-        "healthy partition rollover must not record loss; got failed={:?}",
-        outcome.failed
+        !losses.iter().any(|p| p == pv),
+        "healthy partition rollover must not record loss; got losses={losses:?}"
     );
 
     // Both files must exist on disk.

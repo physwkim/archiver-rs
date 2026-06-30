@@ -403,11 +403,11 @@ impl PlainPbStoragePlugin {
     /// the global flush owner ever sees it.
     ///
     /// **Does not drain `evicted_with_loss`.** That drain belongs
-    /// exclusively to `flush_ingest_writes` so the global owner
-    /// is the single consumer of loss markers. Read-side callers
-    /// (retrieval, ETL) must NOT consume the queue or owner-side
-    /// ts_updates would silently advance past PVs whose bytes
-    /// never reached disk.
+    /// exclusively to `take_loss_markers`, which the global flush
+    /// owner calls on its success path — so the owner is the single
+    /// consumer of loss markers. Read-side callers (retrieval, ETL)
+    /// must NOT consume the queue or owner-side ts_updates would
+    /// silently advance past PVs whose bytes never reached disk.
     fn flush_dirty_writers(&self) -> FlushOutcome {
         // Snapshot slot Arcs under a brief outer lock so we never
         // hold the outer cache mutex while attempting an inner-slot
@@ -1591,13 +1591,13 @@ impl StoragePlugin for PlainPbStoragePlugin {
         // already flushed. Surfacing deferred as Err would make
         // every concurrent read+write race look like storage death.
         //
-        // **Does NOT drain `evicted_with_loss`.** Loss markers
-        // are reserved for the global flush owner — read-side
-        // consumption would silently swallow a failure before
-        // the owner can drop its `ts_updates` for the lost PV.
-        // (Write failures during this read-side pass are still
-        // recorded in `evicted_with_loss` by `flush_dirty_writers`
-        // — they just aren't drained here.)
+        // **Does NOT drain `evicted_with_loss`.** Loss markers are
+        // reserved for the global flush owner (which drains them via
+        // `take_loss_markers`) — read-side consumption would silently
+        // swallow a failure before the owner can drop its `ts_updates`
+        // for the lost PV. (Write failures during this read-side pass
+        // are still recorded in `evicted_with_loss` by
+        // `flush_dirty_writers` — they just aren't drained here.)
         let outcome = self.flush_dirty_writers();
         if !outcome.failed.is_empty() {
             anyhow::bail!(
@@ -1610,36 +1610,47 @@ impl StoragePlugin for PlainPbStoragePlugin {
     }
 
     async fn flush_ingest_writes(&self) -> anyhow::Result<IngestFlushResult> {
-        // Surface failed/deferred separately so the engine can keep
-        // deferred PVs in its ts_updates map (their bytes will reach
-        // disk next cycle) while dropping failed PVs (their bytes
-        // are lost). Lumping them together caused permanent
-        // registry-timestamp loss for PVs that went briefly busy
-        // then silent.
+        // Report ONLY the failures THIS pass produced. The accumulated
+        // loss queue (`evicted_with_loss`) is deliberately NOT drained
+        // here — draining is owned exclusively by the flush owner via
+        // `take_loss_markers`, which it calls from its own context only
+        // after observing this call's success.
+        //
+        // Why the split (over-commit closure): the engine runs this
+        // method inside a `spawn_blocking` task it abandons on timeout.
+        // A `spawn_blocking` body keeps running to completion even after
+        // its JoinHandle is dropped, so if the drain lived here an
+        // abandoned-but-late flush would empty the queue and its result
+        // would be discarded — the owner would never learn those PVs
+        // lost bytes, and the next clean flush would commit a stale
+        // `last_event` for them. Keeping the drain in the owner's
+        // success path makes marker consumption atomic with acting on
+        // it; a timed-out/panicked flush consumes nothing.
+        //
+        // `failed` still includes this-cycle flush failures, which
+        // `flush_dirty_writers` ALSO recorded into the queue — so the
+        // owner's `take_loss_markers` re-surfaces them and the engine
+        // dedupes. (Keeping them in `failed` preserves the direct
+        // contract that this pass's own flush errors are visible to the
+        // immediate caller, e.g. read-side `flush_writes`.)
         let outcome = self.flush_dirty_writers();
-        let mut failed = outcome.failed;
-        // Drain the loss queue here — the global flush owner is
-        // the SOLE consumer of these markers. Includes:
-        //   * LRU dirty-eviction losses (proactive cap pressure)
-        //   * Partition rollover / ghost-file / evict-by-path
-        //     dirty-drop losses
-        //   * Read-side flush failures (recorded by
-        //     `flush_dirty_writers` even when invoked by retrieval)
-        // Dedupe so an entry that appears in both `failed` and the
-        // queue (this-cycle flush failure) is reported once.
-        {
-            let mut ev = self
-                .evicted_with_loss
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            failed.append(&mut *ev);
-        }
-        failed.sort();
-        failed.dedup();
         Ok(IngestFlushResult {
-            failed,
+            failed: outcome.failed,
             deferred: outcome.deferred,
         })
+    }
+
+    /// Drain the dirty-write loss queue. See the trait method's
+    /// single-owner invariant: only the engine's flush owner calls
+    /// this, only on the observed-success path. `mem::take` hands the
+    /// owner exactly the set present at drain time; any loss recorded
+    /// after this returns stays queued for the next cycle.
+    fn take_loss_markers(&self) -> Vec<String> {
+        let mut ev = self
+            .evicted_with_loss
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *ev)
     }
 
     fn stores_for_pv(&self, pv: &str) -> anyhow::Result<Vec<StoreSummary>> {

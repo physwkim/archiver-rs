@@ -216,6 +216,15 @@ impl StoragePlugin for TieredStorage {
         self.sts.flush_ingest_writes().await
     }
 
+    fn take_loss_markers(&self) -> Vec<String> {
+        // Ingest writes only ever touch STS (see
+        // `append_event_with_meta`), so the loss queue that the flush
+        // owner must drain lives entirely on STS. Delegating to STS
+        // alone keeps the single-owner drain consistent with
+        // `flush_ingest_writes` above.
+        self.sts.take_loss_markers()
+    }
+
     fn stores_for_pv(&self, pv: &str) -> anyhow::Result<Vec<StoreSummary>> {
         let mut all = Vec::with_capacity(3);
         all.extend(self.sts.stores_for_pv(pv)?);

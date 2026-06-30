@@ -46,11 +46,16 @@ pub struct AppendMeta {
 /// `failed` and `deferred` carry **different** semantics for callers
 /// like the engine's write_loop:
 ///
-/// * **failed** — the flush errored for this PV; its buffered bytes
-///   have been discarded (writer evicted via `into_parts`). The
-///   caller MUST drop these from any pending timestamp commit AND
-///   from its `ts_updates` map so the registry doesn't claim
-///   `last_event` for samples that never reached disk.
+/// * **failed** — the flush errored for this PV **on this pass**; its
+///   buffered bytes have been discarded (writer evicted via
+///   `into_parts`). The caller MUST drop these from any pending
+///   timestamp commit AND from its `ts_updates` map so the registry
+///   doesn't claim `last_event` for samples that never reached disk.
+///   Losses recorded *outside* this pass (LRU eviction, partition
+///   rollover, ghost-file, ETL evict-by-path, read-side flush
+///   failures) are NOT in `failed` — they accumulate in the plugin's
+///   loss queue and are drained by the owner via
+///   [`StoragePlugin::take_loss_markers`].
 ///
 /// * **deferred** — the writer's per-PV slot was already locked by
 ///   an in-flight append. The bytes are still buffered and will be
@@ -149,6 +154,29 @@ pub trait StoragePlugin: Send + Sync {
         self.flush_writes()
             .await
             .map(|_| IngestFlushResult::default())
+    }
+
+    /// Drain and return the accumulated dirty-write loss markers — PV
+    /// names whose buffered bytes were classified as lost outside a
+    /// single [`flush_ingest_writes`] pass (LRU dirty-eviction,
+    /// partition rollover, ghost-file, ETL evict-by-path, read-side
+    /// flush failures).
+    ///
+    /// **Single-owner invariant.** Only the engine's flush owner may
+    /// call this, and only on the *observed-success* path of a flush
+    /// cycle — so marker consumption is atomic with the owner applying
+    /// the drop (dropping the PV from its pending-timestamp commit).
+    /// The owner runs `flush_ingest_writes` inside a `spawn_blocking`
+    /// task it abandons on timeout; draining must therefore live HERE,
+    /// in a call the owner makes from its own context after observing
+    /// success, not inside the abandon-able flush body. A timed-out or
+    /// panicked flush consumes nothing, so its markers re-surface next
+    /// cycle instead of being silently swallowed (which would let the
+    /// next clean flush commit a `last_event` for lost bytes).
+    ///
+    /// The default returns empty for plugins without a loss queue.
+    fn take_loss_markers(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Per-tier summary scoped to a single PV: name, root folder, granularity,
