@@ -2938,12 +2938,15 @@ pub struct ShardedWritePoolConfig {
     /// bare `write_loop_with_config`).
     pub shards: usize,
     /// mpsc capacity of each shard's input channel. The dispatcher
-    /// `try_send`s into this; when full, the OFFENDING SHARD's
-    /// drop is recorded under
-    /// `archiver_dispatcher_shard_overflow_drops_total{shard=N}`
+    /// `try_send`s into this; when full, the OFFENDING SHARD's drop
+    /// is recorded under
+    /// `archiver_dispatcher_shard_overflow_drops_total{shard=N,phase}`
     /// and the sample's per-PV `buffer_overflow_drops` counter is
     /// bumped. Other shards keep flowing — that's the per-shard
-    /// isolation guarantee.
+    /// isolation guarantee. A shard whose worker dies is respawned by
+    /// the dispatcher; samples lost to a closed channel are recorded
+    /// separately under `archiver_dispatcher_shard_closed_drops_total`
+    /// (a distinct cause, kept out of `buffer_overflow_drops`).
     pub per_shard_buffer: usize,
     /// Per-worker config (timeouts, flush period). Cloned into
     /// each shard.
@@ -3031,34 +3034,23 @@ pub async fn run_sharded_write_pool(
         )
         .await;
     } else {
-        // Multi-shard path: dispatcher + N shard workers.
-        let mut shard_txs = Vec::with_capacity(n);
-        let mut shard_handles = Vec::with_capacity(n);
-        for shard_idx in 0..n {
-            let (s_tx, s_rx) = mpsc::channel::<PvSample>(cfg.per_shard_buffer);
-            shard_txs.push(s_tx);
-            let storage = storage.clone();
-            let pending = pending.clone();
-            let shard_shutdown = shutdown.clone();
-            let shard_cfg = cfg.write_loop.clone();
-            shard_handles.push(tokio::spawn(shard_append_loop(
-                shard_idx,
-                storage,
-                s_rx,
-                pending,
-                shard_shutdown,
-                shard_cfg,
-            )));
-        }
-
-        dispatch_loop(rx, shard_txs, shutdown.clone()).await;
-
-        // Dispatcher exited → shard sample receivers see EOS or
-        // the shutdown signal directly via their watch::Receiver.
-        // Wait for shards to finish their drain branches.
-        for h in shard_handles {
-            let _ = h.await;
-        }
+        // Multi-shard path: the dispatcher owns the shard workers'
+        // entire lifecycle — spawn, route, respawn-on-death, and
+        // join. Centralizing lifecycle in the single dispatcher lets
+        // it restart a shard whose task ended unexpectedly instead of
+        // silently dropping that shard's ~1/N of all PVs forever.
+        dispatch_loop(
+            rx,
+            n,
+            ShardSpawnCtx {
+                storage: storage.clone(),
+                pending: pending.clone(),
+                shutdown: shutdown.clone(),
+                per_shard_buffer: cfg.per_shard_buffer,
+                write_loop: cfg.write_loop.clone(),
+            },
+        )
+        .await;
     }
 
     // Flush owner uses its own shutdown-watch + drain_total_budget
@@ -3067,23 +3059,147 @@ pub async fn run_sharded_write_pool(
     let _ = flush_owner_handle.await;
 }
 
-/// Reads the upstream main mpsc, hashes each sample's `pv_name`,
-/// and forwards to the appropriate shard channel via
-/// `Sender::try_send` for **per-shard isolation**.
+/// Everything `dispatch_loop` needs to (re)spawn a shard worker,
+/// bundled so the dispatcher — the single owner of shard lifecycle —
+/// can restart a shard with identical wiring after its task ends.
+struct ShardSpawnCtx {
+    storage: Arc<dyn StoragePlugin>,
+    pending: Arc<PendingReports>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    per_shard_buffer: usize,
+    write_loop: WriteLoopConfig,
+}
+
+/// Spawn one shard worker; return its input channel and join handle.
+fn spawn_shard(
+    shard_idx: usize,
+    ctx: &ShardSpawnCtx,
+) -> (mpsc::Sender<PvSample>, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<PvSample>(ctx.per_shard_buffer);
+    let handle = tokio::spawn(shard_append_loop(
+        shard_idx,
+        ctx.storage.clone(),
+        rx,
+        ctx.pending.clone(),
+        ctx.shutdown.clone(),
+        ctx.write_loop.clone(),
+    ));
+    (tx, handle)
+}
+
+/// Account a sample dropped because its shard channel was full (the
+/// writer is falling behind). Pins the loss to the PV via
+/// `buffer_overflow_drops` and to the shard+phase via the metric.
+fn record_overflow_drop(shard: usize, s: &PvSample, phase: &'static str) {
+    if let Some(c) = s.counters.as_ref() {
+        c.buffer_overflow_drops.fetch_add(1, Ordering::Relaxed);
+    }
+    metrics::counter!(
+        "archiver_dispatcher_shard_overflow_drops_total",
+        "shard" => shard.to_string(),
+        "phase" => phase,
+    )
+    .increment(1);
+    debug!(
+        shard,
+        pv = s.pv_name,
+        phase,
+        "Shard channel full; sample dropped"
+    );
+}
+
+/// Account a sample dropped because its shard channel was closed (the
+/// worker task ended). Distinct cause from an overflow — shard death,
+/// not the writer falling behind — so it gets its OWN metric instead
+/// of inflating `buffer_overflow_drops` (folding it in would
+/// re-introduce the dual meaning that counter exists to avoid).
+fn record_closed_drop(shard: usize, s: &PvSample, phase: &'static str) {
+    metrics::counter!(
+        "archiver_dispatcher_shard_closed_drops_total",
+        "shard" => shard.to_string(),
+        "phase" => phase,
+    )
+    .increment(1);
+    warn!(
+        shard,
+        pv = s.pv_name,
+        phase,
+        "Shard channel closed; sample dropped"
+    );
+}
+
+/// Route one sample to its shard, respawning the shard first if its
+/// worker task has died. `shard_append_loop` only returns on
+/// shutdown, so a closed channel during steady-state routing means
+/// the worker panicked; restart it and retry once rather than
+/// dropping this shard's ~1/N of all PVs forever.
 ///
-/// `try_send` (not `send().await`) is the load-balancing
-/// invariant: if one slow shard's channel is full, the dispatcher
-/// drops THAT shard's overflow into `buffer_overflow_drops` and
-/// keeps routing for the other shards. Using `send().await` would
-/// block the dispatcher on the slow shard, back-pressuring the
-/// upstream main channel and starving every other shard's PVs —
-/// the exact failure mode the sharded layout is meant to prevent.
-async fn dispatch_loop(
-    mut rx: mpsc::Receiver<PvSample>,
-    shard_txs: Vec<mpsc::Sender<PvSample>>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+/// The respawned shard starts with empty in-shard ordering maps
+/// (`last_ts` / `last_dbr_type`). That is safe: the PB reader
+/// tolerates non-monotonic timestamps (clock backsteps, late
+/// backfills), and the per-PV writer-slot Mutex inside the storage
+/// layer — not the shard's maps — is the real append-ordering owner.
+fn route_sample(
+    sample: PvSample,
+    shard_txs: &mut [mpsc::Sender<PvSample>],
+    shard_handles: &mut [tokio::task::JoinHandle<()>],
+    ctx: &ShardSpawnCtx,
 ) {
-    let n = shard_txs.len();
+    let idx = shard_for_pv(&sample.pv_name, shard_txs.len());
+    match shard_txs[idx].try_send(sample) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(s)) => record_overflow_drop(idx, &s, "steady"),
+        Err(mpsc::error::TrySendError::Closed(s)) => {
+            warn!(shard = idx, pv = s.pv_name, "Shard worker died; respawning");
+            metrics::counter!(
+                "archiver_dispatcher_shard_respawn_total",
+                "shard" => idx.to_string(),
+            )
+            .increment(1);
+            let (tx, handle) = spawn_shard(idx, ctx);
+            // The old task is finished (its receiver was dropped,
+            // which is why we saw Closed); overwriting the handle
+            // detaches it.
+            shard_txs[idx] = tx;
+            shard_handles[idx] = handle;
+            match shard_txs[idx].try_send(s) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(s2)) => {
+                    record_overflow_drop(idx, &s2, "respawn_retry")
+                }
+                Err(mpsc::error::TrySendError::Closed(s2)) => {
+                    record_closed_drop(idx, &s2, "respawn_retry")
+                }
+            }
+        }
+    }
+}
+
+/// Reads the upstream main mpsc, hashes each sample's `pv_name`, and
+/// forwards to the appropriate shard channel via `Sender::try_send`
+/// for **per-shard isolation**. Owns the N shard workers' lifecycle:
+/// spawns them, respawns any that die ([`route_sample`]), and joins
+/// them on exit.
+///
+/// `try_send` (not `send().await`) is the load-balancing invariant:
+/// if one slow shard's channel is full, the dispatcher drops THAT
+/// shard's overflow and keeps routing for the other shards. Using
+/// `send().await` would block the dispatcher on the slow shard,
+/// back-pressuring the upstream main channel and starving every other
+/// shard's PVs — the exact failure mode the sharded layout prevents.
+async fn dispatch_loop(mut rx: mpsc::Receiver<PvSample>, n: usize, ctx: ShardSpawnCtx) {
+    let mut shutdown = ctx.shutdown.clone();
+    // The dispatcher owns its shard workers so it can respawn a dead
+    // one. A shard task only exits normally on shutdown, so a closed
+    // channel before then is a panic — see [`route_sample`].
+    let mut shard_txs: Vec<mpsc::Sender<PvSample>> = Vec::with_capacity(n);
+    let mut shard_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(n);
+    for shard_idx in 0..n {
+        let (tx, handle) = spawn_shard(shard_idx, &ctx);
+        shard_txs.push(tx);
+        shard_handles.push(handle);
+    }
+
     info!(shards = n, "Sharded write dispatcher started");
     loop {
         tokio::select! {
@@ -3093,40 +3209,21 @@ async fn dispatch_loop(
             // even under a sustained sample storm.
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    // Drain remaining samples (try_send for the
-                    // same reason as the steady-state branch).
-                    // Mirror the steady-state overflow accounting
-                    // so a saturated shard's drain-time drops are
-                    // visible to operators — silent loss here
-                    // would shadow real samples lost during
-                    // shutdown.
+                    // Drain remaining samples (try_send for the same
+                    // reason as the steady-state branch). No respawn
+                    // during shutdown — a closed shard has already
+                    // exited its loop on the same signal. Count BOTH
+                    // Full and Closed drops so shutdown-time loss is
+                    // visible to operators rather than silent.
                     while let Ok(sample) = rx.try_recv() {
                         let idx = shard_for_pv(&sample.pv_name, n);
                         match shard_txs[idx].try_send(sample) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(s)) => {
-                                if let Some(c) = s.counters.as_ref() {
-                                    c.buffer_overflow_drops
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                                metrics::counter!(
-                                    "archiver_dispatcher_shard_overflow_drops_total",
-                                    "shard" => idx.to_string(),
-                                    "phase" => "shutdown_drain",
-                                )
-                                .increment(1);
-                                debug!(
-                                    shard = idx,
-                                    pv = s.pv_name,
-                                    "Shutdown-drain shard channel full; sample dropped"
-                                );
+                                record_overflow_drop(idx, &s, "shutdown_drain")
                             }
                             Err(mpsc::error::TrySendError::Closed(s)) => {
-                                warn!(
-                                    shard = idx,
-                                    pv = s.pv_name,
-                                    "Shutdown-drain shard channel closed; sample dropped"
-                                );
+                                record_closed_drop(idx, &s, "shutdown_drain")
                             }
                         }
                     }
@@ -3136,42 +3233,7 @@ async fn dispatch_loop(
             maybe = rx.recv() => {
                 match maybe {
                     Some(sample) => {
-                        let idx = shard_for_pv(&sample.pv_name, n);
-                        match shard_txs[idx].try_send(sample) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(s)) => {
-                                // Shard saturated. Surface the
-                                // drop on the SAMPLE's per-PV
-                                // counter so operators can pin
-                                // the loss to a specific PV+shard.
-                                if let Some(c) = s.counters.as_ref() {
-                                    c.buffer_overflow_drops
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                                metrics::counter!(
-                                    "archiver_dispatcher_shard_overflow_drops_total",
-                                    "shard" => idx.to_string(),
-                                )
-                                .increment(1);
-                                debug!(
-                                    shard = idx,
-                                    pv = s.pv_name,
-                                    "Shard channel full; sample dropped \
-                                     (per-shard isolation)"
-                                );
-                            }
-                            Err(mpsc::error::TrySendError::Closed(s)) => {
-                                // Shard worker died (panic or
-                                // shutdown race). We'll lose this
-                                // sample but keep the dispatcher
-                                // alive for OTHER shards.
-                                warn!(
-                                    shard = idx,
-                                    pv = s.pv_name,
-                                    "Shard channel closed; sample dropped"
-                                );
-                            }
-                        }
+                        route_sample(sample, &mut shard_txs, &mut shard_handles, &ctx);
                     }
                     None => break, // Upstream closed.
                 }
@@ -3179,6 +3241,13 @@ async fn dispatch_loop(
         }
     }
     info!("Sharded write dispatcher exiting");
+
+    // Single owner joins the shard workers on the way out. The
+    // dispatcher exited → shard sample receivers see EOS or the
+    // shutdown signal directly via their watch::Receiver.
+    for handle in shard_handles {
+        let _ = handle.await;
+    }
 }
 
 /// Background writer task — drains samples and writes to storage.
@@ -4349,5 +4418,122 @@ mod pva_mapping_tests {
             ArchiverValue::ScalarDouble(v) => assert!((v - 42.5).abs() < 1e-9),
             other => panic!("expected ScalarDouble, got {:?}", other.db_type()),
         }
+    }
+}
+
+#[cfg(test)]
+mod shard_lifecycle_tests {
+    use super::*;
+    use archiver_core::storage::partition::PartitionGranularity;
+    use archiver_core::storage::traits::{EventStream, StoreSummary};
+
+    /// Minimal StoragePlugin whose appends always succeed — enough to
+    /// drive the dispatcher respawn path. Read/admin methods are
+    /// no-ops; `append_event_with_meta` falls back to `append_event`
+    /// via the trait default, so a successful append bumps the
+    /// sample's `events_stored` counter inside the shard worker.
+    struct OkStorage;
+
+    #[async_trait::async_trait]
+    impl StoragePlugin for OkStorage {
+        fn name(&self) -> &str {
+            "ok-mock"
+        }
+        fn partition_granularity(&self) -> PartitionGranularity {
+            PartitionGranularity::Hour
+        }
+        async fn append_event(
+            &self,
+            _pv: &str,
+            _dbr_type: ArchDbType,
+            _sample: &ArchiverSample,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_data(
+            &self,
+            _pv: &str,
+            _start: SystemTime,
+            _end: SystemTime,
+        ) -> anyhow::Result<Vec<Box<dyn EventStream>>> {
+            Ok(Vec::new())
+        }
+        async fn get_last_known_event(&self, _pv: &str) -> anyhow::Result<Option<ArchiverSample>> {
+            Ok(None)
+        }
+        fn stores_for_pv(&self, _pv: &str) -> anyhow::Result<Vec<StoreSummary>> {
+            Ok(Vec::new())
+        }
+        fn appliance_metrics(&self) -> anyhow::Result<Vec<StoreSummary>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A shard whose worker has died (its channel is closed) must be
+    /// respawned on the next routed sample, and that sample delivered
+    /// — not silently dropped forever. Regression for the dispatcher's
+    /// old `Closed => warn-and-drop` behavior, which lost ~1/N of all
+    /// PVs permanently after a single shard panic.
+    #[tokio::test]
+    async fn route_sample_respawns_dead_shard_and_delivers() {
+        let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+        let ctx = ShardSpawnCtx {
+            storage: Arc::new(OkStorage),
+            pending: Arc::new(PendingReports::new()),
+            shutdown: sd_rx,
+            per_shard_buffer: 16,
+            write_loop: WriteLoopConfig {
+                append_timeout: Duration::from_secs(2),
+                ..WriteLoopConfig::default()
+            },
+        };
+
+        // Single shard whose worker has already died: a sender whose
+        // receiver was dropped reports Closed on try_send.
+        let (dead_tx, dead_rx) = mpsc::channel::<PvSample>(1);
+        drop(dead_rx);
+        let mut shard_txs = vec![dead_tx];
+        let mut shard_handles = vec![tokio::spawn(async {})];
+        assert!(
+            shard_txs[0].is_closed(),
+            "precondition: shard 0's worker is dead (channel closed)"
+        );
+
+        let counters = Arc::new(PvCounters::default());
+        let sample = PvSample {
+            pv_name: "pv:respawn".to_string(),
+            dbr_type: ArchDbType::ScalarDouble,
+            sample: ArchiverSample::new(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                ArchiverValue::ScalarDouble(1.0),
+            ),
+            element_count: Some(1),
+            counters: Some(counters.clone()),
+        };
+
+        route_sample(sample, &mut shard_txs, &mut shard_handles, &ctx);
+
+        // Respawn must have replaced the dead sender with a live one.
+        assert!(
+            !shard_txs[0].is_closed(),
+            "shard 0 must be respawned with a live channel"
+        );
+
+        // The fresh shard receives + appends the retried sample.
+        let mut stored = 0;
+        for _ in 0..200 {
+            stored = counters.events_stored.load(Ordering::Relaxed);
+            if stored == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            stored, 1,
+            "respawned shard must store the retried sample, not drop it"
+        );
+
+        // Tear the respawned shard down cleanly.
+        let _ = sd_tx.send(true);
     }
 }
