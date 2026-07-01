@@ -1448,3 +1448,43 @@ async fn fsync_on_flush_creates_and_syncs_new_directory_chain() {
         other => panic!("Expected ScalarDouble, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn fsync_on_flush_second_pv_sharing_prefix_still_persists() {
+    // Two PVs share a new prefix (root/SR/BPM). The first append creates
+    // + syncs the chain; the SECOND finds the directory already present.
+    // create_dir_all_synced must re-sync the chain unconditionally (not
+    // short-circuit on exists()), so the rider makes the chain durable
+    // itself rather than depending on the first caller's progress. Both
+    // PVs must flush and read back.
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour)
+            .with_fsync_on_flush(true);
+
+    let ts: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap().into();
+    for pv in ["SR:BPM:X", "SR:BPM:Y"] {
+        let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(2.0));
+        plugin
+            .append_event(pv, ArchDbType::ScalarDouble, &sample)
+            .await
+            .unwrap();
+    }
+
+    let res = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        res.failed.is_empty(),
+        "shared-prefix fsync flush must not lose a PV: {:?}",
+        res.failed
+    );
+
+    let start: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 0, 0).unwrap().into();
+    let end: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 11, 0, 0).unwrap().into();
+    for pv in ["SR:BPM:X", "SR:BPM:Y"] {
+        let mut streams = plugin.get_data(pv, start, end).await.unwrap();
+        assert!(
+            streams[0].next_event().unwrap().is_some(),
+            "{pv} sample must read back"
+        );
+    }
+}

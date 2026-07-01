@@ -874,13 +874,13 @@ impl PlainPbStoragePlugin {
             };
             if needs_create {
                 if self.fsync_on_flush {
-                    // Durability: fsync each newly created level's
-                    // parent so the new directory entries survive a
-                    // power loss. Without this, a first-ever sample for
-                    // a new PV prefix could be committed to the
-                    // registry while the directory chain that makes its
-                    // file reachable is still only in the page cache.
-                    Self::create_dir_all_synced(parent)?;
+                    // Durability: fsync every level of the new directory
+                    // chain so the entries survive a power loss. Without
+                    // this, a first-ever sample for a new PV prefix
+                    // could be committed to the registry while the
+                    // directory chain that makes its file reachable is
+                    // still only in the page cache.
+                    self.create_dir_all_synced(parent)?;
                 } else {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -900,39 +900,54 @@ impl PlainPbStoragePlugin {
         std::fs::File::open(dir)?.sync_all()
     }
 
-    /// Like `create_dir_all`, but fsyncs each newly created directory's
-    /// parent so the new entries survive a power loss. Used only when
-    /// `fsync_on_flush` is set. Idempotent and concurrency-safe: a
-    /// level a racing thread created first (`AlreadyExists`) is
-    /// tolerated, and its parent is still synced so the entry is
-    /// durable regardless of which thread won the create.
-    fn create_dir_all_synced(dir: &Path) -> std::io::Result<()> {
-        if dir.exists() {
-            return Ok(());
-        }
-        // Walk up to the deepest existing ancestor, recording missing
-        // levels deepest-first.
-        let mut missing: Vec<&Path> = Vec::new();
+    /// Like `create_dir_all`, but fsyncs each level of the chain so the
+    /// new directory entries survive a power loss. Used only when
+    /// `fsync_on_flush` is set.
+    ///
+    /// Durability is NOT inferred from `exists()`. This runs UNLOCKED on
+    /// a plugin `Arc` shared across all shard write tasks, so a
+    /// concurrent creator can make a directory visible (`exists()` ==
+    /// true) *before* it has fsync'd that directory's entry into its
+    /// parent. If a rider short-circuited on `exists()` it could return,
+    /// append, and let the flush owner commit `last_event` while an
+    /// ancestor entry is still page-cache-only — a power loss then makes
+    /// the committed bytes unreachable (over-commit). A failed sync that
+    /// is retried has the same trap: the level now `exists()`, so the
+    /// re-sync would be skipped.
+    ///
+    /// So every level's parent is fsync'd UNCONDITIONALLY, whether or
+    /// not the level pre-existed: each caller makes the whole chain
+    /// durable itself, with no dependency on another thread's progress.
+    /// `known_dirs` is populated by the caller only after this returns
+    /// `Ok`, so membership there truly means "chain is durable" and the
+    /// fast-path skip is safe. Bounded at `root_folder` (created at
+    /// startup, assumed durable); levels above it are never touched.
+    /// Concurrency-safe: an `AlreadyExists` from a racing creator is
+    /// tolerated and that level's parent is still synced.
+    fn create_dir_all_synced(&self, dir: &Path) -> std::io::Result<()> {
+        let root = self.root_folder.as_path();
+        // Collect the levels strictly under `root`, deepest first,
+        // stopping AT `root` (never descend below/above it).
+        let mut levels: Vec<&Path> = Vec::new();
         let mut cur = dir;
-        loop {
-            if cur.exists() {
-                break;
-            }
-            missing.push(cur);
+        while cur != root {
+            levels.push(cur);
             match cur.parent() {
                 Some(p) => cur = p,
+                // `dir` isn't under `root` (never happens for paths from
+                // `file_path_for`); stop rather than walk to fs root.
                 None => break,
             }
         }
-        // Create shallowest-first; fsync each new dir's parent so the
-        // child's entry is durable before we descend into it.
-        for d in missing.iter().rev() {
-            match std::fs::create_dir(d) {
+        // Shallowest-first: create each level if missing, then fsync its
+        // parent unconditionally so the level's entry is durable.
+        for level in levels.iter().rev() {
+            match std::fs::create_dir(level) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(e),
             }
-            if let Some(parent) = d.parent() {
+            if let Some(parent) = level.parent() {
                 Self::sync_dir(parent)?;
             }
         }
