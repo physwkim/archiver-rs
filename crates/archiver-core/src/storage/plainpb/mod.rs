@@ -869,6 +869,89 @@ impl PlainPbStoragePlugin {
         Self::unlink_idempotent(path)
     }
 
+    /// Slot-locked delete of a moved source partition that additionally
+    /// refuses to unlink when the on-disk file has changed length since the
+    /// copy read it. This closes the copy→delete TOCTOU: a concurrent
+    /// backfill can append (and flush) a late sample into an *old* partition
+    /// while ETL is moving it — growing the source with bytes the mover never
+    /// copied to the coarser tier. Deleting then would silently lose them.
+    ///
+    /// `expected_len` is the source length the caller consumed into the dest.
+    /// Returns:
+    /// - `Ok(true)`  — removed (durably copied, and byte-for-byte unchanged),
+    ///   or already absent (idempotent).
+    /// - `Ok(false)` — KEPT: a live/dirty cached writer holds un-copied bytes,
+    ///   OR the on-disk length differs from `expected_len` (a concurrent
+    ///   append grew it, or an unexpected shrink). The caller leaves its dest
+    ///   checkpoint in place and re-copies the current source next cycle.
+    ///
+    /// The length check runs UNDER the per-PV slot lock, so no append can grow
+    /// `path` between the check and the unlink — the delete is atomic with the
+    /// "unchanged" proof. Mirrors [`remove_moved_partition`]'s slot discipline.
+    pub fn remove_moved_partition_if_len(
+        &self,
+        path: &Path,
+        expected_len: u64,
+    ) -> std::io::Result<bool> {
+        // A path that doesn't decode to a known PV layout cannot be held by
+        // any slot — length-gate then unlink directly.
+        let Some(pv) = self.pv_name_from_path(path) else {
+            return Self::unlink_if_unchanged(path, expected_len);
+        };
+        let slot_arc = {
+            let cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.get(&pv).cloned()
+        };
+        let Some(arc) = slot_arc else {
+            // No slot for this PV → nothing is writing the path.
+            return Self::unlink_if_unchanged(path, expected_len);
+        };
+
+        let mut slot = arc.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = slot.writer.as_ref()
+            && cached.path == path
+            && cached.dirty
+        {
+            // Live partition with un-copied buffered bytes — never delete it;
+            // it will grow past `expected_len` once flushed. Keep + retry.
+            return Ok(false);
+        }
+
+        // Length gate under the slot lock. NotFound → already gone (success).
+        // A mismatch means a prior flush grew (or something shrank) the file
+        // beyond what the caller copied — keep it and re-copy next cycle.
+        match std::fs::metadata(path) {
+            Ok(m) if m.len() != expected_len => return Ok(false),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => return Err(e),
+        }
+
+        // Length matches and no dirty writer: drop any clean writer on this
+        // exact path (close its fd via `into_parts` so BufWriter's drop-time
+        // flush can't re-fire into the soon-to-be-unlinked inode), then unlink
+        // while still holding the slot lock.
+        if slot.writer.as_ref().is_some_and(|cw| cw.path == path)
+            && let Some(taken) = slot.writer.take()
+        {
+            let (_file, _buffered) = taken.writer.into_parts();
+        }
+        Self::unlink_idempotent(path)
+    }
+
+    /// Length-gated unlink for a path held by no slot: unlink only if the
+    /// on-disk length still equals `expected_len`. NotFound → `Ok(true)`
+    /// (already gone). Used by [`remove_moved_partition_if_len`] for paths
+    /// that decode to no PV or have no cached slot.
+    fn unlink_if_unchanged(path: &Path, expected_len: u64) -> std::io::Result<bool> {
+        match std::fs::metadata(path) {
+            Ok(m) if m.len() != expected_len => Ok(false),
+            Ok(_) => Self::unlink_idempotent(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Roll a destination partition file back to a known-good byte
     /// length, discarding any cached writer on it WITHOUT recording loss,
     /// then truncate and (under `fsync_on_flush`) make the new length
@@ -2287,6 +2370,70 @@ mod tests {
         // No file yet, target length 0 — idempotent no-op.
         plugin.truncate_partition(&missing, 0).unwrap();
         assert!(!missing.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_moved_partition_if_len_gates_on_length_and_dirtiness() {
+        use crate::types::ArchiverValue;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin =
+            PlainPbStoragePlugin::new("STS", dir.path().to_path_buf(), PartitionGranularity::Hour);
+        let base = 1_700_000_000;
+        let mk = |i: u64| {
+            ArchiverSample::new(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(base + i),
+                ArchiverValue::ScalarDouble(i as f64),
+            )
+        };
+        let dbr = mk(0).value.db_type();
+        let pv = "PV:X";
+
+        // A clean partition of length N (the "copied" length).
+        for i in 0..5 {
+            plugin.append_event(pv, dbr, &mk(i)).await.unwrap();
+        }
+        plugin.flush_writes().await.unwrap();
+        let path = plugin.file_path_for(pv, mk(0).timestamp);
+        let n = std::fs::metadata(&path).unwrap().len();
+
+        // GROWN: a concurrent backfill appended + flushed a late sample, so
+        // on-disk length now exceeds the copied length → refuse to delete.
+        plugin.append_event(pv, dbr, &mk(5)).await.unwrap();
+        plugin.flush_writes().await.unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > n);
+        assert!(
+            !plugin.remove_moved_partition_if_len(&path, n).unwrap(),
+            "grown source (uncopied tail) must NOT be deleted"
+        );
+        assert!(path.exists(), "kept on length mismatch");
+
+        // DIRTY: an unflushed buffered append leaves on-disk length at the
+        // grown value but a dirty writer → still refuse.
+        let grown = std::fs::metadata(&path).unwrap().len();
+        plugin.append_event(pv, dbr, &mk(6)).await.unwrap(); // dirty, unflushed
+        assert!(
+            !plugin.remove_moved_partition_if_len(&path, grown).unwrap(),
+            "live/dirty source must NOT be deleted even if on-disk length matches"
+        );
+        assert!(path.exists());
+
+        // UNCHANGED: flush so the writer is clean, then gate on the exact
+        // current length → deletes.
+        plugin.flush_writes().await.unwrap();
+        let cur = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            plugin.remove_moved_partition_if_len(&path, cur).unwrap(),
+            "unchanged, durably-copied source is deleted"
+        );
+        assert!(!path.exists(), "removed on exact-length match");
+
+        // ABSENT: idempotent success regardless of expected length.
+        assert!(
+            plugin.remove_moved_partition_if_len(&path, 999).unwrap(),
+            "already-absent path is idempotent success"
+        );
     }
 
     #[test]
