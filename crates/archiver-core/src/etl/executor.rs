@@ -159,6 +159,18 @@ impl EtlExecutor {
             return Ok(());
         }
 
+        // Reap terminal orphan checkpoints before moving. A checkpoint whose
+        // owning source has been deleted (a crash in the commit's
+        // delete-source → remove-checkpoint window) is otherwise never cleared
+        // once its dest partition is terminal (no further source aggregates
+        // into it), and the NEXT tier's `move_file` defers on that checkpoint
+        // forever — a permanent migration wedge. This executor is the correct
+        // owner of the sweep: it holds BOTH the tier that carries the
+        // checkpoint (its dest) and the tier that holds the owner (its source),
+        // so it alone can verify owner-gone. The next tier cannot (it does not
+        // know where the finer tier lives).
+        self.reap_orphan_checkpoints(source_root).await?;
+
         let pb_files = list_pb_files(source_root)?;
 
         // Group every source partition by its TRUE PV name — the same
@@ -222,6 +234,75 @@ impl EtlExecutor {
             }
         }
 
+        Ok(())
+    }
+
+    /// Remove orphan checkpoints in the DEST tier whose owning source (in the
+    /// SOURCE tier) no longer exists — the terminal-partition wedge fix.
+    ///
+    /// Held under the move gate so it never races a `move_file` mid-establishing
+    /// or mid-removing a checkpoint: while a move holds the gate its owner
+    /// source is present, so a gate-held reap only ever sees genuinely orphaned
+    /// (owner-gone) or torn checkpoints. A parseable checkpoint whose owner is
+    /// still on disk is an in-flight aggregation and is left untouched.
+    ///
+    /// `source_root` is passed in (already confirmed to exist by the caller) so
+    /// the owner's path can be reconstructed by mirroring the checkpoint's
+    /// dest-relative sub-directory into the source tier — both tiers lay a PV's
+    /// partitions out under the same relative path.
+    async fn reap_orphan_checkpoints(&self, source_root: &Path) -> anyhow::Result<()> {
+        let _gate = self.move_gate.lock().await;
+
+        let dest_root = self.dest.root_folder();
+        for ckpt_path in list_ckpt_files(dest_root)? {
+            let ck = match read_ckpt(&ckpt_path) {
+                Some(ck) => ck,
+                None => {
+                    // Torn (crashed mid-create, so it predates any append —
+                    // D is at its committed length). Remove it: a torn
+                    // checkpoint on a terminal partition wedges the next tier
+                    // just as an orphan does.
+                    warn!(?ckpt_path, "ETL reaping torn dest checkpoint");
+                    self.dest.remove_etl_sidecar(&ckpt_path)?;
+                    continue;
+                }
+            };
+
+            // Reconstruct the owner's path in the source tier by mirroring the
+            // checkpoint's sub-directory (relative to the dest root) under the
+            // source root.
+            let owner_path = match ckpt_path
+                .parent()
+                .and_then(|p| p.strip_prefix(dest_root).ok())
+            {
+                Some(rel) => source_root.join(rel).join(&ck.owner),
+                None => source_root.join(&ck.owner),
+            };
+            if owner_path.exists() {
+                // In-flight aggregation by a still-present source: leave it.
+                continue;
+            }
+
+            // Orphan: the owner is gone. A `committed` tail is final — just
+            // remove the checkpoint. A `copying` orphan can only arise from an
+            // out-of-model external deletion of the source mid-copy; its tail
+            // past the anchor is a partial, so roll D back before removing so no
+            // uncommitted frames linger. `<D>` is the checkpoint path with the
+            // `.etl_ckpt` extension stripped.
+            if ck.state == CkptState::Copying {
+                let d_path = ckpt_path.with_extension("");
+                let dest = self.dest.clone();
+                let anchor = ck.anchor;
+                tokio::task::spawn_blocking(move || dest.truncate_partition(&d_path, anchor))
+                    .await??;
+            }
+            warn!(
+                ?ckpt_path,
+                owner = ck.owner,
+                "ETL reaping orphaned dest checkpoint (owner source gone)"
+            );
+            self.dest.remove_etl_sidecar(&ckpt_path)?;
+        }
         Ok(())
     }
 
@@ -742,6 +823,25 @@ fn list_pb_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
             if path.is_dir() {
                 files.extend(list_pb_files(&path)?);
             } else if path.extension().and_then(|e| e.to_str()) == Some("pb") {
+                files.push(path);
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Recursively list all `.pb.etl_ckpt` checkpoint sidecars under a directory.
+/// Matches the `etl_ckpt` extension only, so the `.etl_ckpt.tmp` scratch file
+/// of an in-flight atomic overwrite (extension `tmp`) is never returned.
+fn list_ckpt_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(list_ckpt_files(&path)?);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("etl_ckpt") {
                 files.push(path);
             }
         }
@@ -1581,6 +1681,137 @@ mod tests {
         );
         assert!(!s_path.exists(), "source moved out");
         assert!(!ckpt.exists(), "checkpoint cleared on commit");
+    }
+
+    #[tokio::test]
+    async fn reap_removes_terminal_orphan_checkpoint_and_keeps_live_one() {
+        // Finding A: a `committed` checkpoint whose owner source was deleted
+        // (crash in the delete → remove-checkpoint window) is stranded once its
+        // dest partition is terminal — no later move into D reaps it, and the
+        // next tier's move defers on it forever. run_once's reap, owned by the
+        // forward executor (it holds both tiers), removes it. A checkpoint whose
+        // owner source is still present is an in-flight aggregation and is KEPT.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+
+        // D_orphan: a committed day-partition whose owner hour-source is GONE.
+        let orphan_samples: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let dbr = orphan_samples[0].value.db_type();
+        for e in &orphan_samples {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let d_orphan = dest.file_path_for(pv, orphan_samples[0].timestamp);
+        let orphan_ckpt = d_orphan.with_extension("pb.etl_ckpt");
+        dest.create_etl_sidecar(
+            &orphan_ckpt,
+            &ckpt_contents(
+                CkptState::Committed,
+                0,
+                "SimpleSine:1999_01_01_00.pb",
+                Some(1),
+            ),
+        )
+        .unwrap();
+
+        // A live source partition (a distant day) exists in STS, so the source
+        // root exists (the reap is gated on that) and its own checkpoint below
+        // has a present owner. One partition → not movable, so run_once won't
+        // migrate it.
+        let live_samples: Vec<_> = (0..10)
+            .map(|i| sample_at(BASE_SECS + 5 * 86_400 + i, i as f64))
+            .collect();
+        let live_owner_path = write_source_partition(&src, pv, &live_samples).await;
+        let live_owner = live_owner_path.file_name().unwrap().to_str().unwrap();
+        let d_live = dest.file_path_for(pv, live_samples[0].timestamp);
+        let live_ckpt = d_live.with_extension("pb.etl_ckpt");
+        dest.create_etl_sidecar(
+            &live_ckpt,
+            &ckpt_contents(
+                CkptState::Copying,
+                0,
+                live_owner,
+                source_btime_nanos(&live_owner_path),
+            ),
+        )
+        .unwrap();
+
+        exec.run_once().await.unwrap();
+
+        assert!(!orphan_ckpt.exists(), "terminal orphan checkpoint reaped");
+        assert_eq!(
+            count_samples(&d_orphan),
+            20,
+            "committed tail untouched by reap"
+        );
+        assert!(live_ckpt.exists(), "live (owner present) checkpoint kept");
+    }
+
+    #[tokio::test]
+    async fn terminal_orphan_wedge_resolved_by_forward_tier_reap() {
+        // The full wedge: STS→MTS crashed after deleting the last STS source of
+        // a day but before removing D's checkpoint. D (an MTS day-partition) is
+        // terminal — no STS source maps to it again — so MTS→LTS's move_file(D)
+        // defers on the orphan inbound checkpoint every cycle. The STS→MTS
+        // executor's reap removes the orphan, unwedging the MTS→LTS move.
+        let tmp = tempfile::tempdir().unwrap();
+        let sts = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let mts = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let lts = plugin(tmp.path().join("lts"), "LTS", PartitionGranularity::Year);
+        let sts_mts = EtlExecutor::new(sts.clone(), mts.clone(), 3600, 0, 100);
+        let mts_lts = EtlExecutor::new(mts.clone(), lts.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        // D: an MTS day-partition durably holding 20 samples, with a committed
+        // orphan checkpoint owned by a now-deleted STS hour-source.
+        let samples: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let dbr = samples[0].value.db_type();
+        for e in &samples {
+            mts.append_event(pv, dbr, e).await.unwrap();
+        }
+        mts.flush_writes().await.unwrap();
+        let d_path = mts.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        mts.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(
+                CkptState::Committed,
+                0,
+                "SimpleSine:1999_01_01_00.pb",
+                Some(1),
+            ),
+        )
+        .unwrap();
+
+        // A live STS partition (distant day) keeps the STS root present so the
+        // reap runs; one partition → not movable.
+        let keep: Vec<_> = (0..3)
+            .map(|i| sample_at(BASE_SECS + 5 * 86_400 + i, i as f64))
+            .collect();
+        write_source_partition(&sts, pv, &keep).await;
+
+        // Before the reap: MTS→LTS defers on the inbound orphan checkpoint.
+        mts_lts.move_file(&d_path).await.unwrap();
+        assert!(d_path.exists(), "wedged: D not moved while orphan present");
+        let lts_path = lts.file_path_for(pv, samples[0].timestamp);
+        assert!(!lts_path.exists(), "wedged: nothing reached LTS");
+
+        // STS→MTS's reap removes the orphan (its owner STS source is gone).
+        sts_mts.run_once().await.unwrap();
+        assert!(!ckpt.exists(), "orphan reaped by the forward tier");
+
+        // Now MTS→LTS proceeds: D migrates to LTS.
+        mts_lts.move_file(&d_path).await.unwrap();
+        assert!(!d_path.exists(), "unwedged: D moved out to LTS");
+        assert_eq!(count_samples(&lts_path), 20, "D's samples reached LTS once");
     }
 
     #[tokio::test]
