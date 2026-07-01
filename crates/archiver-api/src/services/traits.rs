@@ -117,6 +117,13 @@ pub struct PvCountersDto {
     /// so operators can tell a wedged storage tier apart from a
     /// slow writer.
     pub storage_append_timeouts: u64,
+    /// Events dropped because the shard's channel was closed (worker
+    /// death / respawn budget spent) — distinct from
+    /// `buffer_overflow_drops` (channel full but the worker is alive).
+    pub shard_closed_drops: u64,
+    /// Buffered events abandoned during graceful shutdown because the
+    /// drain budget expired before they could be appended.
+    pub shutdown_abandoned_drops: u64,
 }
 
 // --- ArchiverCommand (async — write operations on archiver engine) ---

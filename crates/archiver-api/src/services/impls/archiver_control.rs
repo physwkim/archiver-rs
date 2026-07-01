@@ -58,6 +58,8 @@ impl ArchiverQuery for ChannelArchiverControl {
                         latest_observed_dbr: c.latest_observed_dbr,
                         metadata_fetch_failures: c.metadata_fetch_failures,
                         storage_append_timeouts: c.storage_append_timeouts,
+                        shard_closed_drops: c.shard_closed_drops,
+                        shutdown_abandoned_drops: c.shutdown_abandoned_drops,
                     },
                 )
             })

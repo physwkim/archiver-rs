@@ -153,6 +153,18 @@ pub struct PvCounters {
     /// operator can tell "the storage tier is wedged" apart from
     /// "the writer can't keep up with the producer".
     pub storage_append_timeouts: AtomicU64,
+    /// Number of events dropped because the shard's channel was closed —
+    /// the worker task died (loop panic) or its respawn budget was spent.
+    /// Distinct from `buffer_overflow_drops` (channel full but the worker
+    /// is alive and catching up): a non-zero value here means this PV's
+    /// samples were lost to shard death, not backpressure. Aggregated
+    /// across shards as `archiver_dispatcher_shard_closed_drops_total`.
+    pub shard_closed_drops: AtomicU64,
+    /// Number of this PV's buffered events abandoned during graceful
+    /// shutdown because the drain budget expired before they could be
+    /// appended. Distinct from `shard_closed_drops` (channel closed): the
+    /// channel was open and draining, but time ran out.
+    pub shutdown_abandoned_drops: AtomicU64,
 }
 
 impl Default for PvCounters {
@@ -171,6 +183,8 @@ impl Default for PvCounters {
             latest_observed_dbr: AtomicI32::new(-1),
             metadata_fetch_failures: AtomicU64::new(0),
             storage_append_timeouts: AtomicU64::new(0),
+            shard_closed_drops: AtomicU64::new(0),
+            shutdown_abandoned_drops: AtomicU64::new(0),
         }
     }
 }
@@ -193,6 +207,8 @@ pub struct PvCountersSnapshot {
     pub latest_observed_dbr: Option<i32>,
     pub metadata_fetch_failures: u64,
     pub storage_append_timeouts: u64,
+    pub shard_closed_drops: u64,
+    pub shutdown_abandoned_drops: u64,
 }
 
 impl From<&PvCounters> for PvCountersSnapshot {
@@ -219,6 +235,8 @@ impl From<&PvCounters> for PvCountersSnapshot {
             },
             metadata_fetch_failures: c.metadata_fetch_failures.load(Ordering::Relaxed),
             storage_append_timeouts: c.storage_append_timeouts.load(Ordering::Relaxed),
+            shard_closed_drops: c.shard_closed_drops.load(Ordering::Relaxed),
+            shutdown_abandoned_drops: c.shutdown_abandoned_drops.load(Ordering::Relaxed),
         }
     }
 }
@@ -3115,6 +3133,13 @@ fn record_overflow_drop(shard: usize, s: &PvSample, phase: &'static str) {
 /// of inflating `buffer_overflow_drops` (folding it in would
 /// re-introduce the dual meaning that counter exists to avoid).
 fn record_closed_drop(shard: usize, s: &PvSample, phase: &'static str) {
+    // Per-PV attribution so an operator can see WHICH PVs lost samples to
+    // shard death, not just the shard-level aggregate. Single owner of the
+    // closed-drop count: every phase (respawn_giveup / respawn_retry /
+    // shutdown_drain) routes through here.
+    if let Some(c) = s.counters.as_ref() {
+        c.shard_closed_drops.fetch_add(1, Ordering::Relaxed);
+    }
     metrics::counter!(
         "archiver_dispatcher_shard_closed_drops_total",
         "shard" => shard.to_string(),
@@ -3948,6 +3973,12 @@ async fn shard_drain_on_shutdown(
     let mut drained_skipped = 0usize;
     while let Ok(pv_sample) = sample_rx.try_recv() {
         if drain_start.elapsed() > drain_total_budget {
+            // Per-PV attribution for the abandoned sample so the loss is
+            // visible on the PV's own counters, not just the shard-level
+            // warn log below.
+            if let Some(c) = pv_sample.counters.as_ref() {
+                c.shutdown_abandoned_drops.fetch_add(1, Ordering::Relaxed);
+            }
             drained_skipped += 1;
             continue;
         }
@@ -4647,5 +4678,30 @@ mod shard_lifecycle_tests {
             gov.allow(0, t0 + RESPAWN_WINDOW + Duration::from_millis(1)),
             "budget must refill after the window elapses"
         );
+    }
+
+    #[test]
+    fn record_closed_drop_increments_per_pv_closed_counter_only() {
+        let counters = Arc::new(PvCounters::default());
+        let sample = PvSample {
+            pv_name: "pv:closed".to_string(),
+            dbr_type: ArchDbType::ScalarDouble,
+            sample: ArchiverSample::new(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                ArchiverValue::ScalarDouble(1.0),
+            ),
+            element_count: Some(1),
+            counters: Some(counters.clone()),
+        };
+
+        // Every closed-drop phase routes through record_closed_drop and
+        // bumps the same per-PV counter.
+        record_closed_drop(0, &sample, "respawn_giveup");
+        record_closed_drop(0, &sample, "shutdown_drain");
+        assert_eq!(counters.shard_closed_drops.load(Ordering::Relaxed), 2);
+
+        // No dual meaning: distinct drop causes stay at zero.
+        assert_eq!(counters.buffer_overflow_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.shutdown_abandoned_drops.load(Ordering::Relaxed), 0);
     }
 }
