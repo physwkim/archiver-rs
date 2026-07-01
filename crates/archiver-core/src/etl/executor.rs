@@ -456,7 +456,27 @@ impl EtlExecutor {
         let source_name = self.source.name().to_string();
         let dest_name = self.dest.name().to_string();
 
-        let mut reader = PbFileReader::open(&source_path)?;
+        let mut reader = match PbFileReader::open(&source_path) {
+            Ok(r) => r,
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                // The source is already gone. `consolidate_pv` lists a PV's
+                // files BEFORE taking the per-move gate, so the periodic loop
+                // (sharing this executor's `move_gate`) can migrate one first;
+                // by the time this call wins the gate the file is deleted.
+                // Nothing to move — report DEFERRED, not an error, so
+                // consolidate_pv doesn't spuriously hard-fail the whole PV over
+                // a file that was in fact correctly migrated.
+                debug!(
+                    ?source_path,
+                    "ETL move_file: source already gone (migrated by a concurrent cycle); skipping"
+                );
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
         // The source length as the copy reads it. The commit deletes the
         // source only if it is STILL exactly this long — proof that D holds
         // every byte we copied and no uncopied tail (a concurrent backfill
@@ -2132,6 +2152,28 @@ mod tests {
         );
         assert!(!s_path.exists());
         assert!(!ckpt.exists());
+    }
+
+    #[tokio::test]
+    async fn move_file_absent_source_is_deferred_not_error() {
+        // Round-6 OBS-A: consolidate_pv lists a PV's files BEFORE taking the
+        // per-move gate, so the periodic loop (sharing this executor's
+        // move_gate) can migrate one first. move_file on the now-absent source
+        // must report Ok(false) (nothing to move), not Err — otherwise
+        // consolidate_pv spuriously hard-fails the whole PV over a file that was
+        // in fact correctly migrated.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let absent = tmp.path().join("sts").join("SimpleSine:2023_11_14_22.pb");
+        assert!(!absent.exists());
+        let moved = exec.move_file(&absent).await.unwrap();
+        assert!(
+            !moved,
+            "absent source reported deferred (Ok(false)), not error"
+        );
     }
 
     #[tokio::test]
