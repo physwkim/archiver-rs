@@ -30,19 +30,35 @@ pub struct EtlExecutor {
     /// Optional PV registry — when present, paused PVs are skipped
     /// (Java parity 92db337).
     pv_registry: Option<Arc<PvRegistry>>,
-    /// Serializes `move_file`'s critical section across this executor.
-    /// ETL moves are already sequential within `run_once` and
-    /// `consolidate_pv`; the only concurrency is the periodic loop task
-    /// racing an operator's `consolidate_pv` (both hold the SAME
-    /// `Arc<EtlExecutor>`, see `main.rs` `etl_chain`). Two moves into the
-    /// same aggregating dest partition would interleave their appends and
-    /// corrupt it, and a truncate-on-retry could clobber another mover's
-    /// bytes — so every move runs one at a time. A single gate (vs a
-    /// per-dest-partition lock) is chosen because the moves are already
-    /// serial per caller: the only lost parallelism is one move waiting on
-    /// an unrelated one, which is negligible for this cold path and avoids
-    /// an unbounded lock map.
-    move_gate: tokio::sync::Mutex<()>,
+    /// Serializes `move_file`'s critical section. Held across the whole
+    /// move (locate → flush → checkpoint → append → commit → delete).
+    ///
+    /// Two distinct races require serialization:
+    /// 1. WITHIN an executor: the periodic loop task and an operator's
+    ///    `consolidate_pv` hold the SAME `Arc<EtlExecutor>` (`main.rs`
+    ///    `etl_chain`), so two moves could interleave appends into the
+    ///    same aggregating dest partition, or a truncate-on-retry could
+    ///    clobber another mover's bytes.
+    /// 2. ACROSS executors sharing a tier: a tier is one executor's DEST
+    ///    and the next executor's SOURCE (MTS is `STS→MTS`'s dest and
+    ///    `MTS→LTS`'s source, via the shared `tiered.mts` `Arc`). With a
+    ///    per-executor gate, `STS→MTS` appending to an MTS day-partition
+    ///    can interleave with `MTS→LTS` reading-then-deleting that same
+    ///    partition: the reader snapshots D, the appender commits new
+    ///    samples into D, the reader deletes D → the appended samples
+    ///    never reached LTS and are lost (reachable via a backfilled STS
+    ///    sample for a day being consolidated). The per-PV slot lock stops
+    ///    torn file ops but NOT this read-copy-delete vs append ordering.
+    ///
+    /// So the gate is SHARED across the whole ETL chain: `main.rs` builds
+    /// one `Arc<Mutex>` and hands it to every executor via
+    /// `with_shared_move_gate`. A single chain-wide gate (vs a per-PV /
+    /// per-partition lock map) is chosen because moves are already serial
+    /// per caller and ETL is a cold background path: the only lost
+    /// parallelism is one move waiting on another, and it avoids an
+    /// unbounded lock map. `new` defaults to a private per-executor gate
+    /// so a standalone executor (tests) is still self-serialized.
+    move_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl EtlExecutor {
@@ -74,8 +90,20 @@ impl EtlExecutor {
             gather,
             move_timeout: DEFAULT_MOVE_TIMEOUT,
             pv_registry: None,
-            move_gate: tokio::sync::Mutex::new(()),
+            move_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Share one move gate across every executor in the ETL chain so no
+    /// two moves run concurrently anywhere in the chain. Required because
+    /// adjacent executors share a tier (one's dest is the next's source):
+    /// without a shared gate, `STS→MTS` appending to an MTS partition can
+    /// interleave with `MTS→LTS` reading-then-deleting it and lose the
+    /// appended samples (see the `move_gate` field). `main.rs` constructs
+    /// one `Arc<Mutex>` and calls this on every executor.
+    pub fn with_shared_move_gate(mut self, gate: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.move_gate = gate;
+        self
     }
 
     /// Wire a PV registry so the executor can skip paused PVs in
@@ -943,6 +971,68 @@ mod tests {
         assert!(!s1_path.exists());
         assert!(!s2_path.exists());
         assert!(!d_path.with_extension("pb.etl_ckpt").exists());
+    }
+
+    #[tokio::test]
+    async fn shared_gate_serializes_cross_executor_moves_without_loss() {
+        // MTS is `STS→MTS`'s DEST and `MTS→LTS`'s SOURCE (shared plugin).
+        // Without a shared move gate, STS→MTS appending to an MTS day
+        // partition D can interleave with MTS→LTS reading-then-deleting D,
+        // losing the appended samples. With the chain-wide gate the two
+        // moves serialize, so every sample ends in exactly one of MTS-D or
+        // the LTS partition — none lost, none duplicated — whichever move
+        // wins the gate first.
+        let tmp = tempfile::tempdir().unwrap();
+        let sts = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let mts = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let lts = plugin(tmp.path().join("lts"), "LTS", PartitionGranularity::Year);
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let sts_mts = EtlExecutor::new(sts.clone(), mts.clone(), 3600, 0, 100)
+            .with_shared_move_gate(gate.clone());
+        let mts_lts = EtlExecutor::new(mts.clone(), lts.clone(), 3600, 0, 100)
+            .with_shared_move_gate(gate.clone());
+
+        let pv = "SimpleSine";
+        // A prior day already sits in MTS as partition D (25 samples),
+        // ready for MTS→LTS to move out.
+        let prior: Vec<_> = (0..25)
+            .map(|i| sample_at(BASE_SECS + i, 100.0 + i as f64))
+            .collect();
+        let dbr = prior[0].value.db_type();
+        for e in &prior {
+            mts.append_event(pv, dbr, e).await.unwrap();
+        }
+        mts.flush_writes().await.unwrap();
+        let d_path = mts.file_path_for(pv, prior[0].timestamp);
+
+        // A new STS partition (same day, hour 23) that STS→MTS appends into
+        // that same MTS day partition D.
+        let s_new: Vec<_> = (0..40)
+            .map(|i| sample_at(BASE_SECS + 3600 + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&sts, pv, &s_new).await;
+        assert_eq!(
+            d_path,
+            mts.file_path_for(pv, s_new[0].timestamp),
+            "STS partition aggregates into the same MTS day D"
+        );
+
+        let (r1, r2) = tokio::join!(sts_mts.move_file(&s_path), mts_lts.move_file(&d_path));
+        r1.unwrap();
+        r2.unwrap();
+
+        // Conservation: 25 prior + 40 new survive, each once, spread across
+        // whatever MTS-D remains plus the LTS partition. Interleaved loss
+        // would read < 65; a double-copy would read > 65.
+        let l_path = lts.file_path_for(pv, prior[0].timestamp);
+        let count = |p: &Path| if p.exists() { count_samples(p) } else { 0 };
+        assert_eq!(
+            count(&d_path) + count(&l_path),
+            25 + 40,
+            "no sample lost or duplicated across the cross-executor race"
+        );
+        assert!(!s_path.exists(), "STS source consumed");
     }
 
     #[tokio::test]

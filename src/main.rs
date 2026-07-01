@@ -203,6 +203,12 @@ async fn main() -> anyhow::Result<()> {
     let mts_period_secs =
         config.storage.mts.hold as u64 * config.storage.mts.partition_granularity.approx_seconds();
 
+    // One move gate shared across the whole ETL chain. MTS is the dest of
+    // `etl_sts_mts` and the source of `etl_mts_lts` (shared `tiered.mts`),
+    // so `STS→MTS` appending to an MTS partition must never run concurrently
+    // with `MTS→LTS` reading-then-deleting it, or the appended samples are
+    // lost. A per-executor gate can't serialize across this boundary.
+    let etl_move_gate = Arc::new(tokio::sync::Mutex::new(()));
     let etl_sts_mts = Arc::new(
         EtlExecutor::new(
             tiered.sts.clone(),
@@ -211,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
             config.storage.sts.hold,
             config.storage.sts.gather,
         )
+        .with_shared_move_gate(etl_move_gate.clone())
         .with_pv_registry(registry.clone()),
     );
     let etl_mts_lts = Arc::new(
@@ -221,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
             config.storage.mts.hold,
             config.storage.mts.gather,
         )
+        .with_shared_move_gate(etl_move_gate.clone())
         .with_pv_registry(registry.clone()),
     );
     let etl_chain: Vec<Arc<EtlExecutor>> = vec![etl_sts_mts.clone(), etl_mts_lts.clone()];
