@@ -121,12 +121,21 @@ impl EtlExecutor {
         }
 
         // Java parity (92db337): skip files whose owning PV is paused.
-        // Keyed by PV name now (matching `grouped`), computed once per
-        // tick to keep the registry lookup off the per-file path.
+        // `grouped`'s keys come from `pv_name_from_path`, whose on-disk
+        // encoding is lossy (`:` and `/` both collapse to `/`), so the
+        // registry name must be routed through the SAME canonicalization
+        // (`canonical_pv_key`) or a paused PV whose name contains `/`
+        // (e.g. `RING/DCCT` → grouped key `RING:DCCT`) would never match
+        // and its files would migrate despite the pause. Computed once
+        // per tick to keep the registry lookup off the per-file path.
         let paused: HashSet<String> = match self.pv_registry.as_ref() {
             Some(reg) => reg
                 .pvs_by_status(PvStatus::Paused)
-                .map(|recs| recs.into_iter().map(|r| r.pv_name).collect())
+                .map(|recs| {
+                    recs.into_iter()
+                        .map(|r| crate::storage::plainpb::canonical_pv_key(&r.pv_name))
+                        .collect()
+                })
                 .unwrap_or_else(|e| {
                     warn!("ETL: failed to read paused PVs from registry: {e}");
                     HashSet::new()
