@@ -409,60 +409,66 @@ impl EtlExecutor {
             }
         };
 
-        // Establish or resume this source's checkpoint on D. The anchor is D's
-        // committed length BEFORE this source's contribution; a retry
-        // truncates D back to it and re-appends, so the copy is idempotent by
-        // construction. Invariant: `<D>.pb.etl_ckpt` present ⟺ a copy of
-        // `owner` into D is in progress or pending-delete; its committed tail
-        // is `[anchor..]`, truncatable + redoable only while `owner` is the
-        // SAME file instance (btime match).
-        match read_ckpt(&ckpt) {
-            Some((anchor, owner, ck_btime)) if owner == s_filename => {
-                if matches!((ck_btime, s_btime), (Some(a), Some(b)) if a != b) {
-                    // Same NAME, different birth-time: `owner` was deleted and
-                    // re-created (a backfill) since this checkpoint was
-                    // stamped. Its committed tail `[anchor..]` in D belongs to
-                    // the OLD instance, which was fully copied and deleted —
-                    // the checkpoint merely outlived it (a crash between the
-                    // delete and the checkpoint removal). Truncating would
-                    // destroy committed data, so DON'T: drop the stale
-                    // checkpoint and anchor a FRESH copy of the re-created
-                    // source AFTER the existing committed bytes.
+        // Establish or resume this source's checkpoint on D and settle on the
+        // `anchor` this copy appends from. A retry rolls D back to `anchor` and
+        // re-appends, so the copy is idempotent by construction. Invariant:
+        // `<D>.pb.etl_ckpt` present ⟺ a copy of `owner` into D is in progress
+        // (`Copying`) or finished-but-pending-delete (`Committed`).
+        let anchor = match read_ckpt(&ckpt) {
+            Some(ck) if ck.owner == s_filename => {
+                // `Copying` proves the tail is a partial copy of THIS same
+                // instance (the source is deleted only after the `Committed`
+                // transition, so a `Copying` checkpoint means it was never
+                // deleted). `Committed` + btime match is likewise this
+                // instance's own final tail — re-copying it is idempotent.
+                // Either way rolling D back to the stored anchor is safe on ANY
+                // filesystem; btime is not load-bearing here.
+                let same_instance = matches!((ck.btime, s_btime), (Some(a), Some(b)) if a == b);
+                if ck.state == CkptState::Copying || same_instance {
+                    // Roll D back to the stored anchor (discarding the partial
+                    // or this-instance tail) and re-append below. KEEP the
+                    // checkpoint's anchor — it is the pre-append length and must
+                    // NOT be re-measured. Awaited to completion (never under the
+                    // copy timeout) so this truncate can't detach and fire after
+                    // the gate is released.
+                    let dest_for_trunc = dest.clone();
+                    let d_for_trunc = d_path.clone();
+                    let trunc_anchor = ck.anchor;
+                    tokio::task::spawn_blocking(move || {
+                        dest_for_trunc.truncate_partition(&d_for_trunc, trunc_anchor)
+                    })
+                    .await??;
+                    ck.anchor
+                } else {
+                    // `Committed` + (btime mismatch, or btime unavailable →
+                    // treated conservatively as re-created): the tail may belong
+                    // to a deleted/older instance, so it must NEVER be truncated
+                    // — that truncate is the btime-less silent loss this design
+                    // removes. Preserve the committed tail and anchor a FRESH
+                    // copy of the current source AFTER it. On a filesystem
+                    // without btime a same-instance crash here yields a
+                    // recoverable duplicate, never loss. (No append has happened
+                    // yet, so re-establishing the checkpoint is crash-safe.)
                     warn!(
                         ?ckpt,
-                        owner,
-                        "ETL checkpoint owner re-created since it was stamped; \
+                        owner = ck.owner,
+                        "ETL committed-checkpoint owner re-created (or btime unavailable); \
                          preserving its committed tail and re-anchoring"
                     );
                     dest.remove_etl_sidecar(&ckpt)?;
                     dest.create_etl_sidecar(
                         &ckpt,
-                        &ckpt_contents(len_before, &s_filename, s_btime),
+                        &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime),
                     )?;
-                } else {
-                    // Our own prior attempt failed mid-copy (btime matches, or
-                    // this filesystem records no btime → conservatively treat
-                    // as ours; truncate + re-copy is idempotent either way).
-                    // Roll D back to the stored anchor (discarding the failed
-                    // tail) and re-append below. KEEP the checkpoint — its
-                    // anchor is the pre-append length and must NOT be
-                    // re-measured. Awaited to completion (never under the copy
-                    // timeout) so this truncate can't detach and fire after the
-                    // gate is released.
-                    let dest_for_trunc = dest.clone();
-                    let d_for_trunc = d_path.clone();
-                    tokio::task::spawn_blocking(move || {
-                        dest_for_trunc.truncate_partition(&d_for_trunc, anchor)
-                    })
-                    .await??;
+                    len_before
                 }
             }
-            Some((_anchor, owner, _ck_btime)) => {
+            Some(ck) => {
                 // A DIFFERENT source owns an in-flight append to D.
                 let owner_src = source_path
                     .parent()
-                    .map(|p| p.join(&owner))
-                    .unwrap_or_else(|| PathBuf::from(&owner));
+                    .map(|p| p.join(&ck.owner))
+                    .unwrap_or_else(|| PathBuf::from(&ck.owner));
                 if owner_src.exists() {
                     // The owner will finish or retry its own copy; appending
                     // now would interleave two sources into D. Defer — a later
@@ -471,7 +477,7 @@ impl EtlExecutor {
                     debug!(
                         ?source_path,
                         ?ckpt,
-                        owner,
+                        owner = ck.owner,
                         "ETL deferring: another source owns the dest checkpoint"
                     );
                     return Ok(());
@@ -480,9 +486,17 @@ impl EtlExecutor {
                 // crashed before clearing it. Its committed tail in D is final;
                 // discard the checkpoint and start a fresh copy of THIS source
                 // AFTER it (anchor at D's current length).
-                warn!(?ckpt, owner, "ETL removing orphaned dest checkpoint");
+                warn!(
+                    ?ckpt,
+                    owner = ck.owner,
+                    "ETL removing orphaned dest checkpoint"
+                );
                 dest.remove_etl_sidecar(&ckpt)?;
-                dest.create_etl_sidecar(&ckpt, &ckpt_contents(len_before, &s_filename, s_btime))?;
+                dest.create_etl_sidecar(
+                    &ckpt,
+                    &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime),
+                )?;
+                len_before
             }
             None => {
                 // Torn (present-but-unparseable) or absent. A torn checkpoint
@@ -493,9 +507,13 @@ impl EtlExecutor {
                     warn!(?ckpt, "ETL discarding torn dest checkpoint");
                     dest.remove_etl_sidecar(&ckpt)?;
                 }
-                dest.create_etl_sidecar(&ckpt, &ckpt_contents(len_before, &s_filename, s_btime))?;
+                dest.create_etl_sidecar(
+                    &ckpt,
+                    &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime),
+                )?;
+                len_before
             }
-        }
+        };
 
         // Carry the SOURCE partition's PayloadInfo metadata (element_count
         // for waveforms, custom field headers) into the copy. Plain
@@ -538,8 +556,19 @@ impl EtlExecutor {
             anyhow::anyhow!("ETL move_file copy timed out after {timeout:?} for {source_path:?}")
         })??;
 
-        // Commit. The copy is durable in D and the checkpoint pins D's
-        // rollback anchor. Two steps, in this order:
+        // The copy is durable in D. Transition the checkpoint
+        // `copying → committed` ATOMICALLY (write-temp + rename): the tail
+        // `[anchor..]` is now final, so from here NO retry will ever truncate
+        // it. This step MUST be crash-atomic — a torn or vanished checkpoint at
+        // this instant would let a retry read `None`/`Copying` and re-copy the
+        // already-committed tail (a duplicate).
+        dest.overwrite_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Committed, anchor, &s_filename, s_btime),
+        )?;
+
+        // Commit. The copy is durable and the checkpoint is `committed`. Two
+        // steps, in this order:
         //
         //   1. Delete the source — LAST, and only if it is byte-for-byte the
         //      partition we copied (length-gated on `copied_len`, under the
@@ -549,10 +578,11 @@ impl EtlExecutor {
         //   2. Remove the checkpoint — only AFTER the source is gone. While
         //      the source is on disk the checkpoint is the SOLE idempotency
         //      guard, so a crash between the delete and this removal just
-        //      leaves an orphan the next move into D reaps (owner file gone),
-        //      or, if the source is re-created first, a btime-mismatch
-        //      checkpoint whose committed tail is preserved. Either way no
-        //      duplicate, no loss.
+        //      leaves a `committed` orphan: reaped by the next move into D
+        //      (owner file gone), by the forward tier's orphan sweep, or — if
+        //      the source is re-created first — preserved (its committed tail
+        //      is never truncated). Either way no loss (a btime-less re-create
+        //      may cost a recoverable duplicate).
         //
         // Awaited to completion (never under the copy timeout) so the unlink
         // can't detach and race a later move.
@@ -579,21 +609,71 @@ impl EtlExecutor {
     }
 }
 
+/// The lifecycle phase of an ETL dest checkpoint. The explicit phase is what
+/// lets a retry decide whether the tail `[anchor..]` in D may be truncated
+/// WITHOUT depending on the filesystem exposing a birth-time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CkptState {
+    /// A copy of `owner` into D is in progress; the tail `[anchor..]` is a
+    /// PARTIAL copy. A `Copying` checkpoint can only exist while its source is
+    /// still on disk (the source is deleted only after the `Committed`
+    /// transition), so its tail is provably a partial copy of the SAME source
+    /// instance — truncating back to `anchor` is always safe, on any
+    /// filesystem, no btime needed.
+    Copying,
+    /// The copy of `owner` FINISHED and is durable in D; the tail `[anchor..]`
+    /// is FINAL and must NEVER be truncated. btime (when available) only
+    /// decides, as an optimization, whether a still-present same-named source
+    /// is this same instance or a re-created backfill.
+    Committed,
+}
+
+impl CkptState {
+    fn as_str(self) -> &'static str {
+        match self {
+            CkptState::Copying => "copying",
+            CkptState::Committed => "committed",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "copying" => Some(CkptState::Copying),
+            "committed" => Some(CkptState::Committed),
+            _ => None,
+        }
+    }
+}
+
+/// A parsed ETL dest checkpoint.
+struct Ckpt {
+    state: CkptState,
+    /// D's byte length BEFORE `owner`'s contribution — the rollback point.
+    anchor: u64,
+    /// The owning source partition's filename.
+    owner: String,
+    /// The owner's birth-time (btime) in ns, or `None` when the filesystem
+    /// records no creation time.
+    btime: Option<u128>,
+}
+
 /// Serialize an ETL checkpoint sidecar, one field per line:
-///   1. `len_before` — the dest partition's byte length BEFORE this source's
-///      contribution (the rollback anchor),
-///   2. `owner` — the owning source partition's filename,
-///   3. `owner_btime` — the owner's birth-time (btime) in nanoseconds since
-///      the epoch, or empty when the filesystem records no creation time.
+///   1. `state` — `copying` or `committed` (see [`CkptState`]),
+///   2. `anchor` — the dest partition's byte length BEFORE this source's
+///      contribution (the rollback point),
+///   3. `owner` — the owning source partition's filename,
+///   4. `btime` — the owner's birth-time in nanoseconds since the epoch, or
+///      empty when the filesystem records no creation time.
 ///
-/// btime is the identity that distinguishes THIS source instance from a
-/// same-named partition a backfill later re-creates: it changes on delete +
-/// re-create but NOT on a plain append. That lets a checkpoint whose owner
-/// was re-created (its committed tail in D is final) be told apart from an
-/// in-flight copy that may still be truncated back to the anchor and redone.
-fn ckpt_contents(len_before: u64, owner: &str, owner_btime: Option<u128>) -> Vec<u8> {
+/// btime distinguishes THIS source instance from a same-named partition a
+/// backfill later re-creates: it changes on delete + re-create but NOT on a
+/// plain append. Under the explicit `state` it is only an optimization (it
+/// never gates the safety of a truncate — the `state` does), so a filesystem
+/// that omits it degrades to a recoverable duplicate in a narrow window, never
+/// silent loss.
+fn ckpt_contents(state: CkptState, anchor: u64, owner: &str, owner_btime: Option<u128>) -> Vec<u8> {
     let btime = owner_btime.map(|b| b.to_string()).unwrap_or_default();
-    format!("{len_before}\n{owner}\n{btime}\n").into_bytes()
+    format!("{}\n{anchor}\n{owner}\n{btime}\n", state.as_str()).into_bytes()
 }
 
 /// Birth-time (btime) of a partition file in nanoseconds since the epoch, or
@@ -611,23 +691,29 @@ fn source_btime_nanos(path: &Path) -> Option<u128> {
     )
 }
 
-/// Parse an ETL checkpoint sidecar into `(len_before, owner, owner_btime)`.
-/// `owner_btime` is `None` when the checkpoint predates the identity field or
-/// the recording filesystem lacked btime. Returns the whole thing as `None`
-/// for a missing, torn, or otherwise unparseable file — the caller treats
-/// that uniformly as "no valid checkpoint". Because the checkpoint is fsync'd
-/// before any append byte, a torn file always predates an append, so
-/// discarding it and re-anchoring from D's current length is safe.
-fn read_ckpt(path: &Path) -> Option<(u64, String, Option<u128>)> {
+/// Parse an ETL checkpoint sidecar into a [`Ckpt`]. `btime` is `None` when the
+/// recording filesystem lacked btime. Returns `None` for a missing, torn, or
+/// otherwise unparseable file (including an unrecognized state token) — the
+/// caller treats that uniformly as "no valid checkpoint". Because the
+/// checkpoint's establishment is fsync'd before any append byte, a torn file
+/// always predates an append, so discarding it and re-anchoring from D's
+/// current length is safe.
+fn read_ckpt(path: &Path) -> Option<Ckpt> {
     let content = std::fs::read_to_string(path).ok()?;
     let mut lines = content.lines();
-    let len: u64 = lines.next()?.trim().parse().ok()?;
+    let state = CkptState::parse(lines.next()?.trim())?;
+    let anchor: u64 = lines.next()?.trim().parse().ok()?;
     let owner = lines.next()?.trim().to_string();
     if owner.is_empty() {
         return None;
     }
-    let owner_btime = lines.next().and_then(|l| l.trim().parse::<u128>().ok());
-    Some((len, owner, owner_btime))
+    let btime = lines.next().and_then(|l| l.trim().parse::<u128>().ok());
+    Some(Ckpt {
+        state,
+        anchor,
+        owner,
+        btime,
+    })
 }
 
 /// Per-PV ETL selection over one PV's chronologically-sorted partition
@@ -817,16 +903,24 @@ mod tests {
         let d_path = dest.file_path_for(pv, samples[0].timestamp);
         let ckpt = d_path.with_extension("pb.etl_ckpt");
 
-        // Stage the failed-attempt state: a 10-sample partial in D and an
-        // owner checkpoint whose anchor is D's pre-append length (0).
+        // Stage the failed-attempt state: a 10-sample partial in D and a
+        // `copying` owner checkpoint whose anchor is D's pre-append length (0).
         let dbr = samples[0].value.db_type();
         for s in &samples[..10] {
             dest.append_event(pv, dbr, s).await.unwrap();
         }
         dest.flush_writes().await.unwrap();
         let s_filename = s_path.file_name().unwrap().to_str().unwrap();
-        dest.create_etl_sidecar(&ckpt, format!("0\n{s_filename}\n").as_bytes())
-            .unwrap();
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(
+                CkptState::Copying,
+                0,
+                s_filename,
+                source_btime_nanos(&s_path),
+            ),
+        )
+        .unwrap();
 
         exec.move_file(&s_path).await.unwrap();
 
@@ -875,14 +969,22 @@ mod tests {
         assert!(anchor > 0, "prior source yields a non-zero anchor");
 
         // Stage S's failed mid-copy: a 15-sample partial appended PAST the
-        // anchor, plus S's owner checkpoint recorded at the anchor.
+        // anchor, plus S's `copying` owner checkpoint recorded at the anchor.
         for e in &s[..15] {
             dest.append_event(pv, dbr, e).await.unwrap();
         }
         dest.flush_writes().await.unwrap();
         let s_filename = s_path.file_name().unwrap().to_str().unwrap();
-        dest.create_etl_sidecar(&ckpt, format!("{anchor}\n{s_filename}\n").as_bytes())
-            .unwrap();
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(
+                CkptState::Copying,
+                anchor,
+                s_filename,
+                source_btime_nanos(&s_path),
+            ),
+        )
+        .unwrap();
 
         exec.move_file(&s_path).await.unwrap();
 
@@ -912,20 +1014,24 @@ mod tests {
         let d_path = dest.file_path_for(pv, samples[0].timestamp);
         let ckpt = d_path.with_extension("pb.etl_ckpt");
 
-        // A DIFFERENT source (still present on disk) owns the checkpoint.
+        // A DIFFERENT source (still present on disk) owns an in-flight
+        // (`copying`) checkpoint on D.
         let owner_name = "SimpleSine:2023_11_14_22.pb";
         let owner_path = s_path.parent().unwrap().join(owner_name);
         std::fs::write(&owner_path, b"partial").unwrap();
-        dest.create_etl_sidecar(&ckpt, format!("0\n{owner_name}\n").as_bytes())
-            .unwrap();
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Copying, 0, owner_name, None),
+        )
+        .unwrap();
 
         // Must defer: return Ok without touching D, source, or checkpoint.
         exec.move_file(&s_path).await.unwrap();
 
         assert!(s_path.exists(), "source kept when deferring");
         assert!(!d_path.exists(), "dest partition untouched when deferring");
-        let (_, owner, _) = read_ckpt(&ckpt).expect("owner checkpoint intact");
-        assert_eq!(owner, owner_name);
+        let ck = read_ckpt(&ckpt).expect("owner checkpoint intact");
+        assert_eq!(ck.owner, owner_name);
     }
 
     #[tokio::test]
@@ -1060,10 +1166,12 @@ mod tests {
 
     #[tokio::test]
     async fn move_file_resumes_via_owned_checkpoint_after_crash_before_delete() {
-        // Crash after the copy is durable in D but before the source delete:
-        // the owned `<D>.pb.etl_ckpt` (btime = THIS source instance) survives.
-        // The resume truncates D back to the anchor and RE-COPIES exactly once
-        // — never leaving a duplicate — then deletes the source and clears the
+        // Crash after the copy is durable AND the checkpoint transitioned to
+        // `committed`, but before the source delete: the `committed` owned
+        // `<D>.pb.etl_ckpt` (btime = THIS source instance) survives. Because
+        // the still-present source IS this same instance (btime match), the
+        // resume rolls D back to the anchor and RE-COPIES exactly once — never
+        // leaving a duplicate — then deletes the source and clears the
         // checkpoint. The redesign has no `.etl_done` marker; the checkpoint
         // alone drives recovery.
         let tmp = tempfile::tempdir().unwrap();
@@ -1080,8 +1188,8 @@ mod tests {
         let ckpt = d_path.with_extension("pb.etl_ckpt");
 
         // Stage the crash state: D already fully holds S, and S's owned
-        // checkpoint (anchor 0 = D's pre-append length, btime = this source)
-        // is still present because the delete hadn't run yet.
+        // `committed` checkpoint (anchor 0 = D's pre-append length, btime =
+        // this source) is still present because the delete hadn't run yet.
         let dbr = samples[0].value.db_type();
         for s in &samples {
             dest.append_event(pv, dbr, s).await.unwrap();
@@ -1090,7 +1198,12 @@ mod tests {
         let s_filename = s_path.file_name().unwrap().to_str().unwrap();
         dest.create_etl_sidecar(
             &ckpt,
-            &ckpt_contents(0, s_filename, source_btime_nanos(&s_path)),
+            &ckpt_contents(
+                CkptState::Committed,
+                0,
+                s_filename,
+                source_btime_nanos(&s_path),
+            ),
         )
         .unwrap();
 
@@ -1137,8 +1250,11 @@ mod tests {
         // Stage a pending inbound checkpoint on the MTS partition, owned by an
         // in-flight STS (hour) source aggregating into it.
         let inbound_ckpt = s_path.with_extension("pb.etl_ckpt");
-        src.create_etl_sidecar(&inbound_ckpt, b"0\nSimpleSine:2023_11_14_22.pb\n")
-            .unwrap();
+        src.create_etl_sidecar(
+            &inbound_ckpt,
+            &ckpt_contents(CkptState::Copying, 0, "SimpleSine:2023_11_14_22.pb", None),
+        )
+        .unwrap();
 
         // Move must DEFER: partition untouched, nothing promoted to LTS.
         exec.move_file(&s_path).await.unwrap();
@@ -1249,13 +1365,14 @@ mod tests {
 
     #[tokio::test]
     async fn move_file_recreated_owner_checkpoint_preserves_committed_tail() {
-        // Redesign / DUP-1 + re-create window: an ORPHAN checkpoint whose
-        // owner was deleted then RE-CREATED (crash after the delete, before
-        // the checkpoint removal, then a backfill). The checkpoint's stored
-        // anchor points BELOW D's committed data. A btime MISMATCH between the
-        // checkpoint and the current (re-created) source proves the committed
-        // tail is final — the move must NOT truncate to the anchor (that would
-        // delete committed samples); it re-anchors fresh and appends.
+        // Redesign / re-create window: an ORPHAN `committed` checkpoint whose
+        // owner was deleted then RE-CREATED (crash after the delete, before the
+        // checkpoint removal, then a backfill). The stored anchor points BELOW
+        // D's committed data. A `committed` tail is FINAL and is NEVER
+        // truncated — so the committed samples survive on EVERY filesystem, not
+        // only ones exposing btime. (btime here would merely confirm the
+        // re-create; its absence changes nothing because the state, not btime,
+        // gates the truncate.) The move re-anchors fresh and appends.
         let tmp = tempfile::tempdir().unwrap();
         let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
         let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
@@ -1281,13 +1398,16 @@ mod tests {
         let s_path = write_source_partition(&src, pv, &backfill).await;
         let s_filename = s_path.file_name().unwrap().to_str().unwrap();
 
-        // Orphan checkpoint: owner == this source's name, anchor = 0 (BELOW the
-        // committed data), btime = a bogus OLD value that cannot match the
-        // re-created source's real btime. If the btime discriminator were
-        // absent, this would be treated as "our own retry" and truncate D to 0
-        // — destroying the 20 committed samples.
-        dest.create_etl_sidecar(&ckpt, &ckpt_contents(0, s_filename, Some(1)))
-            .unwrap();
+        // Orphan `committed` checkpoint: owner == this source's name, anchor =
+        // 0 (BELOW the committed data), btime = a bogus OLD value. The state is
+        // `committed`, so the tail is never truncated regardless of btime; if
+        // truncation to 0 were (wrongly) taken it would destroy the 20
+        // committed samples and this test would read 5.
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Committed, 0, s_filename, Some(1)),
+        )
+        .unwrap();
 
         exec.move_file(&s_path).await.unwrap();
 
@@ -1321,8 +1441,11 @@ mod tests {
         let ckpt = d_path.with_extension("pb.etl_ckpt");
         let s_filename = s_path.file_name().unwrap().to_str().unwrap();
 
-        // Prior attempt copied the 20 originals into D and kept its checkpoint
-        // (delete deferred). btime recorded = this source instance.
+        // Prior attempt copied the 20 originals into D, transitioned the
+        // checkpoint to `committed`, then had its delete deferred (the source
+        // grew before the gated delete). btime recorded = this source instance,
+        // so the retry sees `committed` + btime match and re-copies the whole
+        // (now grown) source.
         let dbr = original[0].value.db_type();
         for e in &original {
             dest.append_event(pv, dbr, e).await.unwrap();
@@ -1330,7 +1453,12 @@ mod tests {
         dest.flush_writes().await.unwrap();
         dest.create_etl_sidecar(
             &ckpt,
-            &ckpt_contents(0, s_filename, source_btime_nanos(&s_path)),
+            &ckpt_contents(
+                CkptState::Committed,
+                0,
+                s_filename,
+                source_btime_nanos(&s_path),
+            ),
         )
         .unwrap();
 
@@ -1354,6 +1482,105 @@ mod tests {
             25,
             "D holds each of the 25 once — original 20 truncated, not duplicated"
         );
+    }
+
+    #[tokio::test]
+    async fn move_file_copying_checkpoint_truncates_partial_without_btime() {
+        // Finding B, core win: on a filesystem exposing NO btime, a `copying`
+        // checkpoint still safely rolls back a partial tail. The `copying`
+        // state PROVES the source was never deleted (deletion happens only
+        // after the `committed` transition), so the still-present source is
+        // this same instance and truncate + re-copy is correct — no btime
+        // needed, no loss, no duplicate. This is the common retry path, and it
+        // is clean on btime-less storage where the old btime-only design would
+        // have had to guess.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..50)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+
+        // A 10-sample partial in D and a `copying` checkpoint recorded with NO
+        // btime (as a btime-less filesystem would).
+        let dbr = samples[0].value.db_type();
+        for s in &samples[..10] {
+            dest.append_event(pv, dbr, s).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let s_filename = s_path.file_name().unwrap().to_str().unwrap();
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Copying, 0, s_filename, None),
+        )
+        .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert_eq!(
+            count_samples(&d_path),
+            50,
+            "copying state truncated the partial without btime — no duplicate"
+        );
+        assert!(!s_path.exists());
+        assert!(!ckpt.exists());
+    }
+
+    #[tokio::test]
+    async fn move_file_committed_checkpoint_without_btime_never_loses_committed_tail() {
+        // Finding B, worst btime-less case: a `committed` orphan checkpoint
+        // recorded with NO btime, whose same-named source is still present
+        // (in reality this same instance — a crash between the `committed`
+        // transition and the source delete). Without btime we cannot PROVE
+        // same-vs-re-created, so we take the conservative path and NEVER
+        // truncate the committed tail. The committed samples survive on every
+        // filesystem (the silent-loss floor is removed); the only cost is a
+        // recoverable duplicate (collapsed by read-time timestamp dedup) —
+        // never loss.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        // D durably holds the committed 20; the source still holds the SAME 20.
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        let dbr = samples[0].value.db_type();
+        for e in &samples {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let s_filename = s_path.file_name().unwrap().to_str().unwrap();
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Committed, 0, s_filename, None),
+        )
+        .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        // The committed 20 are preserved (never truncated); the source is
+        // re-copied after them because same-instance can't be proven without
+        // btime → 40. A truncate-to-0 would have destroyed the committed 20 and
+        // yielded 20; that is the loss this design forecloses.
+        assert_eq!(
+            count_samples(&d_path),
+            40,
+            "committed tail preserved on a btime-less FS (no loss); recoverable duplicate only"
+        );
+        assert!(!s_path.exists(), "source moved out");
+        assert!(!ckpt.exists(), "checkpoint cleared on commit");
     }
 
     #[tokio::test]

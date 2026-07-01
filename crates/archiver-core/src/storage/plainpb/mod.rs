@@ -1061,6 +1061,44 @@ impl PlainPbStoragePlugin {
         Ok(())
     }
 
+    /// Durably OVERWRITE an existing ETL sidecar in place, ATOMICALLY. Unlike
+    /// [`create_etl_sidecar`](Self::create_etl_sidecar) (O_EXCL, refuses an
+    /// existing file), this replaces the current contents via write-temp +
+    /// rename, so a crash mid-write leaves EITHER the old contents or the new
+    /// — never a torn or vanished file. Used for the checkpoint's
+    /// `copying → committed` state transition, which MUST be crash-atomic: a
+    /// partially-written or missing checkpoint at that instant would let a
+    /// retry re-copy an already-committed tail (a duplicate). Under
+    /// `fsync_on_flush`, fsyncs the temp file before the rename and the parent
+    /// directory after, so the replacement is durable before returning.
+    pub fn overwrite_etl_sidecar(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+        self.ensure_parent_dir(path)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            f.write_all(contents)?;
+            if self.fsync_on_flush {
+                f.sync_all()?;
+            }
+        }
+        // Atomic on POSIX: the rename replaces `path` in a single step, so a
+        // reader/recovery sees exactly one of the two versions.
+        std::fs::rename(&tmp, path)?;
+        if self.fsync_on_flush
+            && let Some(parent) = path.parent()
+        {
+            Self::sync_dir(parent)?;
+        }
+        Ok(())
+    }
+
     /// Ensure a parent directory exists, using a cached set to skip repeated syscalls.
     fn ensure_parent_dir(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
@@ -2462,5 +2500,43 @@ mod tests {
         plugin.remove_etl_sidecar(&ckpt).unwrap();
         assert!(!ckpt.exists());
         plugin.remove_etl_sidecar(&ckpt).unwrap();
+    }
+
+    #[test]
+    fn overwrite_etl_sidecar_replaces_in_place_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin =
+            PlainPbStoragePlugin::new("MTS", dir.path().to_path_buf(), PartitionGranularity::Day);
+        let ckpt = dir.path().join("sub/PV:X:2024_01_01.pb.etl_ckpt");
+
+        // Establish a `copying` checkpoint, then transition it to `committed`
+        // via the atomic overwrite (create_etl_sidecar's O_EXCL would refuse
+        // the existing file — overwrite is the only in-place replace).
+        plugin
+            .create_etl_sidecar(&ckpt, b"copying\n0\nPV:X:2024_01_01_00.pb\n\n")
+            .unwrap();
+        plugin
+            .overwrite_etl_sidecar(&ckpt, b"committed\n0\nPV:X:2024_01_01_00.pb\n\n")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ckpt).unwrap(),
+            "committed\n0\nPV:X:2024_01_01_00.pb\n\n",
+            "overwrite replaced the contents in place"
+        );
+
+        // The write-temp must not be left behind (it would confuse a directory
+        // scan and waste inodes).
+        let tmp = dir.path().join("sub/PV:X:2024_01_01.pb.etl_ckpt.tmp");
+        assert!(!tmp.exists(), "temp file renamed away, not leaked");
+
+        // Overwrite also works when the target does not exist yet (create).
+        let fresh = dir.path().join("sub/PV:Y:2024_01_01.pb.etl_ckpt");
+        plugin
+            .overwrite_etl_sidecar(&fresh, b"committed\n7\nPV:Y\n\n")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&fresh).unwrap(),
+            "committed\n7\nPV:Y\n\n"
+        );
     }
 }
