@@ -199,6 +199,18 @@ impl EtlExecutor {
         Ok(total)
     }
 
+    /// Whether the `.etl_done` marker may be cleared after a
+    /// `remove_moved_partition` attempt. Only when the source is
+    /// confirmed gone (`Ok(Ok(true))`): every other outcome
+    /// (still-live/dirty, unlink error, evict-task panic) leaves the
+    /// source on disk, so the marker must survive to drive a delete-only
+    /// retry next cycle instead of a full re-copy.
+    fn recovery_should_clear_marker(
+        removed: &Result<std::io::Result<bool>, tokio::task::JoinError>,
+    ) -> bool {
+        matches!(removed, Ok(Ok(true)))
+    }
+
     /// Move a single PB file from source to destination tier.
     /// Uses copy → durable dest → marker → slot-locked delete for
     /// crash-safe idempotency.
@@ -219,29 +231,35 @@ impl EtlExecutor {
             // partition is never destroyed.
             let source = self.source.clone();
             let path = source_path.to_path_buf();
-            match tokio::task::spawn_blocking(move || source.remove_moved_partition(&path)).await {
-                Ok(Ok(true)) => {}
-                Ok(Ok(false)) => {
-                    // Source is the live partition with un-copied bytes —
-                    // leave it AND the marker; a later cycle cleans up
-                    // once it rolls over to non-live. Never delete a
-                    // live, dirty partition.
-                    warn!(
-                        ?source_path,
-                        "ETL marker recovery: source is still live/dirty; deferring delete"
-                    );
-                    return Ok(());
-                }
+            let removed =
+                tokio::task::spawn_blocking(move || source.remove_moved_partition(&path)).await;
+            match &removed {
+                Ok(Ok(true)) => {} // source gone; marker cleared below
+                Ok(Ok(false)) => warn!(
+                    ?source_path,
+                    "ETL marker recovery: source is still live/dirty; deferring delete"
+                ),
                 Ok(Err(e)) => warn!(
                     ?source_path,
-                    "ETL marker recovery: failed to remove source: {e}"
+                    "ETL marker recovery: failed to remove source (keeping marker \
+                     for delete-only retry next cycle): {e}"
                 ),
                 Err(e) => warn!(
                     ?source_path,
-                    "ETL marker recovery: evict task panicked: {e}"
+                    "ETL marker recovery: evict task panicked (keeping marker for \
+                     delete-only retry next cycle): {e}"
                 ),
             }
-            if let Err(e) = tokio::fs::remove_file(&marker).await {
+            // Clear the marker ONLY when the source is confirmed gone. The
+            // marker means "dest durably holds this partition", so it must
+            // outlive every outcome that leaves the source on disk —
+            // otherwise the next cycle re-selects the surviving source,
+            // finds no marker, and re-runs the full copy, appending a
+            // second copy of every sample (append_event has no dedup) once
+            // per cycle until the unlink finally succeeds.
+            if Self::recovery_should_clear_marker(&removed)
+                && let Err(e) = tokio::fs::remove_file(&marker).await
+            {
                 warn!(?marker, "Failed to remove ETL marker: {e}");
             }
             return Ok(());
@@ -371,6 +389,19 @@ mod tests {
 
     fn p(part: &str) -> PathBuf {
         PathBuf::from(format!("/data/SIM/Sine:{part}.pb"))
+    }
+
+    #[test]
+    fn recovery_clears_marker_only_when_source_confirmed_gone() {
+        // Source gone → clear the marker.
+        assert!(EtlExecutor::recovery_should_clear_marker(&Ok(Ok(true))));
+        // Live/dirty → keep the marker (defer to a later cycle).
+        assert!(!EtlExecutor::recovery_should_clear_marker(&Ok(Ok(false))));
+        // Unlink failed → keep the marker so the next cycle retries
+        // delete-only instead of re-copying (the bug this guards).
+        assert!(!EtlExecutor::recovery_should_clear_marker(&Ok(Err(
+            std::io::Error::other("unlink EIO")
+        ))));
     }
 
     #[test]
