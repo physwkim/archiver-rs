@@ -1015,8 +1015,8 @@ impl PlainPbStoragePlugin {
         Ok(())
     }
 
-    /// Durably create an ETL sidecar file (the `.etl_ckpt` checkpoint or
-    /// the `.etl_done` marker) with `contents`. Uses `create_new` (O_EXCL)
+    /// Durably create an ETL sidecar file (the `.etl_ckpt` checkpoint) with
+    /// `contents`. Uses `create_new` (O_EXCL)
     /// so an existing sidecar is never silently overwritten — the caller
     /// decides whether an `AlreadyExists` is a real error. Under
     /// `fsync_on_flush`, fsyncs the file then its parent directory so both
