@@ -1411,3 +1411,40 @@ async fn fsync_on_flush_persists_through_ingest_flush() {
     }
     assert_eq!(count, 5, "all fsync'd samples must read back");
 }
+
+#[tokio::test]
+async fn fsync_on_flush_creates_and_syncs_new_directory_chain() {
+    // A deeply-nested new PV forces a multi-level directory chain to be
+    // created (root/A/B/C). With fsync_on_flush, ensure_parent_dir must
+    // create + fsync each level and write_cached must fsync the file's
+    // parent, all without erroring — and the sample must still read
+    // back. Guards the create_dir_all_synced / sync_dir paths.
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour)
+            .with_fsync_on_flush(true);
+
+    // pv_key maps ':' -> '/', so "A:B:C:Leaf" lands under root/A/B/C/.
+    let ts: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap().into();
+    let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(1.5));
+    plugin
+        .append_event("A:B:C:Leaf", ArchDbType::ScalarDouble, &sample)
+        .await
+        .unwrap();
+
+    let res = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        res.failed.is_empty(),
+        "new-dir-chain fsync flush must not lose the PV: {:?}",
+        res.failed
+    );
+
+    let start: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 0, 0).unwrap().into();
+    let end: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 11, 0, 0).unwrap().into();
+    let mut streams = plugin.get_data("A:B:C:Leaf", start, end).await.unwrap();
+    let read = streams[0].next_event().unwrap().unwrap();
+    match &read.value {
+        ArchiverValue::ScalarDouble(v) => assert!((v - 1.5).abs() < 1e-10),
+        other => panic!("Expected ScalarDouble, got {other:?}"),
+    }
+}

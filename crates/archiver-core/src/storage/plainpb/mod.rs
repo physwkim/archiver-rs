@@ -873,9 +873,67 @@ impl PlainPbStoragePlugin {
                 !dirs.contains(parent)
             };
             if needs_create {
-                std::fs::create_dir_all(parent)?;
+                if self.fsync_on_flush {
+                    // Durability: fsync each newly created level's
+                    // parent so the new directory entries survive a
+                    // power loss. Without this, a first-ever sample for
+                    // a new PV prefix could be committed to the
+                    // registry while the directory chain that makes its
+                    // file reachable is still only in the page cache.
+                    Self::create_dir_all_synced(parent)?;
+                } else {
+                    std::fs::create_dir_all(parent)?;
+                }
                 let mut dirs = self.known_dirs.lock().unwrap_or_else(|e| e.into_inner());
                 dirs.insert(parent.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+
+    /// fsync a directory so entries added to / removed from it become
+    /// durable. Opening a directory read-only and calling `sync_all`
+    /// is the POSIX way to flush directory metadata (Linux and macOS
+    /// both allow fsync on a directory fd). The transient fd is opened
+    /// and dropped immediately, outside the writer [`FdBudget`].
+    fn sync_dir(dir: &Path) -> std::io::Result<()> {
+        std::fs::File::open(dir)?.sync_all()
+    }
+
+    /// Like `create_dir_all`, but fsyncs each newly created directory's
+    /// parent so the new entries survive a power loss. Used only when
+    /// `fsync_on_flush` is set. Idempotent and concurrency-safe: a
+    /// level a racing thread created first (`AlreadyExists`) is
+    /// tolerated, and its parent is still synced so the entry is
+    /// durable regardless of which thread won the create.
+    fn create_dir_all_synced(dir: &Path) -> std::io::Result<()> {
+        if dir.exists() {
+            return Ok(());
+        }
+        // Walk up to the deepest existing ancestor, recording missing
+        // levels deepest-first.
+        let mut missing: Vec<&Path> = Vec::new();
+        let mut cur = dir;
+        loop {
+            if cur.exists() {
+                break;
+            }
+            missing.push(cur);
+            match cur.parent() {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        // Create shallowest-first; fsync each new dir's parent so the
+        // child's entry is durable before we descend into it.
+        for d in missing.iter().rev() {
+            match std::fs::create_dir(d) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+            if let Some(parent) = d.parent() {
+                Self::sync_dir(parent)?;
             }
         }
         Ok(())
@@ -1009,6 +1067,22 @@ impl PlainPbStoragePlugin {
                 }
                 Err(e) => return Err(e.into()),
             };
+
+            // Durability: persist the file's directory entry so a
+            // committed sample can't outlive its bytes across a power
+            // loss. `sync_all` on the file (the flush path) makes the
+            // DATA durable, but the name→inode link lives in the parent
+            // directory and needs its own fsync. Done on every (re)open
+            // rather than only first-create so a sync that fails here is
+            // retried on the next append — leaving no un-synced entry
+            // behind — instead of being skipped because the file now
+            // exists. No-op (zero syscall) when the flag is off.
+            if self.fsync_on_flush
+                && let Some(parent) = path.parent()
+            {
+                Self::sync_dir(parent)?;
+            }
+
             let mut bw = BufWriter::with_capacity(64 * 1024, file);
 
             if needs_header {
