@@ -283,22 +283,25 @@ impl EtlExecutor {
                 continue;
             }
 
-            // Orphan: the owner is gone. A `committed` tail is final — just
-            // remove the checkpoint. A `copying` orphan can only arise from an
-            // out-of-model external deletion of the source mid-copy; its tail
-            // past the anchor is a partial, so roll D back before removing so no
-            // uncommitted frames linger. `<D>` is the checkpoint path with the
-            // `.etl_ckpt` extension stripped.
-            if ck.state == CkptState::Copying {
-                let d_path = ckpt_path.with_extension("");
-                let dest = self.dest.clone();
-                let anchor = ck.anchor;
-                tokio::task::spawn_blocking(move || dest.truncate_partition(&d_path, anchor))
-                    .await??;
-            }
+            // Orphan: the owner is gone. Remove the checkpoint but NEVER touch
+            // D's bytes. The reap cannot prove what the tail past `anchor` is,
+            // and truncating it risks permanent loss: with `fsync_on_flush=false`
+            // (the default) and source/dest on independent filesystems, the
+            // commit's `copying→committed` rename and the source unlink can
+            // persist OUT OF ORDER under power loss, leaving a stale `Copying`
+            // checkpoint standing over an ALREADY-COMMITTED, durable tail whose
+            // source is gone — rolling that tail back to `anchor` would erase
+            // data that exists nowhere else. A genuine partial (an out-of-model
+            // external source delete mid-copy) is likewise best preserved: there
+            // is no source left to re-copy, so its copied prefix is the only
+            // remaining data. A still-`Copying` orphan is thus indistinguishable
+            // from a reordered-`committed` one; the reap treats both uniformly —
+            // preserve D, drop only the checkpoint. The next tier then carries
+            // D's tail forward like any other committed data.
             warn!(
                 ?ckpt_path,
                 owner = ck.owner,
+                state = ck.state.as_str(),
                 "ETL reaping orphaned dest checkpoint (owner source gone)"
             );
             self.dest.remove_etl_sidecar(&ckpt_path)?;
@@ -1832,6 +1835,56 @@ mod tests {
         mts_lts.move_file(&d_path).await.unwrap();
         assert!(!d_path.exists(), "unwedged: D moved out to LTS");
         assert_eq!(count_samples(&lts_path), 20, "D's samples reached LTS once");
+    }
+
+    #[tokio::test]
+    async fn reap_copying_orphan_preserves_tail_never_truncates() {
+        // Round-5 Finding 1: with fsync_on_flush=false (the default) and
+        // source/dest on independent filesystems, the commit's copying→committed
+        // rename and the source unlink can persist OUT OF ORDER under power
+        // loss, leaving a stale Copying checkpoint standing over an
+        // already-committed, durable tail whose source is gone. The reap must
+        // NEVER truncate an owner-gone orphan — rolling that tail back to the
+        // anchor would erase committed data that exists nowhere else. It removes
+        // the checkpoint (to unwedge the next tier) and leaves D byte-for-byte.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        // D holds 20 durably-committed samples.
+        let samples: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let dbr = samples[0].value.db_type();
+        for e in &samples {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        // A stale COPYING checkpoint (owner gone), anchored at 0 — the OLD reap
+        // would truncate D to 0, wiping all 20 committed samples.
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Copying, 0, "SimpleSine:1999_01_01_00.pb", None),
+        )
+        .unwrap();
+        // Source root must exist for the reap to run.
+        write_source_partition(&src, pv, &[sample_at(BASE_SECS + 5 * 86_400, 0.0)]).await;
+
+        exec.run_once().await.unwrap();
+
+        assert!(
+            !ckpt.exists(),
+            "stale copying orphan checkpoint removed (unwedged)"
+        );
+        assert_eq!(
+            count_samples(&d_path),
+            20,
+            "committed tail preserved — NOT truncated"
+        );
     }
 
     #[tokio::test]
