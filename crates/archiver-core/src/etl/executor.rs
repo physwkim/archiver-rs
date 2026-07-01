@@ -13,7 +13,7 @@ const DEFAULT_MOVE_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 use crate::registry::{PvRegistry, PvStatus};
 use crate::storage::plainpb::PlainPbStoragePlugin;
 use crate::storage::plainpb::reader::PbFileReader;
-use crate::storage::traits::{EventStream, StoragePlugin};
+use crate::storage::traits::{AppendMeta, EventStream, StoragePlugin};
 
 /// ETL executor — periodically moves data from source tier to destination tier.
 pub struct EtlExecutor {
@@ -554,6 +554,18 @@ impl EtlExecutor {
             }
         }
 
+        // Carry the SOURCE partition's PayloadInfo metadata (element_count
+        // for waveforms, custom field headers) into the copy. Plain
+        // `append_event` uses `AppendMeta::default()`, which would stamp a
+        // fresh D's header with `element_count: None` and no headers —
+        // corrupting the type descriptor for waveform / field-carrying PVs.
+        // (Ignored when D already has a header; only the first source into a
+        // fresh D writes it.)
+        let append_meta = AppendMeta {
+            element_count: desc.element_count,
+            headers: desc.headers.clone(),
+        };
+
         // Bulk copy — the only genuinely NFS-hang-prone bulk work, so bound
         // it with the timeout. Abandoning it mid-append is safe: the peeked
         // first sample defines D; every subsequent sample must map to the
@@ -561,7 +573,7 @@ impl EtlExecutor {
         // partition — refuse the move), and a partial tail past the anchor is
         // rolled back by the next retry's owner truncate.
         tokio::time::timeout(timeout, async {
-            dest.append_event(&desc.pv_name, dbr_type, &first_sample)
+            dest.append_event_with_meta(&desc.pv_name, dbr_type, &first_sample, &append_meta)
                 .await?;
             while let Some(sample) = reader.next_event()? {
                 if dest.file_path_for(&desc.pv_name, sample.timestamp) != d_path {
@@ -570,7 +582,8 @@ impl EtlExecutor {
                          partition than {d_path:?}; refusing to split the copy"
                     ));
                 }
-                dest.append_event(&desc.pv_name, dbr_type, &sample).await?;
+                dest.append_event_with_meta(&desc.pv_name, dbr_type, &sample, &append_meta)
+                    .await?;
             }
             // Durability BEFORE the marker: flush + (under fsync_on_flush)
             // fsync D so the copy survives a crash before we commit.
@@ -1419,6 +1432,55 @@ mod tests {
             count_samples(&d_path),
             20,
             "genuine marker: no re-copy, samples not duplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_file_preserves_source_payload_metadata_into_fresh_dest() {
+        // finding D: the copy must carry the source PayloadInfo's
+        // element_count (waveforms) and custom field headers into a fresh
+        // dest partition header. Plain `append_event` defaults them,
+        // corrupting the type descriptor for waveform / field-carrying PVs.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "WaveformPV";
+        let meta = AppendMeta {
+            element_count: Some(3),
+            headers: vec![("EGU".to_string(), "mm".to_string())],
+        };
+        let samples: Vec<_> = (0..8).map(|i| sample_at(BASE_SECS + i, i as f64)).collect();
+        let dbr = samples[0].value.db_type();
+        for s in &samples {
+            src.append_event_with_meta(pv, dbr, s, &meta).await.unwrap();
+        }
+        src.flush_writes().await.unwrap();
+        let s_path = src.file_path_for(pv, samples[0].timestamp);
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+
+        // Sanity: the source header round-trips the metadata.
+        let src_desc = PbFileReader::open(&s_path).unwrap().description().clone();
+        assert_eq!(src_desc.element_count, Some(3));
+        assert_eq!(
+            src_desc.headers,
+            vec![("EGU".to_string(), "mm".to_string())]
+        );
+
+        exec.move_file(&s_path).await.unwrap();
+
+        // The fresh dest header must carry the SAME metadata, not defaults.
+        let dst_desc = PbFileReader::open(&d_path).unwrap().description().clone();
+        assert_eq!(
+            dst_desc.element_count,
+            Some(3),
+            "element_count preserved into fresh dest header"
+        );
+        assert_eq!(
+            dst_desc.headers,
+            vec![("EGU".to_string(), "mm".to_string())],
+            "field headers preserved into fresh dest header"
         );
     }
 }
