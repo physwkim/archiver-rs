@@ -30,6 +30,19 @@ pub struct EtlExecutor {
     /// Optional PV registry — when present, paused PVs are skipped
     /// (Java parity 92db337).
     pv_registry: Option<Arc<PvRegistry>>,
+    /// Serializes `move_file`'s critical section across this executor.
+    /// ETL moves are already sequential within `run_once` and
+    /// `consolidate_pv`; the only concurrency is the periodic loop task
+    /// racing an operator's `consolidate_pv` (both hold the SAME
+    /// `Arc<EtlExecutor>`, see `main.rs` `etl_chain`). Two moves into the
+    /// same aggregating dest partition would interleave their appends and
+    /// corrupt it, and a truncate-on-retry could clobber another mover's
+    /// bytes — so every move runs one at a time. A single gate (vs a
+    /// per-dest-partition lock) is chosen because the moves are already
+    /// serial per caller: the only lost parallelism is one move waiting on
+    /// an unrelated one, which is negligible for this cold path and avoids
+    /// an unbounded lock map.
+    move_gate: tokio::sync::Mutex<()>,
 }
 
 impl EtlExecutor {
@@ -40,6 +53,19 @@ impl EtlExecutor {
         hold: u32,
         gather: u32,
     ) -> Self {
+        // The idempotent copy relies on each source partition nesting in
+        // exactly ONE dest partition — true only when the dest tier is
+        // coarser-or-equal to the source (finer→coarser ETL). Guard it at
+        // construction so a misconfiguration fails loudly instead of
+        // silently splitting a copy across two dest partitions.
+        // `PartitionGranularity` isn't `Ord`; compare via `approx_seconds`.
+        assert!(
+            dest.partition_granularity().approx_seconds()
+                >= source.partition_granularity().approx_seconds(),
+            "ETL dest tier granularity ({:?}) must be coarser-or-equal to source ({:?})",
+            dest.partition_granularity(),
+            source.partition_granularity(),
+        );
         Self {
             source,
             dest,
@@ -48,6 +74,7 @@ impl EtlExecutor {
             gather,
             move_timeout: DEFAULT_MOVE_TIMEOUT,
             pv_registry: None,
+            move_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -224,6 +251,12 @@ impl EtlExecutor {
     /// Uses copy → durable dest → marker → slot-locked delete for
     /// crash-safe idempotency.
     async fn move_file(&self, source_path: &Path) -> anyhow::Result<()> {
+        // Serialize every move so no two run concurrently against the same
+        // aggregating dest partition (see `move_gate`). Held across the
+        // whole function — recovery included — so a move and a same-source
+        // recovery can't race either.
+        let _gate = self.move_gate.lock().await;
+
         // Marker from a previous incomplete cleanup (crash after the
         // copy was made durable). The marker is written ONLY after the
         // destination flush below, so its presence proves the dest tier
@@ -289,30 +322,141 @@ impl EtlExecutor {
             let desc = reader.description().clone();
             let dbr_type = desc.db_type;
 
-            // Copy all samples to the destination tier.
+            // Peek the first sample to locate the single destination
+            // partition D. ETL only moves finer→coarser and each sample
+            // routes by its own timestamp, so every sample in this source
+            // partition nests in the D derived from the first (the
+            // construction-time granularity guard makes that hold; the
+            // per-sample check below catches a stray out-of-range ts).
+            let Some(first_sample) = reader.next_event()? else {
+                // Empty source partition — no dest bytes to protect. Remove
+                // it (slot-locked); a crash just re-runs this idempotent
+                // delete.
+                let source_for_evict = source.clone();
+                let path_for_evict = source_path.clone();
+                let removed = tokio::task::spawn_blocking(move || {
+                    source_for_evict.remove_moved_partition(&path_for_evict)
+                })
+                .await;
+                return match removed {
+                    Ok(Ok(_)) => anyhow::Ok(()),
+                    Ok(Err(e)) => Err(anyhow::anyhow!(
+                        "ETL delete of empty partition {source_path:?} failed: {e}"
+                    )),
+                    Err(e) => Err(anyhow::anyhow!(
+                        "ETL empty-partition delete task panicked for {source_path:?}: {e}"
+                    )),
+                };
+            };
+
+            let d_path = dest.file_path_for(&desc.pv_name, first_sample.timestamp);
+            let ckpt = d_path.with_extension("pb.etl_ckpt");
+            let marker = source_path.with_extension("pb.etl_done");
+            let s_filename = source_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("ETL: source path has no filename: {source_path:?}")
+                })?
+                .to_string();
+
+            // Flush the dest tier so D's on-disk length reflects every
+            // previously-committed byte before we anchor to it. A failed
+            // flush means an unknown dirty tail — abort (keep source) and
+            // never measure a length we can't trust.
+            dest.flush_writes().await?;
+            let len_before = std::fs::metadata(&d_path).map(|m| m.len()).unwrap_or(0);
+
+            // Establish the checkpoint anchor for this copy of S into D.
+            // Invariant: `<D>.pb.etl_ckpt` present ⟺ an in-flight append to
+            // D exists; its stored length is D's last known-good byte
+            // length; only the owning source may truncate D to it.
+            match read_ckpt(&ckpt) {
+                Some((anchor, owner)) if owner == s_filename => {
+                    // Our own prior attempt failed mid-copy: roll D back to
+                    // the stored anchor (discarding the failed tail) and
+                    // re-append below. Keep the checkpoint — its anchor is
+                    // the pre-append length and must NOT be re-measured.
+                    let dest_for_trunc = dest.clone();
+                    let d_for_trunc = d_path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        dest_for_trunc.truncate_partition(&d_for_trunc, anchor)
+                    })
+                    .await??;
+                }
+                Some((_anchor, owner)) => {
+                    // A DIFFERENT source owns an in-flight append to D.
+                    let owner_src = source_path
+                        .parent()
+                        .map(|p| p.join(&owner))
+                        .unwrap_or_else(|| PathBuf::from(&owner));
+                    if owner_src.exists() {
+                        // The owner will finish or retry its own copy;
+                        // appending now would interleave two sources into
+                        // D. Defer — a later cycle retries this source once
+                        // the owner clears its checkpoint.
+                        debug!(
+                            ?source_path,
+                            ?ckpt,
+                            owner,
+                            "ETL deferring: another source owns the dest checkpoint"
+                        );
+                        return anyhow::Ok(());
+                    }
+                    // Orphaned checkpoint: the owner committed and was
+                    // deleted but crashed before clearing it. Discard it and
+                    // start a fresh copy of this source.
+                    warn!(?ckpt, owner, "ETL removing orphaned dest checkpoint");
+                    dest.remove_etl_sidecar(&ckpt)?;
+                    dest.create_etl_sidecar(&ckpt, &ckpt_contents(len_before, &s_filename))?;
+                }
+                None => {
+                    // Torn (present-but-unparseable) or absent. A torn
+                    // checkpoint is fsync'd before any append byte, so it
+                    // always predates an append → D is at its true committed
+                    // length; discard it and re-anchor from len_before.
+                    if ckpt.exists() {
+                        warn!(?ckpt, "ETL discarding torn dest checkpoint");
+                        dest.remove_etl_sidecar(&ckpt)?;
+                    }
+                    dest.create_etl_sidecar(&ckpt, &ckpt_contents(len_before, &s_filename))?;
+                }
+            }
+
+            // Copy: the peeked first sample defines D; every subsequent
+            // sample must map to the SAME D. A stray out-of-range timestamp
+            // would append to a second, unguarded partition — refuse the
+            // move rather than corrupt it.
+            dest.append_event(&desc.pv_name, dbr_type, &first_sample)
+                .await?;
             while let Some(sample) = reader.next_event()? {
+                if dest.file_path_for(&desc.pv_name, sample.timestamp) != d_path {
+                    return Err(anyhow::anyhow!(
+                        "ETL: a sample timestamp in {source_path:?} maps to a different dest \
+                         partition than {d_path:?}; refusing to split the copy"
+                    ));
+                }
                 dest.append_event(&desc.pv_name, dbr_type, &sample).await?;
             }
 
-            // Durability BEFORE delete: flush the destination tier so the
-            // copy is in the page cache and survives a process crash
-            // BEFORE we write the marker or touch the source. Only after
-            // this does the marker mean "dest durably has it". Without
-            // it, a crash after deleting the source but before dest's
-            // BufWriter drained would lose the partition outright — and
-            // the marker-recovery branch would then delete a source whose
-            // data never reached dest.
+            // Durability BEFORE the marker: flush + (under fsync_on_flush)
+            // fsync D so the copy survives a crash before we commit.
             dest.flush_writes().await?;
 
-            // Marker AFTER dest is durable — a crash here lets the next
-            // run clean up the source without re-copying.
-            let marker = source_path.with_extension("pb.etl_done");
-            tokio::fs::write(&marker, b"").await?;
+            // Commit in strict order so any crash is recoverable without
+            // duplicating or losing samples:
+            //   marker → remove checkpoint → delete source → remove marker.
+            // The marker means "dest durably holds S"; it MUST land before
+            // the checkpoint is removed. Reversed, a crash in between would
+            // leave neither marker nor checkpoint, and the next cycle would
+            // re-append S from scratch (duplicate).
+            source.create_etl_sidecar(&marker, b"")?;
+            dest.remove_etl_sidecar(&ckpt)?;
 
             // Slot-locked delete: remove the source under the per-PV slot
-            // lock with a live-writer guard. No append can target the
-            // inode between the liveness check and the unlink, and a
-            // still-dirty live partition is never destroyed.
+            // lock with a live-writer guard. No append can target the inode
+            // between the liveness check and the unlink, and a still-dirty
+            // live partition is never destroyed.
             let source_for_evict = source.clone();
             let path_for_evict = source_path.clone();
             let removed = tokio::task::spawn_blocking(move || {
@@ -321,7 +465,7 @@ impl EtlExecutor {
             .await;
             match removed {
                 Ok(Ok(true)) => {
-                    tokio::fs::remove_file(&marker).await.ok();
+                    source.remove_etl_sidecar(&marker).ok();
                     metrics::counter!(
                         "archiver_etl_files_moved_total",
                         "source" => source_name,
@@ -357,6 +501,29 @@ impl EtlExecutor {
 
         Ok(())
     }
+}
+
+/// Serialize an ETL checkpoint sidecar: the dest partition's pre-append
+/// byte length, then the owning source partition's filename, one per line.
+fn ckpt_contents(len_before: u64, owner: &str) -> Vec<u8> {
+    format!("{len_before}\n{owner}\n").into_bytes()
+}
+
+/// Parse an ETL checkpoint sidecar into `(len_before, owner)`. Returns
+/// `None` for a missing, torn, or otherwise unparseable file — the caller
+/// treats that uniformly as "no valid checkpoint". Because the checkpoint
+/// is fsync'd before any append byte, a torn file always predates an
+/// append, so discarding it and re-anchoring from D's current length is
+/// safe.
+fn read_ckpt(path: &Path) -> Option<(u64, String)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut lines = content.lines();
+    let len: u64 = lines.next()?.trim().parse().ok()?;
+    let owner = lines.next()?.trim().to_string();
+    if owner.is_empty() {
+        return None;
+    }
+    Some((len, owner))
 }
 
 /// Per-PV ETL selection over one PV's chronologically-sorted partition
@@ -470,5 +637,224 @@ mod tests {
             select_movable(&[], 1, 10).is_empty(),
             "no partitions: nothing moves"
         );
+    }
+
+    // ---- crash-safety tests for the idempotent copy (finding #9) ----
+
+    use crate::storage::partition::PartitionGranularity;
+    use crate::types::{ArchiverSample, ArchiverValue};
+    use std::time::SystemTime;
+
+    // 2023-11-14 22:13:20 UTC — 800s into hour 22 of day 2023_11_14, so a
+    // block of a few dozen seconds stays inside hour 22, while hour 22 and
+    // hour 23 share the same day partition.
+    const BASE_SECS: u64 = 1_700_000_000;
+
+    fn sample_at(secs: u64, v: f64) -> ArchiverSample {
+        ArchiverSample::new(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+            ArchiverValue::ScalarDouble(v),
+        )
+    }
+
+    fn plugin(root: PathBuf, name: &str, g: PartitionGranularity) -> Arc<PlainPbStoragePlugin> {
+        Arc::new(PlainPbStoragePlugin::new(name, root, g))
+    }
+
+    /// Append `samples` (all in one source partition) via the source tier
+    /// and flush, returning the on-disk source partition path.
+    async fn write_source_partition(
+        src: &PlainPbStoragePlugin,
+        pv: &str,
+        samples: &[ArchiverSample],
+    ) -> PathBuf {
+        let dbr = samples[0].value.db_type();
+        for s in samples {
+            src.append_event(pv, dbr, s).await.unwrap();
+        }
+        src.flush_writes().await.unwrap();
+        src.file_path_for(pv, samples[0].timestamp)
+    }
+
+    fn count_samples(path: &Path) -> usize {
+        let mut r = PbFileReader::open(path).unwrap();
+        let mut n = 0;
+        while r.next_event().unwrap().is_some() {
+            n += 1;
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn move_file_fresh_copy_commits_and_cleans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..50)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        let marker = s_path.with_extension("pb.etl_done");
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert_eq!(count_samples(&d_path), 50, "dest holds every sample once");
+        assert!(!s_path.exists(), "source deleted after durable copy");
+        assert!(!ckpt.exists(), "checkpoint cleared on commit");
+        assert!(!marker.exists(), "done-marker cleared on commit");
+    }
+
+    #[tokio::test]
+    async fn move_file_owner_retry_truncates_partial_not_duplicated() {
+        // Simulates a crash after a prior attempt appended a PREFIX of S to
+        // D and left an owner checkpoint (anchor = D's length before S = 0).
+        // The retry must truncate the partial away and re-append exactly
+        // once — never 10 + 50.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..50)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+
+        // Stage the failed-attempt state: a 10-sample partial in D and an
+        // owner checkpoint whose anchor is D's pre-append length (0).
+        let dbr = samples[0].value.db_type();
+        for s in &samples[..10] {
+            dest.append_event(pv, dbr, s).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let s_filename = s_path.file_name().unwrap().to_str().unwrap();
+        dest.create_etl_sidecar(&ckpt, format!("0\n{s_filename}\n").as_bytes())
+            .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert_eq!(
+            count_samples(&d_path),
+            50,
+            "partial prefix truncated, not duplicated"
+        );
+        assert!(!s_path.exists());
+        assert!(!ckpt.exists());
+    }
+
+    #[tokio::test]
+    async fn move_file_defers_to_other_source_owning_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..30)
+            .map(|i| sample_at(BASE_SECS + 3600 + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+
+        // A DIFFERENT source (still present on disk) owns the checkpoint.
+        let owner_name = "SimpleSine:2023_11_14_22.pb";
+        let owner_path = s_path.parent().unwrap().join(owner_name);
+        std::fs::write(&owner_path, b"partial").unwrap();
+        dest.create_etl_sidecar(&ckpt, format!("0\n{owner_name}\n").as_bytes())
+            .unwrap();
+
+        // Must defer: return Ok without touching D, source, or checkpoint.
+        exec.move_file(&s_path).await.unwrap();
+
+        assert!(s_path.exists(), "source kept when deferring");
+        assert!(!d_path.exists(), "dest partition untouched when deferring");
+        let (_, owner) = read_ckpt(&ckpt).expect("owner checkpoint intact");
+        assert_eq!(owner, owner_name);
+    }
+
+    #[tokio::test]
+    async fn move_file_discards_torn_checkpoint_and_copies_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..40)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+
+        // Torn checkpoint: unparseable content, D not yet created. A torn
+        // ckpt is fsync'd before any append, so no partial exists — the
+        // mover discards it and copies fresh.
+        dest.create_etl_sidecar(&ckpt, b"garbage-not-a-length")
+            .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert_eq!(count_samples(&d_path), 40, "copied exactly once");
+        assert!(!s_path.exists());
+        assert!(!ckpt.exists());
+    }
+
+    #[tokio::test]
+    async fn move_file_concurrent_same_dest_partition_no_corruption() {
+        // Two sources (hour 22 + hour 23, same day → same dest partition D)
+        // moved concurrently. The move gate serializes them so D ends with
+        // both sources' samples, each exactly once, and no torn frames.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let s1: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s2: Vec<_> = (0..30)
+            .map(|i| sample_at(BASE_SECS + 3600 + i, i as f64))
+            .collect();
+        let s1_path = write_source_partition(&src, pv, &s1).await;
+        let s2_path = write_source_partition(&src, pv, &s2).await;
+        let d_path = dest.file_path_for(pv, s1[0].timestamp);
+        assert_eq!(
+            d_path,
+            dest.file_path_for(pv, s2[0].timestamp),
+            "both hours land in the same day partition"
+        );
+
+        let (r1, r2) = tokio::join!(exec.move_file(&s1_path), exec.move_file(&s2_path));
+        r1.unwrap();
+        r2.unwrap();
+
+        assert_eq!(
+            count_samples(&d_path),
+            50,
+            "both sources present, each once"
+        );
+        assert!(!s1_path.exists());
+        assert!(!s2_path.exists());
+        assert!(!d_path.with_extension("pb.etl_ckpt").exists());
+    }
+
+    #[test]
+    #[should_panic(expected = "coarser-or-equal")]
+    fn new_rejects_dest_finer_than_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("s"), "STS", PartitionGranularity::Day);
+        let dest = plugin(tmp.path().join("d"), "MTS", PartitionGranularity::Hour);
+        let _ = EtlExecutor::new(src, dest, 3600, 0, 100);
     }
 }
