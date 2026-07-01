@@ -323,10 +323,32 @@ impl EtlExecutor {
         // Marker from a previous incomplete cleanup (crash after the
         // copy was made durable). The marker is written ONLY after the
         // destination flush below, so its presence proves the dest tier
-        // already holds this partition's data — recovery deletes the
-        // source without re-copying.
+        // already held THIS partition's data — recovery deletes the source
+        // without re-copying. The marker records the certified partition's
+        // (len, mtime); before trusting it, confirm it still describes the
+        // CURRENT source. A backfill re-creates the same-named partition with
+        // new data (different len/mtime); a marker leaked by a crash — or a
+        // swallowed remove — in the delete→remove-marker window would
+        // otherwise delete that NEW data uncopied (silent loss). Only a
+        // POSITIVE identity mismatch is stale, so a genuine marker never
+        // triggers a re-copy (which would duplicate).
         let marker = source_path.with_extension("pb.etl_done");
-        if marker.exists() {
+        if marker.exists()
+            && matches!(
+                (read_marker_identity(&marker), source_identity(source_path)),
+                (Some(recorded), Some(current)) if recorded != current
+            )
+        {
+            warn!(
+                ?source_path,
+                ?marker,
+                "ETL marker is stale (source re-created since it was certified); \
+                 dropping it and re-copying"
+            );
+            // The marker no longer describes what is on disk — drop it and
+            // fall through to a fresh idempotent copy of the re-created data.
+            self.source.remove_etl_sidecar(&marker).ok();
+        } else if marker.exists() {
             info!(
                 ?source_path,
                 "Found ETL marker — previous copy is durable in dest, cleaning up"
@@ -569,7 +591,18 @@ impl EtlExecutor {
         // from scratch (duplicate). The source delete is awaited to
         // completion (never under the copy timeout) so the unlink can't
         // detach and race a later move.
-        source.create_etl_sidecar(&marker, b"")?;
+        // Certify the copy with the source's identity (byte length + mtime)
+        // so a later cycle can tell THIS partition apart from a same-named one
+        // a backfill re-creates, and never delete-without-copy the new data.
+        // Abort (keep source) if the source can't be stat'd here: the
+        // checkpoint is still present, so the next cycle's owner-retry
+        // re-copies idempotently.
+        let identity = source_identity(&source_path).ok_or_else(|| {
+            anyhow::anyhow!(
+                "ETL: cannot stat source {source_path:?} to certify the copy (keeping source)"
+            )
+        })?;
+        source.create_etl_sidecar(&marker, &marker_contents(identity))?;
         dest.remove_etl_sidecar(&ckpt)?;
 
         // Slot-locked delete: remove the source under the per-PV slot lock
@@ -618,6 +651,41 @@ impl EtlExecutor {
 /// byte length, then the owning source partition's filename, one per line.
 fn ckpt_contents(len_before: u64, owner: &str) -> Vec<u8> {
     format!("{len_before}\n{owner}\n").into_bytes()
+}
+
+/// Identity of a source partition for the `.etl_done` certification:
+/// `(byte length, mtime as nanoseconds since the epoch)`. A backfill that
+/// re-creates or appends to the same-named partition changes at least one —
+/// almost always both — so a marker recorded for the old partition no longer
+/// matches. `None` if the path is absent or unstattable (the caller then
+/// falls back to the conservative "genuine marker" behaviour).
+fn source_identity(path: &Path) -> Option<(u64, u128)> {
+    let m = std::fs::metadata(path).ok()?;
+    let mtime = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((m.len(), mtime))
+}
+
+/// Serialize the `.etl_done` marker body: the certified source partition's
+/// byte length, then its mtime nanoseconds, one per line.
+fn marker_contents((len, mtime): (u64, u128)) -> Vec<u8> {
+    format!("{len}\n{mtime}\n").into_bytes()
+}
+
+/// Parse an `.etl_done` marker body into the certified `(len, mtime_nanos)`.
+/// `None` for a missing, empty (pre-identity), torn, or otherwise unparseable
+/// marker — the caller then treats it as a genuine "copy is durable" marker
+/// (delete-without-copy), matching the pre-identity behaviour.
+fn read_marker_identity(path: &Path) -> Option<(u64, u128)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut lines = content.lines();
+    let len: u64 = lines.next()?.trim().parse().ok()?;
+    let mtime: u128 = lines.next()?.trim().parse().ok()?;
+    Some((len, mtime))
 }
 
 /// Parse an ETL checkpoint sidecar into `(len_before, owner)`. Returns
@@ -1250,6 +1318,107 @@ mod tests {
         assert!(
             s_path.exists(),
             "source kept when D length can't be trusted"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_file_recopies_when_marker_is_stale_from_backfill() {
+        // finding A: a leaked `.etl_done` marker + a backfill that re-creates
+        // the same-named partition must NOT delete the new data without
+        // copying. The marker records the certified partition's identity; a
+        // mismatch against the current source means it was re-created, so the
+        // move re-copies (idempotently) instead of deleting uncopied.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        // Original partition (20 samples), already durable in D and certified.
+        let original: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &original).await;
+        let d_path = dest.file_path_for(pv, original[0].timestamp);
+        let marker = s_path.with_extension("pb.etl_done");
+
+        // D holds the 20 originals (as if S was already copied out).
+        let dbr = original[0].value.db_type();
+        for e in &original {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+
+        // Leak a marker certifying the ORIGINAL partition's identity.
+        let original_identity = source_identity(&s_path).expect("original source stattable");
+        src.create_etl_sidecar(&marker, &marker_contents(original_identity))
+            .unwrap();
+
+        // A backfill re-creates the same-named partition with NEW samples not
+        // yet in D. Evict the cached writer + unlink first so a fresh file
+        // (new inode, new len/mtime) is created at the same path.
+        assert!(src.remove_moved_partition(&s_path).unwrap());
+        let backfill: Vec<_> = (0..5)
+            .map(|i| sample_at(BASE_SECS + 100 + i, 900.0 + i as f64))
+            .collect();
+        let s_path2 = write_source_partition(&src, pv, &backfill).await;
+        assert_eq!(
+            s_path2, s_path,
+            "backfill re-creates the same partition path"
+        );
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert!(
+            !s_path.exists(),
+            "backfill partition moved out, not left behind"
+        );
+        assert!(!marker.exists(), "stale marker cleared");
+        assert_eq!(
+            count_samples(&d_path),
+            20 + 5,
+            "backfill copied into D — no delete-without-copy loss"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_file_marker_recovery_deletes_when_identity_matches() {
+        // Complement to the stale case: a genuine leaked marker (identity
+        // matches the current source) still takes the delete-without-copy
+        // recovery path — never a re-copy that would duplicate.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let marker = s_path.with_extension("pb.etl_done");
+
+        // D already durably holds the copy.
+        let dbr = samples[0].value.db_type();
+        for e in &samples {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+
+        // A genuine marker certifying THIS still-present source.
+        let identity = source_identity(&s_path).unwrap();
+        src.create_etl_sidecar(&marker, &marker_contents(identity))
+            .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert!(!s_path.exists(), "genuine marker: source deleted");
+        assert!(!marker.exists(), "genuine marker: cleared after delete");
+        assert_eq!(
+            count_samples(&d_path),
+            20,
+            "genuine marker: no re-copy, samples not duplicated"
         );
     }
 }
