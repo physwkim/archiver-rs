@@ -247,6 +247,21 @@ impl EtlExecutor {
         matches!(removed, Ok(Ok(true)))
     }
 
+    /// For a source partition still on disk, locate the single dest
+    /// partition `D` its samples aggregate into and return
+    /// `(D, source filename)` — the checkpoint's path stem and its owner
+    /// id. `None` when the source can't be opened or holds no samples (no
+    /// checkpoint could exist for it). Sync PB read, matching the copy
+    /// path's own `PbFileReader::open`.
+    fn locate_dest_and_owner(&self, source_path: &Path) -> Option<(PathBuf, String)> {
+        let mut reader = PbFileReader::open(source_path).ok()?;
+        let pv_name = reader.description().pv_name.clone();
+        let first = reader.next_event().ok()??;
+        let d_path = self.dest.file_path_for(&pv_name, first.timestamp);
+        let s_filename = source_path.file_name()?.to_str()?.to_string();
+        Some((d_path, s_filename))
+    }
+
     /// Move a single PB file from source to destination tier.
     /// Uses copy → durable dest → marker → slot-locked delete for
     /// crash-safe idempotency.
@@ -268,6 +283,29 @@ impl EtlExecutor {
                 ?source_path,
                 "Found ETL marker — previous copy is durable in dest, cleaning up"
             );
+            // Commit order is marker → remove ckpt → delete source. A crash
+            // between the marker and the ckpt-removal leaves a stale
+            // `<D>.pb.etl_ckpt` owned by this source: the copy is already
+            // durable (marker present), so no in-flight append to D remains.
+            // Clear our OWN checkpoint here — the committing owner is the
+            // single party allowed to remove it (invariant: ckpt present ⟺
+            // in-flight append to D exists). Owner-checked so another
+            // source's live checkpoint on the same D is never touched;
+            // best-effort so a source that can't be read to locate D just
+            // leaves the reap to the orphan-removal path on the next move
+            // into D. Runs before the delete below, while the source is
+            // still readable.
+            if let Some((d_path, s_filename)) = self.locate_dest_and_owner(source_path) {
+                let ckpt = d_path.with_extension("pb.etl_ckpt");
+                if read_ckpt(&ckpt).is_some_and(|(_, owner)| owner == s_filename)
+                    && let Err(e) = self.dest.remove_etl_sidecar(&ckpt)
+                {
+                    warn!(
+                        ?ckpt,
+                        "ETL marker recovery: failed to clear owned dest checkpoint: {e}"
+                    );
+                }
+            }
             // Delete the source under the per-PV slot lock so no append
             // can land in the just-deleted inode, and a still-live/dirty
             // partition is never destroyed.
@@ -847,6 +885,87 @@ mod tests {
         assert!(!s1_path.exists());
         assert!(!s2_path.exists());
         assert!(!d_path.with_extension("pb.etl_ckpt").exists());
+    }
+
+    #[tokio::test]
+    async fn move_file_recovery_clears_owned_dest_checkpoint() {
+        // Crash between commit steps marker(453) and remove-ckpt(454): the
+        // dest durably holds S (D fully copied), the marker is present, and
+        // S's owned checkpoint on D was NOT yet removed. Recovery must
+        // delete the source, clear the marker, AND clear its own stale
+        // checkpoint — without leaning on a later move into D to reap it.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..30)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        let marker = s_path.with_extension("pb.etl_done");
+
+        // Stage the crash state: D fully holds S, marker + owned ckpt present.
+        let dbr = samples[0].value.db_type();
+        for s in &samples {
+            dest.append_event(pv, dbr, s).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let s_filename = s_path.file_name().unwrap().to_str().unwrap();
+        dest.create_etl_sidecar(&ckpt, format!("0\n{s_filename}\n").as_bytes())
+            .unwrap();
+        src.create_etl_sidecar(&marker, b"").unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert!(!s_path.exists(), "recovery deletes the source");
+        assert!(!marker.exists(), "recovery clears the marker");
+        assert!(!ckpt.exists(), "recovery clears its own dest checkpoint");
+        assert_eq!(
+            count_samples(&d_path),
+            30,
+            "dest copy untouched by recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_file_recovery_leaves_other_sources_checkpoint() {
+        // Recovery of S must NOT remove a checkpoint on D owned by a
+        // DIFFERENT source (a legitimate in-flight append by that source).
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..30)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        let marker = s_path.with_extension("pb.etl_done");
+
+        let dbr = samples[0].value.db_type();
+        for s in &samples {
+            dest.append_event(pv, dbr, s).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        // Checkpoint owned by a different (hour-23) source of the same PV/day.
+        let other_owner = "SimpleSine:2023_11_14_23.pb";
+        dest.create_etl_sidecar(&ckpt, format!("0\n{other_owner}\n").as_bytes())
+            .unwrap();
+        src.create_etl_sidecar(&marker, b"").unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert!(!s_path.exists());
+        assert!(!marker.exists());
+        let (_, owner) = read_ckpt(&ckpt).expect("other source's checkpoint intact");
+        assert_eq!(owner, other_owner, "recovery must not touch another owner");
     }
 
     #[test]
