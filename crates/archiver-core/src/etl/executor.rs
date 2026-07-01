@@ -458,7 +458,21 @@ impl EtlExecutor {
         // means an unknown dirty tail — abort (keep source) and never measure
         // a length we can't trust.
         dest.flush_writes().await?;
-        let len_before = std::fs::metadata(&d_path).map(|m| m.len()).unwrap_or(0);
+        // Only a genuinely ABSENT D anchors at 0. A non-NotFound stat error
+        // (EIO/EACCES on a flaky mount) must NOT be coerced to 0: that false
+        // anchor would be stamped into the checkpoint and a later owner-retry
+        // would `truncate_partition(D, 0)`, destroying every prior source's
+        // committed samples. Abort the move (keep source) instead.
+        let len_before = match std::fs::metadata(&d_path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "ETL: cannot stat dest partition {d_path:?} to anchor the copy \
+                     (keeping source): {e}"
+                ));
+            }
+        };
 
         // Establish the checkpoint anchor for this copy of S into D.
         // Invariant: `<D>.pb.etl_ckpt` present ⟺ an in-flight append to D
@@ -1201,6 +1215,41 @@ mod tests {
             count_samples(&d_path),
             30,
             "moved: every sample in LTS once"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_file_aborts_on_unreadable_dest_metadata_not_anchoring_zero() {
+        // finding C: a non-NotFound stat error on D must NOT be coerced to a
+        // 0 anchor. Only a genuinely absent D anchors at 0; an I/O error
+        // aborts the move and keeps the source, so no false-0 checkpoint can
+        // drive a later `truncate_partition(D, 0)` that wipes prior data.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..10)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+
+        // Force `metadata(d_path)` to fail with a NON-NotFound error: put a
+        // regular FILE where D's parent directory should be → ENOTDIR on stat.
+        let d_parent = d_path.parent().unwrap();
+        std::fs::create_dir_all(d_parent.parent().unwrap()).unwrap();
+        std::fs::write(d_parent, b"not a directory").unwrap();
+
+        let err = exec.move_file(&s_path).await.unwrap_err();
+        assert!(
+            err.to_string().contains("cannot stat dest partition"),
+            "aborted at the anchor stat, not coerced to 0: {err}"
+        );
+        assert!(
+            s_path.exists(),
+            "source kept when D length can't be trusted"
         );
     }
 }
