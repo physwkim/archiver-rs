@@ -539,6 +539,22 @@ impl EtlExecutor {
             }
         };
 
+        // v0.4.0 upgrade compat. The released binary (v0.4.0, the only tagged
+        // release) used a `<S>.pb.etl_done` marker — written AFTER the copy +
+        // flush into D, BEFORE the source delete — as its idempotency guard;
+        // this redesign retired the marker for the dest checkpoint. A source
+        // left in v0.4.0's marker→delete window at upgrade has its full copy
+        // already durable in D but NO HEAD `.etl_ckpt`, so establishing a FRESH
+        // blind copy below (the `None`/orphan paths) would DUPLICATE it. The
+        // marker is exactly a "D already holds S, re-copy idempotently" signal —
+        // the same family as a `Committed` owner-retry we can't prove
+        // same-instance — so a fresh copy that sees it dedups instead of
+        // blind-appending: an unchanged S is fully skipped (no dup), and a
+        // backfill that grew S after the marker copies only its new samples (no
+        // loss, unlike v0.4.0's unconditional marker-found delete). HEAD never
+        // writes this marker, so it is absent in steady state.
+        let done_marker = source_path.with_extension("pb.etl_done");
+
         // Establish or resume this source's checkpoint on D and settle on the
         // `anchor` this copy appends from. A retry rolls D back to `anchor` and
         // re-appends, so the copy is idempotent by construction. Invariant:
@@ -546,8 +562,9 @@ impl EtlExecutor {
         // (`Copying`) or finished-but-pending-delete (`Committed`).
         //
         // Set when we append over a PRESERVED committed tail (a `Committed`
-        // owner-retry we could not prove same-instance): D may already hold this
-        // source's prior copy, so the copy below dedups against D's timestamps.
+        // owner-retry we could not prove same-instance, or a v0.4.0-marker'd
+        // source whose copy is already in D): D may already hold this source's
+        // prior copy, so the copy below dedups against D's timestamps.
         let mut dedup_against_dest = false;
         // Set to `Some(anchor_len)` by an owner-retry that must roll D back to
         // its checkpoint anchor before re-appending. Hoisted OUT of the match so
@@ -649,25 +666,52 @@ impl EtlExecutor {
                     owner = ck.owner,
                     "ETL removing orphaned dest checkpoint"
                 );
+                // If a v0.4.0 marker says D already holds THIS source's copy,
+                // dedup the fresh copy against D (skip its prior copy) rather
+                // than blind-append it after the orphan's tail — else it
+                // duplicates. The orphan owner's tail is in a disjoint range, so
+                // the bounded dedup read never touches it.
+                if done_marker.exists() {
+                    dedup_against_dest = true;
+                }
                 dest.remove_etl_sidecar(&ckpt)?;
                 dest.create_etl_sidecar(
                     &ckpt,
-                    &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime, false),
+                    &ckpt_contents(
+                        CkptState::Copying,
+                        len_before,
+                        &s_filename,
+                        s_btime,
+                        dedup_against_dest,
+                    ),
                 )?;
                 len_before
             }
             None => {
-                // Torn (present-but-unparseable) or absent. A torn checkpoint
-                // is fsync'd before any append byte, so it always predates an
-                // append → D is at its true committed length; discard it and
-                // re-anchor from len_before.
+                // Torn (present-but-unparseable) or absent HEAD checkpoint. A
+                // torn checkpoint is fsync'd before any append byte, so it always
+                // predates an append → D is at its true committed length; discard
+                // it and re-anchor from len_before.
                 if ckpt.exists() {
                     warn!(?ckpt, "ETL discarding torn dest checkpoint");
                     dest.remove_etl_sidecar(&ckpt)?;
                 }
+                // v0.4.0 upgrade compat (primary path): no HEAD checkpoint, but a
+                // `.etl_done` marker means D already holds this source's copy —
+                // dedup the re-copy instead of blind-appending (see the
+                // `done_marker` note above).
+                if done_marker.exists() {
+                    dedup_against_dest = true;
+                }
                 dest.create_etl_sidecar(
                     &ckpt,
-                    &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime, false),
+                    &ckpt_contents(
+                        CkptState::Copying,
+                        len_before,
+                        &s_filename,
+                        s_btime,
+                        dedup_against_dest,
+                    ),
                 )?;
                 len_before
             }
@@ -814,6 +858,15 @@ impl EtlExecutor {
             return Ok(false);
         }
         dest.remove_etl_sidecar(&ckpt)?;
+        // The source is gone and its copy is committed in D, so any v0.4.0
+        // `.etl_done` marker for it is now superseded — clear it so it does not
+        // linger (the source it named no longer exists to re-trigger cleanup).
+        // Gated on the dedup mode: a marker only ever drives a dedup copy, so a
+        // plain blind move never pays this unlink. Best-effort; a leftover is
+        // harmless (HEAD ignores it once the source is gone).
+        if dedup_against_dest {
+            let _ = std::fs::remove_file(&done_marker);
+        }
         metrics::counter!(
             "archiver_etl_files_moved_total",
             "source" => source_name,
@@ -2151,6 +2204,90 @@ mod tests {
             "Committed+dedup deferred-delete resume re-deduped — no dup (same_instance blind re-append would give 45)"
         );
         assert!(!s_path.exists());
+        assert!(!ckpt.exists());
+    }
+
+    #[tokio::test]
+    async fn move_file_v040_done_marker_dedups_not_reduplicates() {
+        // Round-7 Finding 1 (v0.4.0 upgrade regression). The released v0.4.0
+        // used a `<S>.pb.etl_done` marker (written after copy+flush into D,
+        // before the source delete) as its idempotency guard; this redesign
+        // retired it. A source left in that window at upgrade has its full copy
+        // in D but NO HEAD checkpoint — a fresh blind re-copy would DUPLICATE it
+        // (D→40; retrieval does not collapse it). HEAD must recognize the marker
+        // and dedup.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        // D holds S's full v0.4.0 copy; S is still on disk; the v0.4.0 marker is
+        // present; there is NO HEAD `.etl_ckpt`.
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        let dbr = samples[0].value.db_type();
+        for e in &samples {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let marker = s_path.with_extension("pb.etl_done");
+        std::fs::write(&marker, b"").unwrap();
+        assert!(!ckpt.exists(), "v0.4.0 wrote no HEAD checkpoint");
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert_eq!(
+            count_samples(&d_path),
+            20,
+            "v0.4.0 marker recognized: dedup skipped all — no dup (blind copy would give 40)"
+        );
+        assert!(!s_path.exists(), "source moved out");
+        assert!(!marker.exists(), "v0.4.0 marker cleared");
+        assert!(!ckpt.exists(), "HEAD checkpoint cleared on commit");
+    }
+
+    #[tokio::test]
+    async fn move_file_v040_done_marker_grown_source_no_loss() {
+        // Round-7 Finding 1, grown-source boundary. A backfill grew S after
+        // v0.4.0 wrote the marker (D holds only the original copy). Routing the
+        // marker through the dedup re-copy (not v0.4.0's unconditional delete)
+        // migrates the new samples too — no loss AND no dup.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let full: Vec<_> = (0..25)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let d_path = dest.file_path_for(pv, full[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        let dbr = full[0].value.db_type();
+        // D holds only v0.4.0's original copy [t0..t19].
+        for e in &full[..20] {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        // The source grew to [t0..t24] after the marker (a backfill); marker set.
+        let s_path = write_source_partition(&src, pv, &full).await;
+        let marker = s_path.with_extension("pb.etl_done");
+        std::fs::write(&marker, b"").unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert_eq!(
+            count_samples(&d_path),
+            25,
+            "marker dedup: [t0..t19] skipped, [t20..t24] migrated — no loss, no dup"
+        );
+        assert!(!s_path.exists());
+        assert!(!marker.exists());
         assert!(!ckpt.exists());
     }
 
