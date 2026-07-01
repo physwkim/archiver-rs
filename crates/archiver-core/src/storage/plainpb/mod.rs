@@ -788,9 +788,30 @@ impl PlainPbStoragePlugin {
 
     /// Unlink a `.pb` file, treating an already-absent file as success
     /// (another mover/recovery pass, or a manual `rm`, got there first).
-    fn unlink_idempotent(path: &Path) -> std::io::Result<bool> {
+    ///
+    /// Under `fsync_on_flush`, a real removal fsyncs the parent directory
+    /// BEFORE returning, so the unlink is durable. The ETL commit removes the
+    /// source partition BEFORE the guarding dest checkpoint, and the checkpoint
+    /// removal ([`remove_etl_sidecar`](Self::remove_etl_sidecar)) IS dir-fsync'd
+    /// — so without this the checkpoint's durable removal could outlive the
+    /// source's best-effort unlink across a power loss on INDEPENDENT
+    /// source/dest filesystems (the tiered-storage norm), resurrecting the
+    /// source with no guarding checkpoint; the next cycle then reads no
+    /// checkpoint and blind re-copies it into the dest — a silent duplicate.
+    /// Making the source unlink durable here orders "source durably gone"
+    /// BEFORE "checkpoint durably gone", so a crash can only ever leave the
+    /// safe pair (checkpoint present, source gone → a reaped/committed orphan),
+    /// never the duplicating pair (source present, checkpoint gone).
+    fn unlink_idempotent(&self, path: &Path) -> std::io::Result<bool> {
         match std::fs::remove_file(path) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                if self.fsync_on_flush
+                    && let Some(parent) = path.parent()
+                {
+                    Self::sync_dir(parent)?;
+                }
+                Ok(true)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
             Err(e) => Err(e),
         }
@@ -829,7 +850,7 @@ impl PlainPbStoragePlugin {
         // A path that doesn't decode to a known PV layout cannot be held
         // by any slot — just unlink it.
         let Some(pv) = self.pv_name_from_path(path) else {
-            return Self::unlink_idempotent(path);
+            return self.unlink_idempotent(path);
         };
 
         let slot_arc = {
@@ -838,7 +859,7 @@ impl PlainPbStoragePlugin {
         };
         let Some(arc) = slot_arc else {
             // No slot for this PV → nothing is writing the path.
-            return Self::unlink_idempotent(path);
+            return self.unlink_idempotent(path);
         };
 
         let mut slot = arc.lock().unwrap_or_else(|e| e.into_inner());
@@ -866,7 +887,7 @@ impl PlainPbStoragePlugin {
         // Leaving an empty slot (writer == None) in the cache is
         // harmless — flush_dirty_writers skips it and the next append
         // reuses it.
-        Self::unlink_idempotent(path)
+        self.unlink_idempotent(path)
     }
 
     /// Slot-locked delete of a moved source partition that additionally
@@ -896,7 +917,7 @@ impl PlainPbStoragePlugin {
         // A path that doesn't decode to a known PV layout cannot be held by
         // any slot — length-gate then unlink directly.
         let Some(pv) = self.pv_name_from_path(path) else {
-            return Self::unlink_if_unchanged(path, expected_len);
+            return self.unlink_if_unchanged(path, expected_len);
         };
         let slot_arc = {
             let cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -904,7 +925,7 @@ impl PlainPbStoragePlugin {
         };
         let Some(arc) = slot_arc else {
             // No slot for this PV → nothing is writing the path.
-            return Self::unlink_if_unchanged(path, expected_len);
+            return self.unlink_if_unchanged(path, expected_len);
         };
 
         let mut slot = arc.lock().unwrap_or_else(|e| e.into_inner());
@@ -936,17 +957,17 @@ impl PlainPbStoragePlugin {
         {
             let (_file, _buffered) = taken.writer.into_parts();
         }
-        Self::unlink_idempotent(path)
+        self.unlink_idempotent(path)
     }
 
     /// Length-gated unlink for a path held by no slot: unlink only if the
     /// on-disk length still equals `expected_len`. NotFound → `Ok(true)`
     /// (already gone). Used by [`remove_moved_partition_if_len`] for paths
     /// that decode to no PV or have no cached slot.
-    fn unlink_if_unchanged(path: &Path, expected_len: u64) -> std::io::Result<bool> {
+    fn unlink_if_unchanged(&self, path: &Path, expected_len: u64) -> std::io::Result<bool> {
         match std::fs::metadata(path) {
             Ok(m) if m.len() != expected_len => Ok(false),
-            Ok(_) => Self::unlink_idempotent(path),
+            Ok(_) => self.unlink_idempotent(path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
             Err(e) => Err(e),
         }
@@ -2471,6 +2492,55 @@ mod tests {
         assert!(
             plugin.remove_moved_partition_if_len(&path, 999).unwrap(),
             "already-absent path is idempotent success"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_moved_partition_if_len_durable_delete_under_fsync() {
+        // Round-8 Finding 1 (durability ordering). The ETL commit removes the
+        // source BEFORE the guarding dest checkpoint, and the checkpoint removal
+        // is dir-fsync'd; so the source unlink must ALSO fsync its parent dir
+        // under fsync_on_flush, else a crash on independent source/dest
+        // filesystems could persist the checkpoint removal while the source
+        // unlink reverts → the source reappears with no guard and is blind
+        // re-copied (a duplicate). The crash-ordering itself is not observable
+        // in a unit test; this exercises the new fsync-on-unlink path end-to-end
+        // (real parent dir, no error, file actually gone).
+        use crate::types::ArchiverValue;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin =
+            PlainPbStoragePlugin::new("STS", dir.path().to_path_buf(), PartitionGranularity::Hour)
+                .with_fsync_on_flush(true);
+        let base = 1_700_000_000;
+        let mk = |i: u64| {
+            ArchiverSample::new(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(base + i),
+                ArchiverValue::ScalarDouble(i as f64),
+            )
+        };
+        let dbr = mk(0).value.db_type();
+        let pv = "PV:X";
+
+        for i in 0..5 {
+            plugin.append_event(pv, dbr, &mk(i)).await.unwrap();
+        }
+        plugin.flush_writes().await.unwrap();
+        let path = plugin.file_path_for(pv, mk(0).timestamp);
+        let cur = std::fs::metadata(&path).unwrap().len();
+
+        // Exact-length, clean → durable unlink (fsyncs the STS partition dir).
+        assert!(
+            plugin.remove_moved_partition_if_len(&path, cur).unwrap(),
+            "unchanged source deleted under fsync_on_flush"
+        );
+        assert!(!path.exists(), "removed, and the removal was dir-fsync'd");
+
+        // Idempotent success once already gone (no double-fsync error).
+        assert!(
+            plugin.remove_moved_partition_if_len(&path, cur).unwrap(),
+            "already-absent is idempotent success under fsync_on_flush"
         );
     }
 
