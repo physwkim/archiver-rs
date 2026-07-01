@@ -278,8 +278,14 @@ impl EtlExecutor {
                 Some(rel) => source_root.join(rel).join(&ck.owner),
                 None => source_root.join(&ck.owner),
             };
-            if owner_path.exists() {
-                // In-flight aggregation by a still-present source: leave it.
+            // Only reap when the owner is DEFINITIVELY absent. `exists()`
+            // coerces a transient stat error (ESTALE / EIO on a flaky mount) to
+            // `false`; reaping on that would drop a LIVE owner's checkpoint and
+            // make the next move re-copy after the committed tail — a duplicate.
+            // Ok(true) (present, in-flight) and Err(_) (uncertain) both mean
+            // "not provably gone": leave the checkpoint for a healthy-mount
+            // cycle — or move_file's btime-gated resume — to handle.
+            if !matches!(owner_path.try_exists(), Ok(false)) {
                 continue;
             }
 
@@ -573,7 +579,12 @@ impl EtlExecutor {
                     .parent()
                     .map(|p| p.join(&ck.owner))
                     .unwrap_or_else(|| PathBuf::from(&ck.owner));
-                if owner_src.exists() {
+                // Defer unless the owner is DEFINITIVELY gone. `exists()` reads
+                // a transient stat error as `false`, which would drop this
+                // OTHER source's live checkpoint below and strand its resume (or
+                // duplicate). Ok(true) (present) and Err(_) (uncertain) both
+                // mean "do not treat as orphan" — defer.
+                if !matches!(owner_src.try_exists(), Ok(false)) {
                     // The owner will finish or retry its own copy; appending
                     // now would interleave two sources into D. Defer — a later
                     // cycle retries this source once the owner clears its
@@ -1885,6 +1896,56 @@ mod tests {
             20,
             "committed tail preserved — NOT truncated"
         );
+    }
+
+    #[tokio::test]
+    async fn reap_uncertain_owner_stat_does_not_reap() {
+        // Round-5 Finding 2: the reap must not treat a transient stat error
+        // (ESTALE / EIO on a flaky mount) as "owner gone" — `exists()` coerces
+        // every stat error to `false`, which would reap a live owner's
+        // checkpoint and make the next move re-copy after the committed tail (a
+        // duplicate). Only a DEFINITIVE Ok(false) reaps. Here the owner's parent
+        // is a regular file, so `try_exists` on the owner path returns
+        // Err(ENOTDIR) — the "uncertain" case — and the checkpoint must survive.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        // A colon in the PV name → pv_key "Sim/Orphan" → the partition lives in
+        // a subdir (`<root>/Sim/Orphan:<part>.pb`), so the reap reconstructs the
+        // owner under `source_root/Sim/…`. Making `source_root/Sim` a regular
+        // FILE forces `try_exists(owner)` to fail with ENOTDIR.
+        let pv = "Sim:Orphan";
+        let samples: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let dbr = samples[0].value.db_type();
+        for e in &samples {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Committed, 0, "Orphan:1999_01_01_00.pb", None),
+        )
+        .unwrap();
+
+        // source_root must exist for the reap to run; `source_root/Sim` is a
+        // regular file so the reap's owner stat errors (ENOTDIR) rather than
+        // returning Ok(false).
+        std::fs::create_dir_all(src.root_folder()).unwrap();
+        std::fs::write(src.root_folder().join("Sim"), b"not a dir").unwrap();
+
+        exec.run_once().await.unwrap();
+
+        assert!(
+            ckpt.exists(),
+            "uncertain owner stat (ENOTDIR) must NOT reap the checkpoint"
+        );
+        assert_eq!(count_samples(&d_path), 20, "D untouched");
     }
 
     #[tokio::test]
