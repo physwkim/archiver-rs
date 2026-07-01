@@ -1,6 +1,7 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use dashmap::DashMap;
 use epics_rs::base::server::snapshot::DbrClass;
@@ -3139,10 +3140,58 @@ fn record_closed_drop(shard: usize, s: &PvSample, phase: &'static str) {
 /// tolerates non-monotonic timestamps (clock backsteps, late
 /// backfills), and the per-PV writer-slot Mutex inside the storage
 /// layer — not the shard's maps — is the real append-ordering owner.
+/// How long a spent respawn budget takes to refill.
+const RESPAWN_WINDOW: Duration = Duration::from_secs(60);
+/// Max respawns allowed per shard within [`RESPAWN_WINDOW`].
+const RESPAWN_MAX_IN_WINDOW: usize = 5;
+
+/// Sliding-window budget bounding how often a dead shard is respawned,
+/// so a shard whose loop panics deterministically (a bug that re-fires
+/// on the same input) can't respawn-storm. Storage panics are already
+/// isolated by the shard's `spawn_blocking` + `catch_unwind`, so a
+/// shard task only dies on a bug in its OWN loop — which would re-panic
+/// on respawn. At most [`RESPAWN_MAX_IN_WINDOW`] respawns per
+/// [`RESPAWN_WINDOW`] per shard; once the budget is spent the shard
+/// stays dead — its samples are dropped and counted under a distinct
+/// `respawn_giveup` phase — until the window clears and the next Closed
+/// re-arms a respawn attempt.
+struct RespawnGovernor {
+    /// Respawn instants per shard, pruned to the window on each check.
+    history: Vec<VecDeque<Instant>>,
+}
+
+impl RespawnGovernor {
+    fn new(n: usize) -> Self {
+        Self {
+            history: (0..n).map(|_| VecDeque::new()).collect(),
+        }
+    }
+
+    /// Prune expired entries for `shard`, then record and allow a
+    /// respawn if under budget. Returns `false` when the budget is
+    /// exhausted (caller must NOT respawn).
+    fn allow(&mut self, shard: usize, now: Instant) -> bool {
+        let h = &mut self.history[shard];
+        while let Some(&front) = h.front() {
+            if now.duration_since(front) >= RESPAWN_WINDOW {
+                h.pop_front();
+            } else {
+                break;
+            }
+        }
+        if h.len() >= RESPAWN_MAX_IN_WINDOW {
+            return false;
+        }
+        h.push_back(now);
+        true
+    }
+}
+
 fn route_sample(
     sample: PvSample,
     shard_txs: &mut [mpsc::Sender<PvSample>],
     shard_handles: &mut [tokio::task::JoinHandle<()>],
+    governor: &mut RespawnGovernor,
     ctx: &ShardSpawnCtx,
 ) {
     let idx = shard_for_pv(&sample.pv_name, shard_txs.len());
@@ -3150,6 +3199,22 @@ fn route_sample(
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(s)) => record_overflow_drop(idx, &s, "steady"),
         Err(mpsc::error::TrySendError::Closed(s)) => {
+            // Shard worker died. Respawn — but only within the budget,
+            // so a shard that dies on every sample can't respawn-storm.
+            if !governor.allow(idx, Instant::now()) {
+                warn!(
+                    shard = idx,
+                    pv = s.pv_name,
+                    "Shard respawn budget exhausted; dropping sample without respawn"
+                );
+                metrics::counter!(
+                    "archiver_dispatcher_shard_respawn_giveup_total",
+                    "shard" => idx.to_string(),
+                )
+                .increment(1);
+                record_closed_drop(idx, &s, "respawn_giveup");
+                return;
+            }
             warn!(shard = idx, pv = s.pv_name, "Shard worker died; respawning");
             metrics::counter!(
                 "archiver_dispatcher_shard_respawn_total",
@@ -3199,6 +3264,9 @@ async fn dispatch_loop(mut rx: mpsc::Receiver<PvSample>, n: usize, ctx: ShardSpa
         shard_txs.push(tx);
         shard_handles.push(handle);
     }
+    // Bounds respawns per shard so a deterministically-dying shard
+    // can't storm (see [`RespawnGovernor`]).
+    let mut governor = RespawnGovernor::new(n);
 
     info!(shards = n, "Sharded write dispatcher started");
     loop {
@@ -3233,7 +3301,13 @@ async fn dispatch_loop(mut rx: mpsc::Receiver<PvSample>, n: usize, ctx: ShardSpa
             maybe = rx.recv() => {
                 match maybe {
                     Some(sample) => {
-                        route_sample(sample, &mut shard_txs, &mut shard_handles, &ctx);
+                        route_sample(
+                            sample,
+                            &mut shard_txs,
+                            &mut shard_handles,
+                            &mut governor,
+                            &ctx,
+                        );
                     }
                     None => break, // Upstream closed.
                 }
@@ -4511,7 +4585,14 @@ mod shard_lifecycle_tests {
             counters: Some(counters.clone()),
         };
 
-        route_sample(sample, &mut shard_txs, &mut shard_handles, &ctx);
+        let mut governor = RespawnGovernor::new(1);
+        route_sample(
+            sample,
+            &mut shard_txs,
+            &mut shard_handles,
+            &mut governor,
+            &ctx,
+        );
 
         // Respawn must have replaced the dead sender with a live one.
         assert!(
@@ -4535,5 +4616,36 @@ mod shard_lifecycle_tests {
 
         // Tear the respawned shard down cleanly.
         let _ = sd_tx.send(true);
+    }
+
+    #[test]
+    fn respawn_governor_bounds_respawns_per_window() {
+        let mut gov = RespawnGovernor::new(2);
+        let t0 = Instant::now();
+
+        // The first RESPAWN_MAX_IN_WINDOW attempts in the window are
+        // allowed.
+        for i in 0..RESPAWN_MAX_IN_WINDOW {
+            assert!(
+                gov.allow(0, t0 + Duration::from_millis(i as u64)),
+                "attempt {i} within budget must be allowed"
+            );
+        }
+        // The next attempt in the same window is denied — this is what
+        // stops the respawn storm.
+        assert!(
+            !gov.allow(0, t0 + Duration::from_millis(RESPAWN_MAX_IN_WINDOW as u64)),
+            "over-budget attempt must be denied"
+        );
+        // A different shard has its own independent budget.
+        assert!(
+            gov.allow(1, t0 + Duration::from_millis(RESPAWN_MAX_IN_WINDOW as u64)),
+            "a distinct shard's budget must be independent"
+        );
+        // Once the window clears, shard 0's budget refills.
+        assert!(
+            gov.allow(0, t0 + RESPAWN_WINDOW + Duration::from_millis(1)),
+            "budget must refill after the window elapses"
+        );
     }
 }
