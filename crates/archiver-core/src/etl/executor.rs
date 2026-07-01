@@ -300,6 +300,26 @@ impl EtlExecutor {
         // recovery can't race either.
         let _gate = self.move_gate.lock().await;
 
+        // A partition with a pending INBOUND checkpoint is mid-aggregation by
+        // a FINER tier (an in-flight append, or a crash-left partial). It is
+        // not eligible for ANY outbound move: reading it would promote the
+        // uncommitted partial tail to the coarser tier, and deleting it would
+        // strand the finer tier's owner-retry on
+        // `truncate_partition(<absent D>, anchor>0)` → `NotFound` every cycle
+        // (permanent wedge). Defer — the finer tier commits, or its marker
+        // recovery clears this checkpoint, then a later cycle moves the
+        // partition out cleanly. No-op for the finest tier (nothing feeds it
+        // via ETL, so it never carries an inbound checkpoint).
+        let inbound_ckpt = source_path.with_extension("pb.etl_ckpt");
+        if inbound_ckpt.exists() {
+            debug!(
+                ?source_path,
+                ?inbound_ckpt,
+                "ETL deferring: partition has a pending inbound checkpoint"
+            );
+            return Ok(());
+        }
+
         // Marker from a previous incomplete cleanup (crash after the
         // copy was made durable). The marker is written ONLY after the
         // destination flush below, so its presence proves the dest tier
@@ -1134,5 +1154,53 @@ mod tests {
         let src = plugin(tmp.path().join("s"), "STS", PartitionGranularity::Day);
         let dest = plugin(tmp.path().join("d"), "MTS", PartitionGranularity::Hour);
         let _ = EtlExecutor::new(src, dest, 3600, 0, 100);
+    }
+
+    #[tokio::test]
+    async fn move_file_defers_partition_with_pending_inbound_checkpoint() {
+        // finding B: an MTS→LTS move must NOT read+delete an MTS partition
+        // that a finer STS→MTS copy is still aggregating into. Doing so
+        // promotes the uncommitted partial tail and strands the STS→MTS
+        // owner-retry on `truncate_partition(<absent D>, anchor>0)` forever.
+        // The partition's own inbound `.etl_ckpt` makes it ineligible until
+        // the finer tier clears it.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let dest = plugin(tmp.path().join("lts"), "LTS", PartitionGranularity::Year);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..30)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+
+        // Stage a pending inbound checkpoint on the MTS partition, owned by an
+        // in-flight STS (hour) source aggregating into it.
+        let inbound_ckpt = s_path.with_extension("pb.etl_ckpt");
+        src.create_etl_sidecar(&inbound_ckpt, b"0\nSimpleSine:2023_11_14_22.pb\n")
+            .unwrap();
+
+        // Move must DEFER: partition untouched, nothing promoted to LTS.
+        exec.move_file(&s_path).await.unwrap();
+        assert!(s_path.exists(), "deferred: MTS partition not deleted");
+        assert_eq!(count_samples(&s_path), 30, "deferred: partition unchanged");
+        assert!(!d_path.exists(), "deferred: nothing written to LTS");
+        assert!(
+            inbound_ckpt.exists(),
+            "deferred: inbound checkpoint left for the finer tier"
+        );
+
+        // Finer tier completes and clears its checkpoint → the partition is
+        // now eligible and the move proceeds.
+        src.remove_etl_sidecar(&inbound_ckpt).unwrap();
+        exec.move_file(&s_path).await.unwrap();
+        assert!(!s_path.exists(), "moved: MTS partition deleted");
+        assert_eq!(
+            count_samples(&d_path),
+            30,
+            "moved: every sample in LTS once"
+        );
     }
 }
