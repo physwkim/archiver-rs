@@ -233,11 +233,24 @@ impl StoragePlugin for TieredStorage {
 
     fn take_loss_markers(&self) -> Vec<String> {
         // Ingest writes only ever touch STS (see
-        // `append_event_with_meta`), so the loss queue that the flush
-        // owner must drain lives entirely on STS. Delegating to STS
-        // alone keeps the single-owner drain consistent with
-        // `flush_ingest_writes` above.
-        self.sts.take_loss_markers()
+        // `append_event_with_meta`), so only STS's loss markers drive the
+        // ingest flush owner's pending-timestamp drop; those are returned
+        // upward. Returning MTS/LTS markers here would be WRONG — those
+        // PVs are never in the ingest pending set, so surfacing them would
+        // drop a healthy ingest commit.
+        //
+        // MTS/LTS still accumulate loss markers when an ETL-side flush
+        // genuinely fails, but `move_file` aborts that move on the same
+        // failure (`flush_writes` bails) and keeps the source for a later
+        // retry, so those markers are redundant for correctness. Drain
+        // them here anyway (discarding the result) so a sustained
+        // dest-tier I/O fault can't grow the queues without bound.
+        // TieredStorage owns the drain of every tier's queue; only STS's
+        // is surfaced.
+        let sts = self.sts.take_loss_markers();
+        let _ = self.mts.take_loss_markers();
+        let _ = self.lts.take_loss_markers();
+        sts
     }
 
     fn stores_for_pv(&self, pv: &str) -> anyhow::Result<Vec<StoreSummary>> {
@@ -261,5 +274,43 @@ impl StoragePlugin for TieredStorage {
         let m = self.mts.rename_pv(from, to).await?;
         let l = self.lts.rename_pv(from, to).await?;
         Ok(s + m + l)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn plugin(name: &str) -> Arc<PlainPbStoragePlugin> {
+        // No disk access: constructor stores fields, and the loss-queue
+        // operations under test touch only an in-memory Vec.
+        Arc::new(PlainPbStoragePlugin::new(
+            name,
+            PathBuf::from(format!("/nonexistent-{name}")),
+            PartitionGranularity::Hour,
+        ))
+    }
+
+    #[test]
+    fn take_loss_markers_drains_all_tiers_but_returns_only_sts() {
+        let tiered = TieredStorage {
+            sts: plugin("STS"),
+            mts: plugin("MTS"),
+            lts: plugin("LTS"),
+        };
+        tiered.sts.push_loss_marker_for_test("PV:STS");
+        tiered.mts.push_loss_marker_for_test("PV:MTS");
+        tiered.lts.push_loss_marker_for_test("PV:LTS");
+
+        // Only STS markers reach the ingest flush owner; MTS/LTS markers
+        // would spuriously drop healthy ingest commits.
+        assert_eq!(tiered.take_loss_markers(), vec!["PV:STS".to_string()]);
+
+        // All three queues were drained — a second drain of any tier
+        // yields nothing, proving MTS/LTS can't grow unbounded.
+        assert!(tiered.take_loss_markers().is_empty());
+        assert!(tiered.mts.take_loss_markers().is_empty());
+        assert!(tiered.lts.take_loss_markers().is_empty());
     }
 }

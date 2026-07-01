@@ -522,6 +522,14 @@ impl PlainPbStoragePlugin {
         ev.push(pv.to_string());
     }
 
+    /// Test-only accessor to seed a loss marker without staging a real
+    /// flush failure. Used by the `TieredStorage` drain test to verify
+    /// every tier's queue is drained. Compiled out of release builds.
+    #[cfg(test)]
+    pub(crate) fn push_loss_marker_for_test(&self, pv: &str) {
+        self.record_dirty_loss(pv);
+    }
+
     /// Helper used by every code path that drops a dirty writer
     /// outside the regular flush iteration (partition rollover,
     /// ghost-file reopen, evict_writer_for_path, write_cached
