@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
@@ -524,6 +524,11 @@ impl EtlExecutor {
         // re-appends, so the copy is idempotent by construction. Invariant:
         // `<D>.pb.etl_ckpt` present ⟺ a copy of `owner` into D is in progress
         // (`Copying`) or finished-but-pending-delete (`Committed`).
+        //
+        // Set when we append over a PRESERVED committed tail (a `Committed`
+        // owner-retry we could not prove same-instance): D may already hold this
+        // source's prior copy, so the copy below dedups against D's timestamps.
+        let mut dedup_against_dest = false;
         let anchor = match read_ckpt(&ckpt) {
             Some(ck) if ck.owner == s_filename => {
                 // `Copying` proves the tail is a partial copy of THIS same
@@ -555,21 +560,26 @@ impl EtlExecutor {
                     // to a deleted/older instance, so it must NEVER be truncated
                     // — that truncate is the btime-less silent loss this design
                     // removes. Preserve the committed tail and anchor a FRESH
-                    // copy of the current source AFTER it. On a filesystem
-                    // without btime a same-instance crash here yields a
-                    // recoverable duplicate, never loss. (No append has happened
-                    // yet, so re-establishing the checkpoint is crash-safe.)
+                    // copy of the current source AFTER it. To keep the re-copy
+                    // idempotent WITHOUT btime, the copy below dedups against D:
+                    // if this is actually a same-instance retry (D already holds
+                    // this source's committed copy) every sample is skipped and
+                    // no duplicate is produced; a genuine re-created/backfill
+                    // source (disjoint, gap-fill, or superset) copies exactly its
+                    // not-yet-present samples. (No append has happened yet, so
+                    // re-establishing the checkpoint is crash-safe.)
                     warn!(
                         ?ckpt,
                         owner = ck.owner,
                         "ETL committed-checkpoint owner re-created (or btime unavailable); \
-                         preserving its committed tail and re-anchoring"
+                         preserving its committed tail and re-anchoring (dedup re-copy)"
                     );
                     dest.remove_etl_sidecar(&ckpt)?;
                     dest.create_etl_sidecar(
                         &ckpt,
                         &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime),
                     )?;
+                    dedup_against_dest = true;
                     len_before
                 }
             }
@@ -630,6 +640,19 @@ impl EtlExecutor {
             }
         };
 
+        // When appending over a preserved committed tail, read D's existing
+        // timestamps so the copy can skip any this source already contributed.
+        // Each finer source covers a DISJOINT time sub-range of D, so the only
+        // collisions are this source's own prior copy — a same-instance retry
+        // then copies nothing (no duplicate), while a re-created/backfill source
+        // copies exactly its new samples (no loss). Guarded on `len_before > 0`:
+        // an empty/absent D has nothing to dedup against.
+        let dest_ts: Option<HashSet<SystemTime>> = if dedup_against_dest && len_before > 0 {
+            Some(read_partition_timestamps(&d_path)?)
+        } else {
+            None
+        };
+
         // Carry the SOURCE partition's PayloadInfo metadata (element_count
         // for waveforms, custom field headers) into the copy. Plain
         // `append_event` uses `AppendMeta::default()`, which would stamp a
@@ -649,14 +672,23 @@ impl EtlExecutor {
         // partition — refuse the move), and a partial tail past the anchor is
         // rolled back by the next retry's owner truncate.
         tokio::time::timeout(timeout, async {
-            dest.append_event_with_meta(&desc.pv_name, dbr_type, &first_sample, &append_meta)
-                .await?;
+            // `None` ⇒ copy everything (the common path). `Some(set)` ⇒ skip any
+            // sample D already holds (the preserved-committed-tail re-copy).
+            let already_in_dest =
+                |ts: SystemTime| dest_ts.as_ref().is_some_and(|set| set.contains(&ts));
+            if !already_in_dest(first_sample.timestamp) {
+                dest.append_event_with_meta(&desc.pv_name, dbr_type, &first_sample, &append_meta)
+                    .await?;
+            }
             while let Some(sample) = reader.next_event()? {
                 if dest.file_path_for(&desc.pv_name, sample.timestamp) != d_path {
                     return Err(anyhow::anyhow!(
                         "ETL: a sample timestamp in {source_path:?} maps to a different dest \
                          partition than {d_path:?}; refusing to split the copy"
                     ));
+                }
+                if already_in_dest(sample.timestamp) {
+                    continue;
                 }
                 dest.append_event_with_meta(&desc.pv_name, dbr_type, &sample, &append_meta)
                     .await?;
@@ -696,8 +728,8 @@ impl EtlExecutor {
         //      leaves a `committed` orphan: reaped by the next move into D
         //      (owner file gone), by the forward tier's orphan sweep, or — if
         //      the source is re-created first — preserved (its committed tail
-        //      is never truncated). Either way no loss (a btime-less re-create
-        //      may cost a recoverable duplicate).
+        //      is never truncated) and its re-copy deduped against D. No loss
+        //      and no duplicate on any filesystem, btime or not.
         //
         // Awaited to completion (never under the copy timeout) so the unlink
         // can't detach and race a later move.
@@ -782,10 +814,12 @@ struct Ckpt {
 ///
 /// btime distinguishes THIS source instance from a same-named partition a
 /// backfill later re-creates: it changes on delete + re-create but NOT on a
-/// plain append. Under the explicit `state` it is only an optimization (it
-/// never gates the safety of a truncate — the `state` does), so a filesystem
-/// that omits it degrades to a recoverable duplicate in a narrow window, never
-/// silent loss.
+/// plain append. Under the explicit `state` it is only a fast-path optimization
+/// — it never gates the safety of a truncate (the `state` does), and a
+/// filesystem that omits it loses neither correctness guarantee: the committed
+/// tail is never truncated (no loss) and the re-copy is deduped against D (no
+/// duplicate). btime just lets a proven same-instance retry take the cheaper
+/// truncate-and-recopy path instead of the dedup one.
 fn ckpt_contents(state: CkptState, anchor: u64, owner: &str, owner_btime: Option<u128>) -> Vec<u8> {
     let btime = owner_btime.map(|b| b.to_string()).unwrap_or_default();
     format!("{}\n{anchor}\n{owner}\n{btime}\n", state.as_str()).into_bytes()
@@ -862,6 +896,21 @@ fn list_pb_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
+}
+
+/// Collect every sample timestamp already stored in a dest partition so a
+/// re-copy over a preserved committed tail can SKIP samples D already holds —
+/// making the re-copy idempotent by construction, without depending on btime.
+/// Only called when D is known non-empty (`len_before > 0`), so a missing file
+/// or read error propagates (aborting the move, keeping the source for a retry)
+/// rather than silently producing a duplicate.
+fn read_partition_timestamps(path: &Path) -> anyhow::Result<HashSet<SystemTime>> {
+    let mut reader = PbFileReader::open(path)?;
+    let mut set = HashSet::new();
+    while let Some(sample) = reader.next_event()? {
+        set.insert(sample.timestamp);
+    }
+    Ok(set)
 }
 
 /// Recursively list all `.pb.etl_ckpt` checkpoint sidecars under a directory.
@@ -1668,15 +1717,15 @@ mod tests {
 
     #[tokio::test]
     async fn move_file_committed_checkpoint_without_btime_never_loses_committed_tail() {
-        // Finding B, worst btime-less case: a `committed` orphan checkpoint
-        // recorded with NO btime, whose same-named source is still present
-        // (in reality this same instance — a crash between the `committed`
-        // transition and the source delete). Without btime we cannot PROVE
-        // same-vs-re-created, so we take the conservative path and NEVER
-        // truncate the committed tail. The committed samples survive on every
-        // filesystem (the silent-loss floor is removed); the only cost is a
-        // recoverable duplicate (collapsed by read-time timestamp dedup) —
-        // never loss.
+        // Finding B, worst btime-less case, now closed by the set-merge
+        // (Round-5 Finding 3): a `committed` checkpoint recorded with NO btime,
+        // whose same-named source is still present (in reality this same
+        // instance — a crash between the `committed` transition and the source
+        // delete). Without btime we cannot PROVE same-vs-re-created, so we never
+        // truncate the committed tail (no loss on any filesystem) AND we dedup
+        // the re-copy against D. Since D already holds this exact source's 20
+        // committed samples, every source sample is skipped: the retry is
+        // idempotent — no loss AND no duplicate, without btime.
         let tmp = tempfile::tempdir().unwrap();
         let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
         let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
@@ -1704,17 +1753,120 @@ mod tests {
 
         exec.move_file(&s_path).await.unwrap();
 
-        // The committed 20 are preserved (never truncated); the source is
-        // re-copied after them because same-instance can't be proven without
-        // btime → 40. A truncate-to-0 would have destroyed the committed 20 and
-        // yielded 20; that is the loss this design forecloses.
+        // The committed 20 are preserved (never truncated) AND the re-copy is
+        // deduped against D — every source sample is already present, so nothing
+        // is appended: D reads 20. A truncate-to-0 would have destroyed the
+        // committed 20 (loss → 20 different bytes); a blind re-copy would have
+        // yielded 40 (the duplicate the set-merge forecloses).
         assert_eq!(
             count_samples(&d_path),
-            40,
-            "committed tail preserved on a btime-less FS (no loss); recoverable duplicate only"
+            20,
+            "same-instance btime-less retry: tail preserved, re-copy deduped — no loss, no dup"
         );
         assert!(!s_path.exists(), "source moved out");
         assert!(!ckpt.exists(), "checkpoint cleared on commit");
+    }
+
+    #[tokio::test]
+    async fn move_file_committed_retry_superset_source_dedups_overlap() {
+        // Set-merge boundary (Round-5 Finding 3): a committed-owner retry we
+        // cannot prove same-instance, where the source OVERLAPS D's committed
+        // tail (a replay re-containing already-migrated samples PLUS new ones).
+        // The dedup re-copy skips the overlap and appends only the new samples —
+        // no duplicate, no loss. A naive "content-equal → skip" would wrongly
+        // re-copy the whole superset (duplicating the overlap).
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        // D holds committed [t0..t19].
+        let committed: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let dbr = committed[0].value.db_type();
+        for e in &committed {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let d_path = dest.file_path_for(pv, committed[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+
+        // The source is a SUPERSET: [t0..t24] (the 20 already in D + 5 new).
+        let superset: Vec<_> = (0..25)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &superset).await;
+        let s_filename = s_path.file_name().unwrap().to_str().unwrap();
+        // Committed + owner match + bogus btime → cannot prove same-instance →
+        // preserve tail + dedup re-copy.
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Committed, 0, s_filename, Some(1)),
+        )
+        .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert_eq!(
+            count_samples(&d_path),
+            25,
+            "overlap [t0..t19] deduped, [t20..t24] appended — no dup, no loss"
+        );
+        assert!(!s_path.exists());
+        assert!(!ckpt.exists());
+    }
+
+    #[tokio::test]
+    async fn move_file_committed_retry_gapfill_source_not_lost() {
+        // Set-merge boundary (Round-5 Finding 3): a committed-owner retry where
+        // the re-created source fills GAPS older than D's newest committed
+        // sample. A high-water-mark rule ("copy only ts > max in D") would DROP
+        // them (loss); the set-merge keeps them (they are absent from D) — no
+        // loss, no dup.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        // D holds SPARSE committed [t0, t10, t20, t30].
+        let committed: Vec<_> = [0u64, 10, 20, 30]
+            .into_iter()
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let dbr = committed[0].value.db_type();
+        for e in &committed {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let d_path = dest.file_path_for(pv, committed[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+
+        // Re-created source: gap-fillers [t5, t15] — older than t30, absent
+        // from D.
+        let gaps: Vec<_> = [5u64, 15]
+            .into_iter()
+            .map(|i| sample_at(BASE_SECS + i, 900.0 + i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &gaps).await;
+        let s_filename = s_path.file_name().unwrap().to_str().unwrap();
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Committed, 0, s_filename, Some(1)),
+        )
+        .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert_eq!(
+            count_samples(&d_path),
+            4 + 2,
+            "gap-fillers [t5,t15] kept (absent from D) — no loss"
+        );
+        assert!(!s_path.exists());
+        assert!(!ckpt.exists());
     }
 
     #[tokio::test]
