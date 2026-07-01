@@ -1033,6 +1033,12 @@ impl PlainPbStoragePlugin {
 
         if slot.writer.is_none() {
             let needs_header = file_needs_header(path);
+            // Whether the open below will CREATE the file (add a new
+            // directory entry). Reliable under the per-PV slot lock: no
+            // other writer targets this path. Gates the parent-dir
+            // fsync so a plain reopen (post-eviction) of an
+            // already-durable file skips the syscall.
+            let is_new_file = self.fsync_on_flush && !path.exists();
 
             // Atomic fd-cap reservation: loop trying to reserve a
             // permit; each failed reservation triggers one LRU
@@ -1087,15 +1093,20 @@ impl PlainPbStoragePlugin {
             // committed sample can't outlive its bytes across a power
             // loss. `sync_all` on the file (the flush path) makes the
             // DATA durable, but the name→inode link lives in the parent
-            // directory and needs its own fsync. Done on every (re)open
-            // rather than only first-create so a sync that fails here is
-            // retried on the next append — leaving no un-synced entry
-            // behind — instead of being skipped because the file now
-            // exists. No-op (zero syscall) when the flag is off.
-            if self.fsync_on_flush
+            // directory and needs its own fsync. Only when we just
+            // CREATED the file — a reopen of an existing (already
+            // durable-entry) file needs no re-sync. If the sync fails,
+            // remove the just-created empty file so the entry-sync is
+            // retried on the next append: leaving the file behind would
+            // flip `is_new_file` false next time and skip the sync,
+            // yielding an un-synced entry a later commit could rely on.
+            if is_new_file
                 && let Some(parent) = path.parent()
+                && let Err(e) = Self::sync_dir(parent)
             {
-                Self::sync_dir(parent)?;
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                return Err(e.into());
             }
 
             let mut bw = BufWriter::with_capacity(64 * 1024, file);
