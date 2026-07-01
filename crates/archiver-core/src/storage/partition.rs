@@ -117,6 +117,47 @@ pub fn recent_partitions(
     names
 }
 
+/// Compute the start of the partition CONTAINING `ts` — the lower bound of
+/// that partition's half-open time range `[partition_start, next_partition_start)`.
+pub fn partition_start(ts: SystemTime, granularity: PartitionGranularity) -> SystemTime {
+    let dt = chrono::DateTime::<Utc>::from(ts);
+
+    let start = match granularity {
+        PartitionGranularity::Year => NaiveDate::from_ymd_opt(dt.year(), 1, 1)
+            .expect("Jan 1 is always valid")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid")
+            .and_utc(),
+        PartitionGranularity::Month => NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
+            .expect("1st of month is always valid")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid")
+            .and_utc(),
+        PartitionGranularity::Day => dt
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid")
+            .and_utc(),
+        PartitionGranularity::Hour => dt
+            .date_naive()
+            .and_hms_opt(dt.hour(), 0, 0)
+            .expect("hour from valid DateTime")
+            .and_utc(),
+        PartitionGranularity::FiveMin
+        | PartitionGranularity::FifteenMin
+        | PartitionGranularity::ThirtyMin => {
+            let approx_min = granularity.approx_minutes();
+            let start_min = (dt.minute() / approx_min) * approx_min;
+            dt.date_naive()
+                .and_hms_opt(dt.hour(), start_min, 0)
+                .expect("aligned minute from valid DateTime")
+                .and_utc()
+        }
+    };
+
+    start.into()
+}
+
 /// Compute the start of the next partition after the one containing `ts`.
 pub fn next_partition_start(ts: SystemTime, granularity: PartitionGranularity) -> SystemTime {
     let dt = chrono::DateTime::<Utc>::from(ts);
@@ -253,6 +294,43 @@ mod tests {
         assert_eq!(
             partition_name(ts, PartitionGranularity::FifteenMin),
             "2024_03_05_09_45"
+        );
+    }
+
+    #[test]
+    fn test_partition_start_bounds_ts() {
+        let ts: SystemTime = Utc.with_ymd_and_hms(2024, 3, 5, 9, 47, 30).unwrap().into();
+        // Every granularity: partition_start <= ts < next_partition_start, and
+        // the start lands on the exact partition boundary.
+        let start = partition_start(ts, PartitionGranularity::Hour);
+        let end = next_partition_start(ts, PartitionGranularity::Hour);
+        assert!(
+            start <= ts && ts < end,
+            "ts falls in its own hour partition"
+        );
+        assert_eq!(
+            start,
+            Utc.with_ymd_and_hms(2024, 3, 5, 9, 0, 0).unwrap().into()
+        );
+        assert_eq!(
+            end,
+            Utc.with_ymd_and_hms(2024, 3, 5, 10, 0, 0).unwrap().into()
+        );
+        assert_eq!(
+            partition_start(ts, PartitionGranularity::Day),
+            Utc.with_ymd_and_hms(2024, 3, 5, 0, 0, 0).unwrap().into()
+        );
+        assert_eq!(
+            partition_start(ts, PartitionGranularity::Month),
+            Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap().into()
+        );
+        assert_eq!(
+            partition_start(ts, PartitionGranularity::Year),
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap().into()
+        );
+        assert_eq!(
+            partition_start(ts, PartitionGranularity::FifteenMin),
+            Utc.with_ymd_and_hms(2024, 3, 5, 9, 45, 0).unwrap().into()
         );
     }
 

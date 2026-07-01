@@ -676,7 +676,16 @@ impl EtlExecutor {
         // Guarded on `anchor > 0`: nothing sits below a zero anchor to dedup
         // against.
         let dest_ts: Option<HashSet<SystemTime>> = if dedup_against_dest && anchor > 0 {
-            Some(read_partition_timestamps(&d_path)?)
+            // Only D's timestamps within THIS source partition's own time range
+            // can collide with a source sample (disjoint sub-ranges), so bound
+            // the read to `[S_start, S_end)` — the slice that holds exactly this
+            // source's prior copy. first_sample is in this source's range, so
+            // its partition boundaries at the SOURCE granularity delimit it.
+            let src_g = self.source.partition_granularity();
+            let s_start = crate::storage::partition::partition_start(first_sample.timestamp, src_g);
+            let s_end =
+                crate::storage::partition::next_partition_start(first_sample.timestamp, src_g);
+            Some(read_partition_timestamps_in_range(&d_path, s_start, s_end)?)
         } else {
             None
         };
@@ -976,11 +985,25 @@ fn list_pb_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 /// Only called when D is known non-empty (`len_before > 0`), so a missing file
 /// or read error propagates (aborting the move, keeping the source for a retry)
 /// rather than silently producing a duplicate.
-fn read_partition_timestamps(path: &Path) -> anyhow::Result<HashSet<SystemTime>> {
+/// Collect the timestamps in dest partition `path` that fall in the half-open
+/// range `[lo, hi)`. Bounding to one source partition's range keeps the dedup
+/// set O(source partition) rather than O(dest partition): a coarse LTS-year D
+/// holds millions of samples, but — since each finer source covers a DISJOINT
+/// sub-range of D — only the one-finer-partition slice `[lo, hi)` that overlaps
+/// this source can collide with a source sample. Reading all of D would build a
+/// multi-hundred-MB set for nothing (and OOM a constrained node), and on a
+/// btime-less filesystem this dedup path runs on every committed-owner retry.
+fn read_partition_timestamps_in_range(
+    path: &Path,
+    lo: SystemTime,
+    hi: SystemTime,
+) -> anyhow::Result<HashSet<SystemTime>> {
     let mut reader = PbFileReader::open(path)?;
     let mut set = HashSet::new();
     while let Some(sample) = reader.next_event()? {
-        set.insert(sample.timestamp);
+        if sample.timestamp >= lo && sample.timestamp < hi {
+            set.insert(sample.timestamp);
+        }
     }
     Ok(set)
 }
