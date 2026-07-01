@@ -1970,8 +1970,17 @@ impl StoragePlugin for PlainPbStoragePlugin {
         // changes the parent dir from SIM/ to RING/).
         let (to_dir_part, _) = pv_file_parts(to);
         let to_dir = self.root_folder.join(&to_dir_part);
-        if !to_dir.as_os_str().is_empty() && !to_dir.exists() {
-            std::fs::create_dir_all(&to_dir)?;
+        if !to_dir.as_os_str().is_empty() {
+            if self.fsync_on_flush {
+                // Sync the whole chain (create_dir_all_synced is
+                // idempotent and never infers durability from exists()):
+                // a live append to `to` can be creating this dir
+                // concurrently, so an exists()-gated skip could leave an
+                // ancestor entry non-durable under a committed `to`.
+                self.create_dir_all_synced(&to_dir)?;
+            } else if !to_dir.exists() {
+                std::fs::create_dir_all(&to_dir)?;
+            }
         }
 
         let mut moved = 0u64;
@@ -1993,6 +2002,15 @@ impl StoragePlugin for PlainPbStoragePlugin {
             moved += 1;
         }
 
+        // Durability (destination): the renames added new directory
+        // entries in to_dir. Persist them before returning success — the
+        // caller commits `to`'s registry row on success, so a non-durable
+        // dest entry under a committed `to` would over-commit across a
+        // power loss (the FATAL class). No-op when fsync_on_flush is off.
+        if self.fsync_on_flush && !to_dir.as_os_str().is_empty() {
+            Self::sync_dir(&to_dir)?;
+        }
+
         // Clean up empty source directory + invalidate
         // known_dirs cache for it (same rationale as
         // delete_pv_data — a stale entry would make the next
@@ -2000,11 +2018,28 @@ impl StoragePlugin for PlainPbStoragePlugin {
         // hit ENOENT).
         let (from_dir_part, _) = pv_file_parts(from);
         let from_dir = self.root_folder.join(&from_dir_part);
+        // Durability (source): persist the entry removals the renames made
+        // in from_dir. Best-effort — a stale source entry is orphan data,
+        // not an over-commit (`from`'s registry row is removed by the
+        // rename). Skip when from_dir == to_dir (already synced above).
+        if self.fsync_on_flush
+            && !from_dir_part.as_os_str().is_empty()
+            && from_dir != to_dir
+            && from_dir.exists()
+        {
+            let _ = Self::sync_dir(&from_dir);
+        }
         if !from_dir_part.as_os_str().is_empty()
             && from_dir.exists()
             && std::fs::read_dir(&from_dir)?.next().is_none()
         {
             let _ = std::fs::remove_dir(&from_dir);
+            // Persist the directory removal via its parent (best-effort).
+            if self.fsync_on_flush
+                && let Some(parent) = from_dir.parent()
+            {
+                let _ = Self::sync_dir(parent);
+            }
             let mut dirs = self.known_dirs.lock().unwrap_or_else(|e| e.into_inner());
             dirs.remove(&from_dir);
         }

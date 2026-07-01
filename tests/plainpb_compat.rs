@@ -1488,3 +1488,43 @@ async fn fsync_on_flush_second_pv_sharing_prefix_still_persists() {
         );
     }
 }
+
+#[tokio::test]
+async fn fsync_on_flush_rename_persists_across_prefix() {
+    // Rename across prefixes (SIM:Sine -> RING:Current) under
+    // fsync_on_flush: the dest dir chain is created + synced, the moved
+    // entries are synced in to_dir, and the emptied source prefix dir is
+    // pruned + its parent synced. The renamed data must read back under
+    // the new name and be gone under the old — verifying the fsync
+    // rename path runs without error and preserves the move.
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour)
+            .with_fsync_on_flush(true);
+
+    let ts: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap().into();
+    let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(7.0));
+    plugin
+        .append_event("SIM:Sine", ArchDbType::ScalarDouble, &sample)
+        .await
+        .unwrap();
+    plugin.flush_ingest_writes().await.unwrap();
+
+    let moved = plugin.rename_pv("SIM:Sine", "RING:Current").await.unwrap();
+    assert_eq!(moved, 1, "exactly one partition file must move");
+
+    let start: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 10, 0, 0).unwrap().into();
+    let end: SystemTime = Utc.with_ymd_and_hms(2024, 6, 15, 11, 0, 0).unwrap().into();
+
+    let mut streams = plugin.get_data("RING:Current", start, end).await.unwrap();
+    assert!(
+        streams[0].next_event().unwrap().is_some(),
+        "sample must read back under the new name after an fsync rename"
+    );
+
+    let mut old = plugin.get_data("SIM:Sine", start, end).await.unwrap();
+    assert!(
+        old.is_empty() || old[0].next_event().unwrap().is_none(),
+        "old name must hold no data after rename"
+    );
+}
