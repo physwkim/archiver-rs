@@ -22,3 +22,6 @@ toml = { workspace = true }
 dashmap = { workspace = true }
 rusqlite = { workspace = true }
 metrics = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

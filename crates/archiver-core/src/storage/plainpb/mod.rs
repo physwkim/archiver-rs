@@ -869,6 +869,115 @@ impl PlainPbStoragePlugin {
         Self::unlink_idempotent(path)
     }
 
+    /// Roll a destination partition file back to a known-good byte
+    /// length, discarding any cached writer on it WITHOUT recording loss,
+    /// then truncate and (under `fsync_on_flush`) make the new length
+    /// durable.
+    ///
+    /// This is the ETL idempotency primitive: when a failed mid-copy
+    /// append left a partial tail on `path`, the mover truncates back to
+    /// the length recorded in its checkpoint before re-appending, so a
+    /// retry yields exactly one copy of each sample. The discarded buffer
+    /// is that failed append (or clean bytes already on disk), never
+    /// archive loss — so, unlike [`evict_writer_for_path`], this must NOT
+    /// record a dirty-loss marker or bump `archiver_pb_dirty_drop_loss_total`.
+    ///
+    /// The per-PV slot lock is held across the discard AND the `set_len`,
+    /// so a concurrent `append_event` for this PV cannot open a writer on
+    /// `path` in between. No parent-dir fsync: changing a file's length
+    /// adds or removes no directory entry.
+    ///
+    /// Idempotent: an absent file with `len == 0` is already at the target.
+    ///
+    /// Sync (blocking slot lock + truncate/fsync); ETL wraps it in
+    /// `spawn_blocking` so a runtime worker isn't held during the wait.
+    pub fn truncate_partition(&self, path: &Path, len: u64) -> std::io::Result<()> {
+        // Hold the per-PV slot lock (when the path decodes to a slotted
+        // PV) across the discard + truncate so no concurrent append can
+        // open a writer on `path` between the two.
+        let slot_arc = self.pv_name_from_path(path).and_then(|pv| {
+            let cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.get(&pv).cloned()
+        });
+        let mut slot_guard = slot_arc
+            .as_ref()
+            .map(|arc| arc.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(guard) = slot_guard.as_mut()
+            && guard
+                .writer
+                .as_ref()
+                .map(|cw| cw.path == path)
+                .unwrap_or(false)
+            && let Some(cached) = guard.writer.take()
+        {
+            // Discard the buffer WITHOUT recording loss: these bytes are a
+            // failed ETL append being truncated away, not archive loss.
+            // `into_parts` so `BufWriter::drop` can't re-issue a flush into
+            // the file we're about to truncate.
+            let (_file, _buffered) = cached.writer.into_parts();
+        }
+
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(file) => {
+                file.set_len(len)?;
+                if self.fsync_on_flush {
+                    file.sync_all()?;
+                }
+            }
+            // Absent file already at length 0 — nothing to truncate.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && len == 0 => {}
+            Err(e) => return Err(e),
+        }
+        // `slot_guard` (if any) releases here, after the truncate.
+        Ok(())
+    }
+
+    /// Durably create an ETL sidecar file (the `.etl_ckpt` checkpoint or
+    /// the `.etl_done` marker) with `contents`. Uses `create_new` (O_EXCL)
+    /// so an existing sidecar is never silently overwritten — the caller
+    /// decides whether an `AlreadyExists` is a real error. Under
+    /// `fsync_on_flush`, fsyncs the file then its parent directory so both
+    /// the bytes AND the directory entry are durable before returning; the
+    /// ETL commit ordering relies on a created sidecar being crash-visible.
+    pub fn create_etl_sidecar(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+        // The sidecar shares its directory with the partition file it
+        // guards. For a brand-new dest partition that directory may not
+        // exist yet (it is normally created by the first append), but the
+        // checkpoint must be created BEFORE any append — so create the
+        // directory durably here, or the O_EXCL open fails with NotFound.
+        self.ensure_parent_dir(path)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        f.write_all(contents)?;
+        if self.fsync_on_flush {
+            f.sync_all()?;
+            if let Some(parent) = path.parent() {
+                Self::sync_dir(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Durably remove an ETL sidecar file. An already-absent file is
+    /// success (idempotent recovery). Under `fsync_on_flush`, fsyncs the
+    /// parent directory so the removal is durable before returning.
+    pub fn remove_etl_sidecar(&self, path: &Path) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        if self.fsync_on_flush
+            && let Some(parent) = path.parent()
+        {
+            Self::sync_dir(parent)?;
+        }
+        Ok(())
+    }
+
     /// Ensure a parent directory exists, using a cached set to skip repeated syscalls.
     fn ensure_parent_dir(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
@@ -2131,5 +2240,80 @@ mod tests {
         // The raw-name comparison ETL used before is exactly what breaks
         // for a '/'-containing name.
         assert_ne!("RING/DCCT", canonical_pv_key("RING/DCCT"));
+    }
+
+    #[tokio::test]
+    async fn truncate_partition_discards_dirty_writer_without_loss() {
+        use crate::types::ArchiverValue;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin =
+            PlainPbStoragePlugin::new("STS", dir.path().to_path_buf(), PartitionGranularity::Hour);
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let sample = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(1.0));
+        let dbr = sample.value.db_type();
+
+        // Two appends leave a DIRTY (unflushed) cached writer on D.
+        plugin.append_event("PV:X", dbr, &sample).await.unwrap();
+        plugin.append_event("PV:X", dbr, &sample).await.unwrap();
+        let d = plugin.file_path_for("PV:X", ts);
+        assert!(d.exists());
+
+        // Truncate to 0 while the writer is still dirty.
+        plugin.truncate_partition(&d, 0).unwrap();
+
+        // The dirty buffer was DISCARDED, not surfaced as loss — an
+        // intentional truncate is not archive loss.
+        assert!(
+            plugin.take_loss_markers().is_empty(),
+            "intentional truncate must not record a dirty-loss marker"
+        );
+        assert_eq!(std::fs::metadata(&d).unwrap().len(), 0);
+
+        // The slot no longer holds a writer on the truncated path: a fresh
+        // append reopens the file rather than writing at a stale offset.
+        plugin.append_event("PV:X", dbr, &sample).await.unwrap();
+        plugin.flush_writes().await.unwrap();
+        assert!(std::fs::metadata(&d).unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn truncate_partition_absent_file_len_zero_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin =
+            PlainPbStoragePlugin::new("MTS", dir.path().to_path_buf(), PartitionGranularity::Day);
+        let missing = dir.path().join("PV:X:2024_01_01.pb");
+        // No file yet, target length 0 — idempotent no-op.
+        plugin.truncate_partition(&missing, 0).unwrap();
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn etl_sidecar_create_makes_missing_dir_and_remove_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin =
+            PlainPbStoragePlugin::new("MTS", dir.path().to_path_buf(), PartitionGranularity::Day);
+        // A brand-new dest partition's directory does not exist yet; the
+        // sidecar must be creatable BEFORE any append, so create_etl_sidecar
+        // creates the directory itself.
+        let ckpt = dir.path().join("sub/PV:X:2024_01_01.pb.etl_ckpt");
+        assert!(!ckpt.parent().unwrap().exists());
+        plugin
+            .create_etl_sidecar(&ckpt, b"42\nPV:X:2024_01_01_00.pb\n")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ckpt).unwrap(),
+            "42\nPV:X:2024_01_01_00.pb\n"
+        );
+
+        // O_EXCL: a second create over an existing sidecar is an error.
+        assert!(plugin.create_etl_sidecar(&ckpt, b"x").is_err());
+
+        // Remove is durable and idempotent — a second remove of an
+        // already-absent sidecar is success.
+        plugin.remove_etl_sidecar(&ckpt).unwrap();
+        assert!(!ckpt.exists());
+        plugin.remove_etl_sidecar(&ckpt).unwrap();
     }
 }
