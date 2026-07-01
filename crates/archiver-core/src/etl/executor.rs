@@ -319,7 +319,11 @@ impl EtlExecutor {
     /// Drives the `consolidateDataForPV` BPL endpoint.
     ///
     /// The same crash-safe move_file is reused, so partial failures leave
-    /// the source either fully migrated or untouched.
+    /// the source either fully migrated or untouched. Returns the number of
+    /// files ACTUALLY moved out — not the number attempted: a file `move_file`
+    /// defers (pending inbound checkpoint, another source owning the dest
+    /// checkpoint, or grown/live since the copy) stays in the source tier and
+    /// is not counted, so the operator is never told a deferred file migrated.
     pub async fn consolidate_pv(&self, pv: &str) -> anyhow::Result<u64> {
         // Flush any buffered writes for the source tier so we move
         // everything that's been written so far.
@@ -327,21 +331,28 @@ impl EtlExecutor {
 
         let pv_files =
             crate::storage::plainpb::list_pv_pb_files_pub(self.source.root_folder(), pv)?;
-        let total = pv_files.len() as u64;
+        let attempted = pv_files.len();
         info!(
             pv,
-            total,
+            attempted,
             source = self.source.name(),
             dest = self.dest.name(),
             "Consolidating PV files",
         );
+        let mut moved = 0u64;
         for file in &pv_files {
-            if let Err(e) = self.move_file(file).await {
-                warn!(?file, "consolidate_pv: failed to move file: {e}");
-                return Err(e);
+            match self.move_file(file).await {
+                Ok(true) => moved += 1,
+                Ok(false) => {
+                    debug!(?file, "consolidate_pv: deferred, left in source tier");
+                }
+                Err(e) => {
+                    warn!(?file, "consolidate_pv: failed to move file: {e}");
+                    return Err(e);
+                }
             }
         }
-        Ok(total)
+        Ok(moved)
     }
 
     /// Slot-locked, length-gated delete of a moved source partition, awaited
@@ -382,7 +393,14 @@ impl EtlExecutor {
     /// source is deleted LAST and only if it is byte-for-byte the partition
     /// that was copied (a concurrent backfill that grew it is refused), then
     /// the checkpoint is removed.
-    async fn move_file(&self, source_path: &Path) -> anyhow::Result<()> {
+    ///
+    /// Returns `Ok(true)` when the source was actually moved out (copied +
+    /// deleted) and `Ok(false)` when the move was DEFERRED — a pending inbound
+    /// checkpoint, another source owning the dest checkpoint, or a source that
+    /// grew / stayed live since the copy. A deferred file is left in the source
+    /// tier for a later cycle; callers that report progress must not count it
+    /// as moved.
+    async fn move_file(&self, source_path: &Path) -> anyhow::Result<bool> {
         // Serialize every move so no two run concurrently against the same
         // aggregating dest partition (see `move_gate`). Held across the
         // whole function — recovery included — so a move and a same-source
@@ -406,7 +424,7 @@ impl EtlExecutor {
                 ?inbound_ckpt,
                 "ETL deferring: partition has a pending inbound checkpoint"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         // Java parity (3daedae): the bulk COPY is wrapped in a timeout so a
@@ -452,8 +470,10 @@ impl EtlExecutor {
             // it, but still length-gated on `copied_len` so a backfill that
             // raced real samples in since the open is not deleted uncopied (it
             // fails the gate and is re-processed, now non-empty, next cycle).
-            Self::delete_moved_source(&source, &source_path, copied_len).await?;
-            return Ok(());
+            // The delete's own outcome IS the move outcome: removed ⇒ moved
+            // out, refused (raced backfill) ⇒ deferred.
+            let removed = Self::delete_moved_source(&source, &source_path, copied_len).await?;
+            return Ok(removed);
         };
 
         let d_path = dest.file_path_for(&desc.pv_name, first_sample.timestamp);
@@ -561,7 +581,7 @@ impl EtlExecutor {
                         owner = ck.owner,
                         "ETL deferring: another source owns the dest checkpoint"
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
                 // Orphaned checkpoint: the owner committed and was deleted but
                 // crashed before clearing it. Its committed tail in D is final;
@@ -677,7 +697,7 @@ impl EtlExecutor {
                 ?source_path,
                 "ETL deferring source delete: live/dirty or grew since the copy"
             );
-            return Ok(());
+            return Ok(false);
         }
         dest.remove_etl_sidecar(&ckpt)?;
         metrics::counter!(
@@ -686,7 +706,7 @@ impl EtlExecutor {
             "dest" => dest_name,
         )
         .increment(1);
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1812,6 +1832,43 @@ mod tests {
         mts_lts.move_file(&d_path).await.unwrap();
         assert!(!d_path.exists(), "unwedged: D moved out to LTS");
         assert_eq!(count_samples(&lts_path), 20, "D's samples reached LTS once");
+    }
+
+    #[tokio::test]
+    async fn consolidate_pv_counts_only_actually_moved_not_deferred() {
+        // Finding C: consolidate_pv is the count surfaced to the operator via
+        // the consolidateDataForPV endpoint. A file `move_file` DEFERS
+        // (Ok(false)) is left in the source tier — counting it as moved falsely
+        // claims a still-present file migrated. The count must be the number
+        // actually moved out, not the number attempted.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        // S_move: a normal source partition that migrates cleanly.
+        let a: Vec<_> = (0..10)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let s_move = write_source_partition(&src, pv, &a).await;
+        // S_defer: a source partition carrying a pending INBOUND checkpoint (a
+        // finer tier is mid-aggregation into it), so move_file defers it.
+        let b: Vec<_> = (0..10)
+            .map(|i| sample_at(BASE_SECS + 86_400 + i, i as f64))
+            .collect();
+        let s_defer = write_source_partition(&src, pv, &b).await;
+        src.create_etl_sidecar(
+            &s_defer.with_extension("pb.etl_ckpt"),
+            &ckpt_contents(CkptState::Copying, 0, "finer-owner.pb", Some(1)),
+        )
+        .unwrap();
+
+        let moved = exec.consolidate_pv(pv).await.unwrap();
+
+        assert_eq!(moved, 1, "only the clean file counts, not the deferred one");
+        assert!(!s_move.exists(), "clean source migrated out");
+        assert!(s_defer.exists(), "deferred source stays in the source tier");
     }
 
     #[tokio::test]
