@@ -485,17 +485,43 @@ impl PvRegistry {
     }
 
     /// Batch update last timestamps (for periodic flush).
+    ///
+    /// `last_timestamp` is the registry's record of the newest sample
+    /// durably archived for a PV; it MUST be non-decreasing. The registry
+    /// is the single owner of that value, so the monotonic invariant is
+    /// enforced HERE — at the write boundary — instead of trusting every
+    /// caller to pre-max. An out-of-order or stale commit (e.g. a late
+    /// flush-success report for a PV whose newer timestamp already
+    /// landed) is dropped rather than regressing the stored value
+    /// backwards, which would let retrieval and the next ETL scan see an
+    /// older `last_event` than data already on disk.
     pub fn batch_update_timestamps(&self, updates: &[(&str, SystemTime)]) -> anyhow::Result<()> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         let now = Utc::now().to_rfc3339();
         {
-            let mut stmt = tx.prepare(
+            let mut select = tx.prepare("SELECT last_timestamp FROM pv_info WHERE pv_name = ?1")?;
+            let mut update = tx.prepare(
                 "UPDATE pv_info SET last_timestamp = ?1, updated_at = ?2 WHERE pv_name = ?3",
             )?;
             for (pv_name, ts) in updates {
-                let dt = DateTime::<Utc>::from(*ts).to_rfc3339();
-                stmt.execute(params![dt, now, pv_name])?;
+                let new_dt = DateTime::<Utc>::from(*ts);
+                // Compare by PARSED instant, not RFC3339 string order:
+                // only advance when strictly newer. A NULL / missing /
+                // unparseable stored value has nothing valid to preserve,
+                // so it is overwritten.
+                let stored: Option<Option<String>> = select
+                    .query_row(params![pv_name], |row| row.get(0))
+                    .optional()?;
+                let advance = match stored {
+                    Some(Some(s)) => DateTime::parse_from_rfc3339(&s)
+                        .map(|cur| new_dt > cur.with_timezone(&Utc))
+                        .unwrap_or(true),
+                    _ => true,
+                };
+                if advance {
+                    update.execute(params![new_dt.to_rfc3339(), now, pv_name])?;
+                }
             }
         }
         tx.commit()?;
@@ -1111,6 +1137,40 @@ mod tests {
 
         let a = reg.get_pv("PV:A").unwrap().unwrap();
         assert!(a.last_timestamp.is_some());
+    }
+
+    #[test]
+    fn batch_update_timestamps_is_monotonic() {
+        let reg = PvRegistry::in_memory().unwrap();
+        reg.register_pv("PV:Mono", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+
+        // Whole-second instants so the rfc3339 round-trip is exact.
+        let t2 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000); // older
+        let t3 = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000_000); // newer
+
+        reg.batch_update_timestamps(&[("PV:Mono", t2)]).unwrap();
+        assert_eq!(
+            reg.get_pv("PV:Mono").unwrap().unwrap().last_timestamp,
+            Some(t2)
+        );
+
+        // An older (stale/out-of-order) commit must be dropped.
+        reg.batch_update_timestamps(&[("PV:Mono", t1)]).unwrap();
+        assert_eq!(
+            reg.get_pv("PV:Mono").unwrap().unwrap().last_timestamp,
+            Some(t2),
+            "older timestamp must not regress last_timestamp"
+        );
+
+        // A newer commit advances it.
+        reg.batch_update_timestamps(&[("PV:Mono", t3)]).unwrap();
+        assert_eq!(
+            reg.get_pv("PV:Mono").unwrap().unwrap().last_timestamp,
+            Some(t3),
+            "newer timestamp must advance last_timestamp"
+        );
     }
 
     #[test]
