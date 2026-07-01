@@ -789,6 +789,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn move_file_owner_retry_preserves_prior_source_truncates_only_partial() {
+        // The delicate case: truncate rolls D back to a NON-ZERO anchor
+        // (a prior source already committed into D). The retry must drop
+        // only S's failed partial past the anchor and re-append S once,
+        // leaving the prior source's samples byte-for-byte intact — never
+        // truncate to 0, never duplicate.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        // A prior source (hour 22) already aggregated into the same day D;
+        // S covers hour 23 and appends after it, so the anchor is > 0.
+        let prior: Vec<_> = (0..25)
+            .map(|i| sample_at(BASE_SECS + i, 100.0 + i as f64))
+            .collect();
+        let s: Vec<_> = (0..40)
+            .map(|i| sample_at(BASE_SECS + 3600 + i, i as f64))
+            .collect();
+        let s_path = write_source_partition(&src, pv, &s).await;
+        let d_path = dest.file_path_for(pv, s[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        let dbr = s[0].value.db_type();
+
+        // Commit the prior source into D, then record D's length: this is
+        // the byte boundary S's checkpoint anchors to.
+        for e in &prior {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let anchor = std::fs::metadata(&d_path).unwrap().len();
+        assert!(anchor > 0, "prior source yields a non-zero anchor");
+
+        // Stage S's failed mid-copy: a 15-sample partial appended PAST the
+        // anchor, plus S's owner checkpoint recorded at the anchor.
+        for e in &s[..15] {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let s_filename = s_path.file_name().unwrap().to_str().unwrap();
+        dest.create_etl_sidecar(&ckpt, format!("{anchor}\n{s_filename}\n").as_bytes())
+            .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        // 25 prior + 40 for S, each exactly once. A truncate-to-0 would
+        // give 40; a non-truncated partial would give 25 + 15 + 40 = 80.
+        assert_eq!(
+            count_samples(&d_path),
+            25 + 40,
+            "partial truncated at anchor>0; prior source preserved, S once"
+        );
+        assert!(!s_path.exists());
+        assert!(!ckpt.exists());
+    }
+
+    #[tokio::test]
     async fn move_file_defers_to_other_source_owning_checkpoint() {
         let tmp = tempfile::tempdir().unwrap();
         let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
