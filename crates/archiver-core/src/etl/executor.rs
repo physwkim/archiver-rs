@@ -529,55 +529,68 @@ impl EtlExecutor {
         // owner-retry we could not prove same-instance): D may already hold this
         // source's prior copy, so the copy below dedups against D's timestamps.
         let mut dedup_against_dest = false;
+        // Set to `Some(anchor_len)` by an owner-retry that must roll D back to
+        // its checkpoint anchor before re-appending. Hoisted OUT of the match so
+        // the truncate runs once, awaited to completion OUTSIDE the copy timeout
+        // (a detached `truncate_partition` could `set_len` D after the gate is
+        // released and roll a later move's bytes off D — silent loss).
+        let mut rollback_to: Option<u64> = None;
         let anchor = match read_ckpt(&ckpt) {
             Some(ck) if ck.owner == s_filename => {
-                // `Copying` proves the tail is a partial copy of THIS same
-                // instance (the source is deleted only after the `Committed`
-                // transition, so a `Copying` checkpoint means it was never
-                // deleted). `Committed` + btime match is likewise this
-                // instance's own final tail — re-copying it is idempotent.
-                // Either way rolling D back to the stored anchor is safe on ANY
-                // filesystem; btime is not load-bearing here.
                 let same_instance = matches!((ck.btime, s_btime), (Some(a), Some(b)) if a == b);
-                if ck.state == CkptState::Copying || same_instance {
-                    // Roll D back to the stored anchor (discarding the partial
-                    // or this-instance tail) and re-append below. KEEP the
-                    // checkpoint's anchor — it is the pre-append length and must
-                    // NOT be re-measured. Awaited to completion (never under the
-                    // copy timeout) so this truncate can't detach and fire after
-                    // the gate is released.
-                    let dest_for_trunc = dest.clone();
-                    let d_for_trunc = d_path.clone();
-                    let trunc_anchor = ck.anchor;
-                    tokio::task::spawn_blocking(move || {
-                        dest_for_trunc.truncate_partition(&d_for_trunc, trunc_anchor)
-                    })
-                    .await??;
+                if ck.dedup {
+                    // A persisted DEDUP re-copy (established from a `Committed`
+                    // owner-retry we could not prove same-instance). D holds a
+                    // preserved committed tail BELOW `anchor` that already
+                    // contains this source's prior copy; the tail `[anchor..]` is
+                    // this cycle's dedup-appended (re-derivable) samples, whether
+                    // the prior attempt stopped mid-copy (`Copying`) or after
+                    // commit (`Committed`, delete deferred). Roll D back to
+                    // `anchor` and re-copy WITH dedup — idempotent on ANY
+                    // filesystem, same-instance or re-created. Critically NOT the
+                    // blind re-append below: that would duplicate the
+                    // below-anchor committed tail a dedup checkpoint preserves.
+                    rollback_to = Some(ck.anchor);
+                    dedup_against_dest = true;
+                    ck.anchor
+                } else if ck.state == CkptState::Copying || same_instance {
+                    // Non-dedup: `[anchor..]` holds ALL of this source's
+                    // contribution — `Copying` is a partial copy of THIS instance
+                    // (the source is deleted only after the `Committed`
+                    // transition, so a `Copying` checkpoint was never deleted),
+                    // and `Committed` + btime match is this instance's own final
+                    // tail. Either way rolling D back to `anchor` and blind
+                    // re-appending is exact on ANY filesystem; btime is not
+                    // load-bearing. KEEP the checkpoint's anchor (the pre-append
+                    // length — must NOT be re-measured).
+                    rollback_to = Some(ck.anchor);
                     ck.anchor
                 } else {
                     // `Committed` + (btime mismatch, or btime unavailable →
                     // treated conservatively as re-created): the tail may belong
                     // to a deleted/older instance, so it must NEVER be truncated
                     // — that truncate is the btime-less silent loss this design
-                    // removes. Preserve the committed tail and anchor a FRESH
-                    // copy of the current source AFTER it. To keep the re-copy
-                    // idempotent WITHOUT btime, the copy below dedups against D:
-                    // if this is actually a same-instance retry (D already holds
-                    // this source's committed copy) every sample is skipped and
-                    // no duplicate is produced; a genuine re-created/backfill
-                    // source (disjoint, gap-fill, or superset) copies exactly its
-                    // not-yet-present samples. (No append has happened yet, so
-                    // re-establishing the checkpoint is crash-safe.)
+                    // removes. Preserve the committed tail and anchor a dedup
+                    // re-copy of the current source AFTER it. Persist the dedup
+                    // mode and transition ATOMICALLY (overwrite = tmp+rename): a
+                    // crash in this window leaves either the old `Committed`
+                    // (re-enters here) or the new dedup `Copying` (resumes as a
+                    // dedup re-copy) — never NO checkpoint, which a resume would
+                    // read as a dedup-off fresh copy and duplicate the preserved
+                    // tail. The dedup copy is idempotent WITHOUT btime: a true
+                    // same-instance retry skips every already-present sample (no
+                    // duplicate); a genuine re-created/backfill source (disjoint,
+                    // gap-fill, or superset) copies exactly its not-yet-present
+                    // samples (no loss). (No append has happened yet.)
                     warn!(
                         ?ckpt,
                         owner = ck.owner,
                         "ETL committed-checkpoint owner re-created (or btime unavailable); \
                          preserving its committed tail and re-anchoring (dedup re-copy)"
                     );
-                    dest.remove_etl_sidecar(&ckpt)?;
-                    dest.create_etl_sidecar(
+                    dest.overwrite_etl_sidecar(
                         &ckpt,
-                        &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime),
+                        &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime, true),
                     )?;
                     dedup_against_dest = true;
                     len_before
@@ -619,7 +632,7 @@ impl EtlExecutor {
                 dest.remove_etl_sidecar(&ckpt)?;
                 dest.create_etl_sidecar(
                     &ckpt,
-                    &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime),
+                    &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime, false),
                 )?;
                 len_before
             }
@@ -634,20 +647,35 @@ impl EtlExecutor {
                 }
                 dest.create_etl_sidecar(
                     &ckpt,
-                    &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime),
+                    &ckpt_contents(CkptState::Copying, len_before, &s_filename, s_btime, false),
                 )?;
                 len_before
             }
         };
 
+        // Roll D back to the checkpoint anchor for an owner-retry (dedup or
+        // non-dedup). Awaited to completion, never under the copy timeout — a
+        // detached `truncate_partition` could `set_len` D after the gate is
+        // released and roll a later move's committed bytes off D.
+        if let Some(anchor_len) = rollback_to {
+            let dest_for_trunc = dest.clone();
+            let d_for_trunc = d_path.clone();
+            tokio::task::spawn_blocking(move || {
+                dest_for_trunc.truncate_partition(&d_for_trunc, anchor_len)
+            })
+            .await??;
+        }
+
         // When appending over a preserved committed tail, read D's existing
-        // timestamps so the copy can skip any this source already contributed.
-        // Each finer source covers a DISJOINT time sub-range of D, so the only
-        // collisions are this source's own prior copy — a same-instance retry
-        // then copies nothing (no duplicate), while a re-created/backfill source
-        // copies exactly its new samples (no loss). Guarded on `len_before > 0`:
-        // an empty/absent D has nothing to dedup against.
-        let dest_ts: Option<HashSet<SystemTime>> = if dedup_against_dest && len_before > 0 {
+        // timestamps (now rolled back to `anchor`, so this reads exactly the
+        // preserved region `[0..anchor]`) so the copy can skip any this source
+        // already contributed. Each finer source covers a DISJOINT time
+        // sub-range of D, so the only collisions are this source's own prior
+        // copy — a same-instance retry then copies nothing (no duplicate), while
+        // a re-created/backfill source copies exactly its new samples (no loss).
+        // Guarded on `anchor > 0`: nothing sits below a zero anchor to dedup
+        // against.
+        let dest_ts: Option<HashSet<SystemTime>> = if dedup_against_dest && anchor > 0 {
             Some(read_partition_timestamps(&d_path)?)
         } else {
             None
@@ -709,9 +737,20 @@ impl EtlExecutor {
         // it. This step MUST be crash-atomic — a torn or vanished checkpoint at
         // this instant would let a retry read `None`/`Copying` and re-copy the
         // already-committed tail (a duplicate).
+        // Carry the dedup mode into `Committed`: if the delete defers (source
+        // live/grown) and this checkpoint is resumed, a dedup copy MUST resume
+        // as a dedup copy — a same-instance `Committed` resume would otherwise
+        // truncate to `anchor` and blind re-append, duplicating the preserved
+        // committed tail that sits below `anchor`.
         dest.overwrite_etl_sidecar(
             &ckpt,
-            &ckpt_contents(CkptState::Committed, anchor, &s_filename, s_btime),
+            &ckpt_contents(
+                CkptState::Committed,
+                anchor,
+                &s_filename,
+                s_btime,
+                dedup_against_dest,
+            ),
         )?;
 
         // Commit. The copy is durable and the checkpoint is `committed`. Two
@@ -766,7 +805,10 @@ enum CkptState {
     /// still on disk (the source is deleted only after the `Committed`
     /// transition), so its tail is provably a partial copy of the SAME source
     /// instance — truncating back to `anchor` is always safe, on any
-    /// filesystem, no btime needed.
+    /// filesystem, no btime needed. Whether the re-copy after that truncate
+    /// blind-appends or dedups is the ORTHOGONAL [`Ckpt::dedup`] mode, not the
+    /// state: a dedup `Copying` preserves this source's own committed tail
+    /// BELOW `anchor`, so its re-copy must dedup against D.
     Copying,
     /// The copy of `owner` FINISHED and is durable in D; the tail `[anchor..]`
     /// is FINAL and must NEVER be truncated. btime (when available) only
@@ -802,6 +844,15 @@ struct Ckpt {
     /// The owner's birth-time (btime) in ns, or `None` when the filesystem
     /// records no creation time.
     btime: Option<u128>,
+    /// The persisted copy MODE. `true` ⟺ the tail `[anchor..]` was appended
+    /// over a PRESERVED committed tail that already holds (some of) this
+    /// source's data — so a resume must re-copy WITH dedup, never blind-append
+    /// (that would duplicate the below-anchor tail). `false` ⟺ `[anchor..]`
+    /// holds ALL of this source's contribution (disjoint below), so a resume
+    /// truncates + blind re-appends. This is orthogonal to `state` and, unlike
+    /// the old in-memory flag, survives a crash/timeout so the mode is never
+    /// re-guessed on resume.
+    dedup: bool,
 }
 
 /// Serialize an ETL checkpoint sidecar, one field per line:
@@ -810,7 +861,10 @@ struct Ckpt {
 ///      contribution (the rollback point),
 ///   3. `owner` — the owning source partition's filename,
 ///   4. `btime` — the owner's birth-time in nanoseconds since the epoch, or
-///      empty when the filesystem records no creation time.
+///      empty when the filesystem records no creation time,
+///   5. `dedup` — `1` when the tail was appended over a preserved committed
+///      tail that overlaps this source (resume must re-copy WITH dedup), else
+///      `0`. Absent (a 4-line legacy checkpoint) parses as `0`.
 ///
 /// btime distinguishes THIS source instance from a same-named partition a
 /// backfill later re-creates: it changes on delete + re-create but NOT on a
@@ -820,9 +874,23 @@ struct Ckpt {
 /// tail is never truncated (no loss) and the re-copy is deduped against D (no
 /// duplicate). btime just lets a proven same-instance retry take the cheaper
 /// truncate-and-recopy path instead of the dedup one.
-fn ckpt_contents(state: CkptState, anchor: u64, owner: &str, owner_btime: Option<u128>) -> Vec<u8> {
+///
+/// `dedup` is the persisted copy MODE (see [`Ckpt::dedup`]): it — not `state`,
+/// not btime — is what tells a resume whether `[anchor..]` may be blind
+/// re-appended (mode `0`, tail disjoint below) or must be re-copied with dedup
+/// (mode `1`, this source's data also sits below `anchor`). Persisting it means
+/// an interrupted dedup re-copy resumes AS a dedup re-copy instead of a
+/// blind-append that would duplicate the preserved tail.
+fn ckpt_contents(
+    state: CkptState,
+    anchor: u64,
+    owner: &str,
+    owner_btime: Option<u128>,
+    dedup: bool,
+) -> Vec<u8> {
     let btime = owner_btime.map(|b| b.to_string()).unwrap_or_default();
-    format!("{}\n{anchor}\n{owner}\n{btime}\n", state.as_str()).into_bytes()
+    let dedup = if dedup { "1" } else { "0" };
+    format!("{}\n{anchor}\n{owner}\n{btime}\n{dedup}\n", state.as_str()).into_bytes()
 }
 
 /// Birth-time (btime) of a partition file in nanoseconds since the epoch, or
@@ -857,11 +925,15 @@ fn read_ckpt(path: &Path) -> Option<Ckpt> {
         return None;
     }
     let btime = lines.next().and_then(|l| l.trim().parse::<u128>().ok());
+    // 5th line is the persisted dedup mode; a legacy 4-line checkpoint (no
+    // line) parses as `false` (blind re-append), matching its old semantics.
+    let dedup = lines.next().map(|l| l.trim() == "1").unwrap_or(false);
     Some(Ckpt {
         state,
         anchor,
         owner,
         btime,
+        dedup,
     })
 }
 
@@ -1101,6 +1173,7 @@ mod tests {
                 0,
                 s_filename,
                 source_btime_nanos(&s_path),
+                false,
             ),
         )
         .unwrap();
@@ -1165,6 +1238,7 @@ mod tests {
                 anchor,
                 s_filename,
                 source_btime_nanos(&s_path),
+                false,
             ),
         )
         .unwrap();
@@ -1204,7 +1278,7 @@ mod tests {
         std::fs::write(&owner_path, b"partial").unwrap();
         dest.create_etl_sidecar(
             &ckpt,
-            &ckpt_contents(CkptState::Copying, 0, owner_name, None),
+            &ckpt_contents(CkptState::Copying, 0, owner_name, None, false),
         )
         .unwrap();
 
@@ -1386,6 +1460,7 @@ mod tests {
                 0,
                 s_filename,
                 source_btime_nanos(&s_path),
+                false,
             ),
         )
         .unwrap();
@@ -1435,7 +1510,13 @@ mod tests {
         let inbound_ckpt = s_path.with_extension("pb.etl_ckpt");
         src.create_etl_sidecar(
             &inbound_ckpt,
-            &ckpt_contents(CkptState::Copying, 0, "SimpleSine:2023_11_14_22.pb", None),
+            &ckpt_contents(
+                CkptState::Copying,
+                0,
+                "SimpleSine:2023_11_14_22.pb",
+                None,
+                false,
+            ),
         )
         .unwrap();
 
@@ -1588,7 +1669,7 @@ mod tests {
         // committed samples and this test would read 5.
         dest.create_etl_sidecar(
             &ckpt,
-            &ckpt_contents(CkptState::Committed, 0, s_filename, Some(1)),
+            &ckpt_contents(CkptState::Committed, 0, s_filename, Some(1), false),
         )
         .unwrap();
 
@@ -1641,6 +1722,7 @@ mod tests {
                 0,
                 s_filename,
                 source_btime_nanos(&s_path),
+                false,
             ),
         )
         .unwrap();
@@ -1700,7 +1782,7 @@ mod tests {
         let s_filename = s_path.file_name().unwrap().to_str().unwrap();
         dest.create_etl_sidecar(
             &ckpt,
-            &ckpt_contents(CkptState::Copying, 0, s_filename, None),
+            &ckpt_contents(CkptState::Copying, 0, s_filename, None, false),
         )
         .unwrap();
 
@@ -1747,7 +1829,7 @@ mod tests {
         let s_filename = s_path.file_name().unwrap().to_str().unwrap();
         dest.create_etl_sidecar(
             &ckpt,
-            &ckpt_contents(CkptState::Committed, 0, s_filename, None),
+            &ckpt_contents(CkptState::Committed, 0, s_filename, None, false),
         )
         .unwrap();
 
@@ -1803,7 +1885,7 @@ mod tests {
         // preserve tail + dedup re-copy.
         dest.create_etl_sidecar(
             &ckpt,
-            &ckpt_contents(CkptState::Committed, 0, s_filename, Some(1)),
+            &ckpt_contents(CkptState::Committed, 0, s_filename, Some(1), false),
         )
         .unwrap();
 
@@ -1854,7 +1936,7 @@ mod tests {
         let s_filename = s_path.file_name().unwrap().to_str().unwrap();
         dest.create_etl_sidecar(
             &ckpt,
-            &ckpt_contents(CkptState::Committed, 0, s_filename, Some(1)),
+            &ckpt_contents(CkptState::Committed, 0, s_filename, Some(1), false),
         )
         .unwrap();
 
@@ -1864,6 +1946,166 @@ mod tests {
             count_samples(&d_path),
             4 + 2,
             "gap-fillers [t5,t15] kept (absent from D) — no loss"
+        );
+        assert!(!s_path.exists());
+        assert!(!ckpt.exists());
+    }
+
+    #[tokio::test]
+    async fn move_file_dedup_copying_resume_same_instance_no_duplicate() {
+        // Round-6 Finding 1 (regression). An interrupted dedup re-copy: a
+        // `Committed` btime-less owner-retry entered the dedup branch (preserve
+        // tail + re-anchor), skipped every already-present sample, then
+        // crashed/timed-out BEFORE the `committed` transition — leaving a
+        // `Copying` checkpoint whose `dedup` mode is now PERSISTED and whose
+        // tail `[anchor..]` is empty (all skipped). The resume must re-copy WITH
+        // dedup (skip all → append nothing), not blind re-append the source
+        // after the anchor. Before `dedup` was persisted the resume read plain
+        // `Copying` and blind re-copied, duplicating the preserved tail (D→40).
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let samples: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        // D durably holds this source's committed 20; the source still holds the
+        // SAME 20 (this same instance, btime-less filesystem → None).
+        let s_path = write_source_partition(&src, pv, &samples).await;
+        let d_path = dest.file_path_for(pv, samples[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        let dbr = samples[0].value.db_type();
+        for e in &samples {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        // Anchor at D's full length: the preserved committed tail sits BELOW it,
+        // `[anchor..]` is empty (the interrupted dedup copy appended nothing).
+        let anchor = std::fs::metadata(&d_path).unwrap().len();
+        let s_filename = s_path.file_name().unwrap().to_str().unwrap();
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Copying, anchor, s_filename, None, true),
+        )
+        .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert_eq!(
+            count_samples(&d_path),
+            20,
+            "dedup Copying resume re-deduped (skipped all) — no dup (blind re-append would give 40)"
+        );
+        assert!(!s_path.exists(), "source moved out");
+        assert!(!ckpt.exists(), "checkpoint cleared on commit");
+    }
+
+    #[tokio::test]
+    async fn move_file_dedup_copying_resume_truncates_partial_and_rededuplicates() {
+        // Round-6 Finding 1, superset boundary. An interrupted dedup re-copy
+        // that HAD appended a partial tail past the anchor before dying. The
+        // resume must truncate that partial (this cycle's re-derivable work) and
+        // re-copy WITH dedup — skipping D's preserved [t0..t19] and re-appending
+        // exactly [t20..t24]. No duplicate of the preserved tail, no torn
+        // partial left behind.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let full: Vec<_> = (0..25)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let d_path = dest.file_path_for(pv, full[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        let dbr = full[0].value.db_type();
+        // D holds the preserved committed [t0..t19].
+        for e in &full[..20] {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let anchor = std::fs::metadata(&d_path).unwrap().len();
+        // An interrupted dedup copy had appended a partial [t20,t21] past anchor.
+        for e in &full[20..22] {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        // Source is the full superset [t0..t24].
+        let s_path = write_source_partition(&src, pv, &full).await;
+        let s_filename = s_path.file_name().unwrap().to_str().unwrap();
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Copying, anchor, s_filename, None, true),
+        )
+        .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert_eq!(
+            count_samples(&d_path),
+            25,
+            "partial [t20,t21] truncated, dedup re-copy skipped [t0..t19] + re-appended [t20..t24] — no dup, no loss"
+        );
+        assert!(!s_path.exists());
+        assert!(!ckpt.exists());
+    }
+
+    #[tokio::test]
+    async fn move_file_dedup_committed_resume_deferred_delete_no_duplicate() {
+        // Round-6 Finding 1, second reachability (no crash needed). A SUCCESSFUL
+        // dedup copy whose source delete DEFERRED (source live/grown). Cycle 1
+        // committed `Committed(dedup=1, anchor=len[t0..t19])` with btime present;
+        // the source is still on disk (same instance). On resume the persisted
+        // `dedup` mode routes it back through the dedup re-copy — NOT the
+        // `same_instance` truncate-to-anchor + blind re-append, which would
+        // duplicate the preserved [t0..t19] below the anchor (D→45).
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let full: Vec<_> = (0..25)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let d_path = dest.file_path_for(pv, full[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        let dbr = full[0].value.db_type();
+        // The completed dedup copy: D holds [t0..t19] preserved + [t20..t24]
+        // appended = [t0..t24]; `anchor` is the [t0..t19] boundary.
+        for e in &full[..20] {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let anchor = std::fs::metadata(&d_path).unwrap().len();
+        for e in &full[20..] {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        // Source still present (delete deferred), SAME instance (btime matches).
+        let s_path = write_source_partition(&src, pv, &full).await;
+        let s_filename = s_path.file_name().unwrap().to_str().unwrap();
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(
+                CkptState::Committed,
+                anchor,
+                s_filename,
+                source_btime_nanos(&s_path),
+                true,
+            ),
+        )
+        .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        assert_eq!(
+            count_samples(&d_path),
+            25,
+            "Committed+dedup deferred-delete resume re-deduped — no dup (same_instance blind re-append would give 45)"
         );
         assert!(!s_path.exists());
         assert!(!ckpt.exists());
@@ -1902,6 +2144,7 @@ mod tests {
                 0,
                 "SimpleSine:1999_01_01_00.pb",
                 Some(1),
+                false,
             ),
         )
         .unwrap();
@@ -1924,6 +2167,7 @@ mod tests {
                 0,
                 live_owner,
                 source_btime_nanos(&live_owner_path),
+                false,
             ),
         )
         .unwrap();
@@ -1973,6 +2217,7 @@ mod tests {
                 0,
                 "SimpleSine:1999_01_01_00.pb",
                 Some(1),
+                false,
             ),
         )
         .unwrap();
@@ -2031,7 +2276,13 @@ mod tests {
         // would truncate D to 0, wiping all 20 committed samples.
         dest.create_etl_sidecar(
             &ckpt,
-            &ckpt_contents(CkptState::Copying, 0, "SimpleSine:1999_01_01_00.pb", None),
+            &ckpt_contents(
+                CkptState::Copying,
+                0,
+                "SimpleSine:1999_01_01_00.pb",
+                None,
+                false,
+            ),
         )
         .unwrap();
         // Source root must exist for the reap to run.
@@ -2081,7 +2332,13 @@ mod tests {
         let ckpt = d_path.with_extension("pb.etl_ckpt");
         dest.create_etl_sidecar(
             &ckpt,
-            &ckpt_contents(CkptState::Committed, 0, "Orphan:1999_01_01_00.pb", None),
+            &ckpt_contents(
+                CkptState::Committed,
+                0,
+                "Orphan:1999_01_01_00.pb",
+                None,
+                false,
+            ),
         )
         .unwrap();
 
@@ -2126,7 +2383,7 @@ mod tests {
         let s_defer = write_source_partition(&src, pv, &b).await;
         src.create_etl_sidecar(
             &s_defer.with_extension("pb.etl_ckpt"),
-            &ckpt_contents(CkptState::Copying, 0, "finer-owner.pb", Some(1)),
+            &ckpt_contents(CkptState::Copying, 0, "finer-owner.pb", Some(1), false),
         )
         .unwrap();
 
