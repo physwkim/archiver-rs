@@ -1,22 +1,29 @@
 name: Cross-platform build
 
-# Build + test the whole workspace on Linux, macOS, and Windows, each on
-# both arm64 and x86_64. The strict lint gate (clippy `-D warnings`,
-# fmt, doctests) stays in `rust.yml` on Linux x86_64. This workflow
-# proves the code *compiles and tests* everywhere; `rust.yml` proves
-# it's *clean* on the canonical target.
+# Build + test the whole workspace on Linux and macOS, each on both
+# arm64 and x86_64. The strict lint gate (clippy `-D warnings`, fmt,
+# doctests) stays in `rust.yml` on Linux x86_64. This workflow proves
+# the code *compiles and tests* on every supported platform; `rust.yml`
+# proves it's *clean* on the canonical target.
+#
+# Windows is intentionally excluded. The EPICS Archiver Appliance is a
+# Linux/Unix server product, and EPICS PV names routinely contain ':'
+# (e.g. `SR:C01-MG:PS`), which is illegal in Windows filenames — the
+# on-disk PlainPB store maps PV names to file paths, so Windows is not a
+# viable target for the storage layer regardless of the fsync-on-a-dir
+# handle issue that also breaks it there.
 #
 # Hosted-runner notes:
-#   * `ubuntu-24.04-arm` / `windows-11-arm` are GitHub-hosted arm64
-#     runners — free for public repositories, billed for private ones.
+#   * `ubuntu-24.04-arm` is a GitHub-hosted arm64 runner — free for
+#     public repositories, billed for private ones.
 #   * `macos-15-intel` is an Intel (x86_64) macOS image; `macos-latest`
 #     (macos-15) is Apple Silicon (arm64).
 #
 # Native toolchain: the workspace pulls in `rusqlite` with the `bundled`
 # feature (compiles SQLite from C) and `ring` via rustls (compiles C/asm
 # per arch). Every GitHub-hosted image above ships a working C compiler
-# (gcc on Linux, clang on macOS, MSVC — incl. the ARM64 target — on
-# Windows), so no extra toolchain setup or vendored library is needed.
+# (gcc on Linux, clang on macOS), so no extra toolchain setup or vendored
+# library is needed.
 
 on:
   push:
@@ -52,10 +59,6 @@ jobs:
             os: macos-latest
           - name: macos-x86_64
             os: macos-15-intel
-          - name: windows-x86_64
-            os: windows-latest
-          - name: windows-arm64
-            os: windows-11-arm
 
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +69,7 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
-      # Per-platform target cache, keyed on the matrix name so the six
+      # Per-platform target cache, keyed on the matrix name so the four
       # cells don't clobber each other's cache.
       - uses: Swatinem/rust-cache@v2
         with:
