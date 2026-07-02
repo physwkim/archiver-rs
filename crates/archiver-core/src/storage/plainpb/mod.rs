@@ -789,25 +789,31 @@ impl PlainPbStoragePlugin {
     /// Unlink a `.pb` file, treating an already-absent file as success
     /// (another mover/recovery pass, or a manual `rm`, got there first).
     ///
-    /// Under `fsync_on_flush`, a real removal fsyncs the parent directory
-    /// BEFORE returning, so the unlink is durable. The ETL commit removes the
-    /// source partition BEFORE the guarding dest checkpoint, and the checkpoint
-    /// removal ([`remove_etl_sidecar`](Self::remove_etl_sidecar)) IS dir-fsync'd
-    /// — so without this the checkpoint's durable removal could outlive the
-    /// source's best-effort unlink across a power loss on INDEPENDENT
-    /// source/dest filesystems (the tiered-storage norm), resurrecting the
-    /// source with no guarding checkpoint; the next cycle then reads no
-    /// checkpoint and blind re-copies it into the dest — a silent duplicate.
-    /// Making the source unlink durable here orders "source durably gone"
-    /// BEFORE "checkpoint durably gone", so a crash can only ever leave the
-    /// safe pair (checkpoint present, source gone → a reaped/committed orphan),
-    /// never the duplicating pair (source present, checkpoint gone).
+    /// A real removal ALWAYS fsyncs the parent directory BEFORE returning, so
+    /// the unlink is durable. This is EXCLUSIVELY the ETL-commit source-delete
+    /// primitive (production callers all reach it via `remove_moved_partition`
+    /// / `remove_moved_partition_if_len`; operator whole-PV erase does not use
+    /// it), so its durability is part of the ETL IDEMPOTENCY chain, not the
+    /// loss-tolerant DATA policy `fsync_on_flush` governs — hence the fsync is
+    /// unconditional, matching the checkpoint sidecar primitives.
+    ///
+    /// The ETL commit removes the source partition BEFORE the guarding dest
+    /// checkpoint, and the checkpoint removal
+    /// ([`remove_etl_sidecar`](Self::remove_etl_sidecar)) is ALSO unconditionally
+    /// dir-fsync'd. Were this unlink left best-effort while the checkpoint
+    /// removal is durable, a power loss on INDEPENDENT source/dest filesystems
+    /// (the tiered-storage norm) could make the checkpoint's durable removal
+    /// outlive the source's best-effort unlink, resurrecting the source with no
+    /// guarding checkpoint; the next cycle then reads no checkpoint and blind
+    /// re-copies it into the dest — a silent duplicate. Making BOTH unlinks
+    /// unconditionally durable orders "source durably gone" BEFORE "checkpoint
+    /// durably gone" on EVERY config, so a crash can only ever leave the safe
+    /// pair (checkpoint present, source gone → a reaped/committed orphan), never
+    /// the duplicating pair (source present, checkpoint gone).
     fn unlink_idempotent(&self, path: &Path) -> std::io::Result<bool> {
         match std::fs::remove_file(path) {
             Ok(()) => {
-                if self.fsync_on_flush
-                    && let Some(parent) = path.parent()
-                {
+                if let Some(parent) = path.parent() {
                     Self::sync_dir(parent)?;
                 }
                 Ok(true)
@@ -1039,10 +1045,19 @@ impl PlainPbStoragePlugin {
     /// Durably create an ETL sidecar file (the `.etl_ckpt` checkpoint) with
     /// `contents`. Uses `create_new` (O_EXCL)
     /// so an existing sidecar is never silently overwritten — the caller
-    /// decides whether an `AlreadyExists` is a real error. Under
-    /// `fsync_on_flush`, fsyncs the file then its parent directory so both
-    /// the bytes AND the directory entry are durable before returning; the
-    /// ETL commit ordering relies on a created sidecar being crash-visible.
+    /// decides whether an `AlreadyExists` is a real error. ALWAYS fsyncs the
+    /// file then its parent directory so both the bytes AND the directory
+    /// entry are durable before returning; the ETL commit ordering relies on a
+    /// created sidecar being crash-visible before the first append byte.
+    ///
+    /// The fsync is DELIBERATELY unconditional — NOT gated on `fsync_on_flush`.
+    /// `fsync_on_flush` governs DATA durability, where losing recent samples on
+    /// power loss is the accepted default tradeoff. The checkpoint governs
+    /// IDEMPOTENCY: if it is only page-cache-resident, a power loss that keeps
+    /// D's appended bytes but drops the checkpoint lets the next cycle re-copy
+    /// the source over samples already in D — a DURABLE DUPLICATE in the
+    /// aggregated dest (finding #9). Duplication corrupts already-archived
+    /// history and must not be coupled to the loss-tolerant data policy.
     pub fn create_etl_sidecar(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
         // The sidecar shares its directory with the partition file it
         // guards. For a brand-new dest partition that directory may not
@@ -1056,27 +1071,28 @@ impl PlainPbStoragePlugin {
             .create_new(true)
             .open(path)?;
         f.write_all(contents)?;
-        if self.fsync_on_flush {
-            f.sync_all()?;
-            if let Some(parent) = path.parent() {
-                Self::sync_dir(parent)?;
-            }
+        f.sync_all()?;
+        if let Some(parent) = path.parent() {
+            Self::sync_dir(parent)?;
         }
         Ok(())
     }
 
     /// Durably remove an ETL sidecar file. An already-absent file is
-    /// success (idempotent recovery). Under `fsync_on_flush`, fsyncs the
-    /// parent directory so the removal is durable before returning.
+    /// success (idempotent recovery). ALWAYS fsyncs the parent directory so
+    /// the removal is durable before returning — the checkpoint removal is the
+    /// ETL commit's final step, and it MUST be ordered AFTER the durable source
+    /// unlink (see [`unlink_idempotent`](Self::unlink_idempotent)). Unconditional
+    /// for the same reason as [`create_etl_sidecar`](Self::create_etl_sidecar):
+    /// checkpoint durability enforces IDEMPOTENCY, not the loss-tolerant DATA
+    /// policy `fsync_on_flush` governs.
     pub fn remove_etl_sidecar(&self, path: &Path) -> std::io::Result<()> {
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        if self.fsync_on_flush
-            && let Some(parent) = path.parent()
-        {
+        if let Some(parent) = path.parent() {
             Self::sync_dir(parent)?;
         }
         Ok(())
@@ -1089,9 +1105,12 @@ impl PlainPbStoragePlugin {
     /// — never a torn or vanished file. Used for the checkpoint's
     /// `copying → committed` state transition, which MUST be crash-atomic: a
     /// partially-written or missing checkpoint at that instant would let a
-    /// retry re-copy an already-committed tail (a duplicate). Under
-    /// `fsync_on_flush`, fsyncs the temp file before the rename and the parent
-    /// directory after, so the replacement is durable before returning.
+    /// retry re-copy an already-committed tail (a duplicate). ALWAYS fsyncs the
+    /// temp file before the rename and the parent directory after, so the
+    /// replacement is durable before returning — unconditional for the same
+    /// reason as [`create_etl_sidecar`](Self::create_etl_sidecar): the
+    /// `copying → committed` transition is an IDEMPOTENCY guard, not
+    /// loss-tolerant data, so its durability must not depend on `fsync_on_flush`.
     pub fn overwrite_etl_sidecar(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
         self.ensure_parent_dir(path)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -1105,16 +1124,12 @@ impl PlainPbStoragePlugin {
                 .truncate(true)
                 .open(&tmp)?;
             f.write_all(contents)?;
-            if self.fsync_on_flush {
-                f.sync_all()?;
-            }
+            f.sync_all()?;
         }
         // Atomic on POSIX: the rename replaces `path` in a single step, so a
         // reader/recovery sees exactly one of the two versions.
         std::fs::rename(&tmp, path)?;
-        if self.fsync_on_flush
-            && let Some(parent) = path.parent()
-        {
+        if let Some(parent) = path.parent() {
             Self::sync_dir(parent)?;
         }
         Ok(())
@@ -2496,23 +2511,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_moved_partition_if_len_durable_delete_under_fsync() {
-        // Round-8 Finding 1 (durability ordering). The ETL commit removes the
-        // source BEFORE the guarding dest checkpoint, and the checkpoint removal
-        // is dir-fsync'd; so the source unlink must ALSO fsync its parent dir
-        // under fsync_on_flush, else a crash on independent source/dest
-        // filesystems could persist the checkpoint removal while the source
-        // unlink reverts → the source reappears with no guard and is blind
-        // re-copied (a duplicate). The crash-ordering itself is not observable
-        // in a unit test; this exercises the new fsync-on-unlink path end-to-end
+    async fn remove_moved_partition_if_len_unlink_durable_regardless_of_config() {
+        // Round-8 Finding 1 + finding #9 R9-B2 (durability ordering, decoupled).
+        // The ETL commit removes the source BEFORE the guarding dest checkpoint,
+        // and the checkpoint removal is dir-fsync'd UNCONDITIONALLY; so the
+        // source unlink must ALSO fsync its parent dir unconditionally, else a
+        // crash on independent source/dest filesystems could persist the
+        // checkpoint removal while the source unlink reverts → the source
+        // reappears with no guard and is blind re-copied (a duplicate). Because
+        // both are now decoupled from `fsync_on_flush`, this runs under the
+        // DEFAULT config (fsync_on_flush = false) — the config where the
+        // fsync-on-unlink previously did NOT happen and the ordering could
+        // invert. The crash-ordering itself is not observable in a unit test;
+        // this exercises the now-unconditional fsync-on-unlink path end-to-end
         // (real parent dir, no error, file actually gone).
         use crate::types::ArchiverValue;
         use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
+        // DEFAULT config: no `.with_fsync_on_flush(true)`. The unlink still
+        // fsyncs because ETL idempotency durability is decoupled from the data
+        // policy.
         let plugin =
-            PlainPbStoragePlugin::new("STS", dir.path().to_path_buf(), PartitionGranularity::Hour)
-                .with_fsync_on_flush(true);
+            PlainPbStoragePlugin::new("STS", dir.path().to_path_buf(), PartitionGranularity::Hour);
         let base = 1_700_000_000;
         let mk = |i: u64| {
             ArchiverSample::new(
@@ -2530,17 +2551,18 @@ mod tests {
         let path = plugin.file_path_for(pv, mk(0).timestamp);
         let cur = std::fs::metadata(&path).unwrap().len();
 
-        // Exact-length, clean → durable unlink (fsyncs the STS partition dir).
+        // Exact-length, clean → durable unlink (fsyncs the STS partition dir
+        // even under the default config).
         assert!(
             plugin.remove_moved_partition_if_len(&path, cur).unwrap(),
-            "unchanged source deleted under fsync_on_flush"
+            "unchanged source deleted (durable unlink, default config)"
         );
         assert!(!path.exists(), "removed, and the removal was dir-fsync'd");
 
         // Idempotent success once already gone (no double-fsync error).
         assert!(
             plugin.remove_moved_partition_if_len(&path, cur).unwrap(),
-            "already-absent is idempotent success under fsync_on_flush"
+            "already-absent is idempotent success"
         );
     }
 
