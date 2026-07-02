@@ -791,9 +791,21 @@ impl EtlExecutor {
                 dest.append_event_with_meta(&desc.pv_name, dbr_type, &sample, &append_meta)
                     .await?;
             }
-            // Durability BEFORE the commit: flush + (under fsync_on_flush)
-            // fsync D so the copy survives a crash before we delete the source.
+            // Durability BEFORE the commit. Flush all dest writers, then fsync
+            // D's data AND its directory entry UNCONDITIONALLY so the copy
+            // survives a crash before we delete the source. The copied samples
+            // are already-archived history being RELOCATED, not loss-tolerant
+            // fresh ingest — and the source delete is now unconditionally
+            // durable, so once it runs there is no original left to re-copy
+            // from. Gating D's durability on `fsync_on_flush` (as the ordinary
+            // flush path is) would, on the default config, leave a window where
+            // a power loss after the durable source delete permanently loses the
+            // copy (finding #9 R10). So decouple it, exactly as the checkpoint
+            // sidecar and source unlink were decoupled.
             dest.flush_writes().await?;
+            dest.sync_partition_durable(&d_path).map_err(|e| {
+                anyhow::anyhow!("ETL: durable-sync of dest partition {d_path:?} failed: {e}")
+            })?;
             anyhow::Ok(())
         })
         .await

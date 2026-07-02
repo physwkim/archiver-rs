@@ -1042,6 +1042,64 @@ impl PlainPbStoragePlugin {
         Ok(())
     }
 
+    /// Durably persist an ETL dest partition's copied bytes AND its directory
+    /// entry, UNCONDITIONALLY (independent of `fsync_on_flush`).
+    ///
+    /// The ETL copy calls this after appending a source partition into the
+    /// aggregating dest `path`, and BEFORE it transitions the checkpoint to
+    /// `Committed` and deletes the (already-durable) source. The copied samples
+    /// are already-archived history being RELOCATED, not loss-tolerant fresh
+    /// ingest: once the durable source original is deleted there is no copy to
+    /// recover from, so the aggregated copy MUST be durable in `path` first.
+    /// Gating this on `fsync_on_flush` (as the ordinary flush path is) would, on
+    /// the default config, leave a window where a power loss after the
+    /// now-unconditionally-durable source delete permanently loses the copy —
+    /// silent corruption of archived history (finding #9). Same decoupling
+    /// rationale as the checkpoint sidecar and source-unlink primitives: this is
+    /// the ETL no-loss/idempotency chain, not the loss-tolerant data policy.
+    ///
+    /// Flushes any cached writer on `path` under the per-PV slot lock (so its
+    /// buffered tail reaches the file before the `sync_all`, and no concurrent
+    /// append interleaves), then fsyncs the file and its parent directory. The
+    /// parent-dir fsync makes a brand-new `path`'s own entry durable too.
+    pub fn sync_partition_durable(&self, path: &Path) -> std::io::Result<()> {
+        // If a writer is cached on this exact path, flush its buffer to the
+        // file and fsync it under the slot lock.
+        if let Some(pv) = self.pv_name_from_path(path) {
+            let slot_arc = {
+                let cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+                cache.get(&pv).cloned()
+            };
+            if let Some(arc) = slot_arc {
+                let mut slot = arc.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(cached) = slot.writer.as_mut()
+                    && cached.path == path
+                {
+                    cached.writer.flush()?;
+                    cached.writer.get_ref().sync_all()?;
+                    cached.dirty = false;
+                    if let Some(parent) = path.parent() {
+                        Self::sync_dir(parent)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        // No cached writer on `path` (already evicted/flushed, or the path
+        // decodes to no PV): the bytes are on disk — fsync the file and its dir.
+        match std::fs::File::open(path) {
+            Ok(f) => {
+                f.sync_all()?;
+                if let Some(parent) = path.parent() {
+                    Self::sync_dir(parent)?;
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Durably create an ETL sidecar file (the `.etl_ckpt` checkpoint) with
     /// `contents`. Uses `create_new` (O_EXCL)
     /// so an existing sidecar is never silently overwritten — the caller
@@ -2564,6 +2622,61 @@ mod tests {
             plugin.remove_moved_partition_if_len(&path, cur).unwrap(),
             "already-absent is idempotent success"
         );
+    }
+
+    #[tokio::test]
+    async fn sync_partition_durable_persists_copy_under_default_config() {
+        // finding #9 R10: the ETL copy's dest DATA must be durable before the
+        // (now unconditionally durable) source delete, independent of
+        // fsync_on_flush — else a power loss after the delete loses the
+        // relocated copy (already-archived history), which no source remains to
+        // re-copy. The fsync itself is not observable in a unit test; this runs
+        // under the DEFAULT config (fsync_on_flush = false) and exercises the
+        // flush + sync_all + parent-dir-fsync path end-to-end: no error, data
+        // intact, and an absent path is idempotent success.
+        use crate::types::ArchiverValue;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        // DEFAULT config: no `.with_fsync_on_flush(true)`. The partition is
+        // still durably synced because ETL copy durability is decoupled from
+        // the data policy.
+        let plugin =
+            PlainPbStoragePlugin::new("MTS", dir.path().to_path_buf(), PartitionGranularity::Day);
+        let base = 1_700_000_000;
+        let mk = |i: u64| {
+            ArchiverSample::new(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(base + i),
+                ArchiverValue::ScalarDouble(i as f64),
+            )
+        };
+        let dbr = mk(0).value.db_type();
+        let pv = "PV:X";
+        for i in 0..5 {
+            plugin.append_event(pv, dbr, &mk(i)).await.unwrap();
+        }
+        let path = plugin.file_path_for(pv, mk(0).timestamp);
+
+        // Cached-writer path: a dirty writer is still open on `path`; the sync
+        // flushes its buffer to the file, then fsyncs file + dir.
+        plugin.sync_partition_durable(&path).unwrap();
+        assert!(path.exists(), "partition present after durable sync");
+        let len_after = std::fs::metadata(&path).unwrap().len();
+        assert!(len_after > 0, "copied bytes are on disk after durable sync");
+
+        // Re-sync is a no-op-safe repeat (buffer already flushed): still Ok,
+        // length unchanged.
+        plugin.sync_partition_durable(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len_after,
+            "re-sync does not change the file"
+        );
+
+        // Absent path (no cached writer, File::open NotFound) → idempotent Ok.
+        let missing = plugin.file_path_for(pv, mk(10_000_000).timestamp);
+        assert!(!missing.exists());
+        plugin.sync_partition_durable(&missing).unwrap();
     }
 
     #[test]
