@@ -820,11 +820,13 @@ impl EtlExecutor {
         // it. This step MUST be crash-atomic — a torn or vanished checkpoint at
         // this instant would let a retry read `None`/`Copying` and re-copy the
         // already-committed tail (a duplicate).
-        // Carry the dedup mode into `Committed`: if the delete defers (source
-        // live/grown) and this checkpoint is resumed, a dedup copy MUST resume
-        // as a dedup copy — a same-instance `Committed` resume would otherwise
-        // truncate to `anchor` and blind re-append, duplicating the preserved
-        // committed tail that sits below `anchor`.
+        // Record the dedup mode. A `Committed` resume is gated on `state` alone
+        // — it ALWAYS preserves D and dedup-re-copies the source (see the
+        // owner-match arm above), so it does NOT consult this stored flag; on a
+        // `Committed` checkpoint the field is informational. It is
+        // decision-load-bearing only on a `Copying` checkpoint, where it selects
+        // blind vs dedup re-copy of the partial tail. Written faithfully here so
+        // the checkpoint records what this copy actually did.
         dest.overwrite_etl_sidecar(
             &ckpt,
             &ckpt_contents(
