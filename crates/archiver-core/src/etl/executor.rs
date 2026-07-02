@@ -556,10 +556,13 @@ impl EtlExecutor {
         // `<D>.pb.etl_ckpt` present ⟺ a copy of `owner` into D is in progress
         // (`Copying`) or finished-but-pending-delete (`Committed`).
         //
-        // Set when we append over a PRESERVED committed tail (any `Committed`
-        // owner-retry, or a v0.4.0-marker'd source whose copy is already in D):
-        // D may already hold this source's prior copy, so the copy below dedups
-        // against D's timestamps.
+        // Set when the copy below must dedup against D's existing timestamps
+        // rather than blind-append: a `Committed` owner-retry (preserve the
+        // committed tail, re-copy the source after it), a resumed dedup `Copying`
+        // (a `Committed`→dedup transition that crashed mid-copy, persisted as
+        // `Copying`/dedup=1), or a v0.4.0-marker'd source whose copy is already
+        // in D. D may already hold this source's prior copy, so the copy below
+        // dedups against D's timestamps.
         let mut dedup_against_dest = false;
         // Set to `Some(anchor_len)` by an owner-retry that must roll D back to
         // its checkpoint anchor before re-appending. Hoisted OUT of the match so
@@ -569,31 +572,23 @@ impl EtlExecutor {
         let mut rollback_to: Option<u64> = None;
         let anchor = match read_ckpt(&ckpt) {
             Some(ck) if ck.owner == s_filename => {
-                if ck.dedup {
-                    // A persisted DEDUP re-copy (established from a `Committed`
-                    // owner-retry). D holds a preserved committed tail BELOW
-                    // `anchor` that already contains this source's prior copy; the
-                    // tail `[anchor..]` is this cycle's dedup-appended
-                    // (re-derivable) samples, whether the prior attempt stopped
-                    // mid-copy (`Copying`) or after commit (`Committed`, delete
-                    // deferred). Roll D back to `anchor` and re-copy WITH dedup —
-                    // idempotent on ANY filesystem, same-instance or re-created.
-                    // Critically NOT the blind re-append below: that would
-                    // duplicate the below-anchor committed tail a dedup checkpoint
-                    // preserves.
-                    rollback_to = Some(ck.anchor);
-                    dedup_against_dest = true;
-                    ck.anchor
-                } else if ck.state == CkptState::Copying {
+                if ck.state == CkptState::Copying {
                     // `Copying`: `[anchor..]` is a PARTIAL copy of THIS instance.
                     // A source is deleted only AFTER its `Committed` transition, so
                     // a `Copying` checkpoint proves its source was never deleted —
                     // this is necessarily the same instance and `[anchor..]` holds
-                    // all (and only) its contribution. Rolling D back to `anchor`
-                    // and blind re-appending is exact on ANY filesystem, no btime
-                    // and no dedup needed. KEEP the checkpoint's anchor (the
-                    // pre-append length — must NOT be re-measured).
+                    // all (and only) its contribution. Roll D back to `anchor` and
+                    // re-copy; exact on ANY filesystem, no btime needed. `state`,
+                    // and ONLY `state`, gates the truncate — NEVER `dedup`: the
+                    // persisted `dedup` mode says only HOW this cycle re-copies
+                    // (dedup=1 when a `Committed`→dedup transition crashed mid-copy
+                    // and left `Copying`/dedup=1; dedup=0 for a plain partial), not
+                    // WHETHER to truncate. Both re-derive `[anchor..]` from the
+                    // proven same-instance source, so the truncate is loss-free
+                    // either way. KEEP the checkpoint's anchor (the pre-append
+                    // length — must NOT be re-measured).
                     rollback_to = Some(ck.anchor);
+                    dedup_against_dest = ck.dedup;
                     ck.anchor
                 } else {
                     // `Committed`: the copy finished, so `[anchor..]` is a
@@ -602,22 +597,28 @@ impl EtlExecutor {
                     // window), and nothing on disk can reliably prove it is or
                     // isn't the same instance (a filesystem's birth time may be
                     // coarse, constant/synthetic, or absent), so it must NEVER be
-                    // truncated — a wrong truncate here is silent loss. `state`,
-                    // and only `state`, gates the truncate: a `Committed` tail is
-                    // ALWAYS preserved and the current source is dedup-re-copied
-                    // AFTER it, uniformly on every filesystem. Persist the dedup
-                    // mode and transition ATOMICALLY (overwrite = tmp+rename): a
-                    // crash in this window leaves either the old `Committed`
-                    // (re-enters here) or the new dedup `Copying` (resumes as a
-                    // dedup re-copy) — never NO checkpoint, which a resume would
-                    // read as a dedup-off fresh copy and duplicate the preserved
-                    // tail. The dedup copy is idempotent: a true same-instance
-                    // retry (crash before the source delete, or a deferred delete
-                    // of a grown source) skips every already-present sample —
-                    // copying nothing, or only a grown tail; a genuine
-                    // re-created/backfill source (disjoint, gap-fill, or superset)
-                    // copies exactly its not-yet-present samples (no loss). (No
-                    // append has happened yet.)
+                    // truncated — a wrong truncate here is silent loss. This holds
+                    // for a `dedup` (=1) `Committed` tail too: a re-created SUBSET
+                    // or gap-fill source does NOT re-derive the committed
+                    // `[anchor..]`, so rolling back to `anchor` (as gating the
+                    // truncate on `dedup` rather than `state` would) drops
+                    // committed samples the current source no longer holds.
+                    // `state`, and only `state`, gates the truncate: a `Committed`
+                    // tail is ALWAYS preserved — regardless of the persisted dedup
+                    // mode — and the current source is dedup-re-copied AFTER it,
+                    // uniformly on every filesystem. Persist the dedup mode and
+                    // transition ATOMICALLY (overwrite = tmp+rename): a crash in
+                    // this window leaves either the old `Committed` (re-enters
+                    // here) or the new dedup `Copying` (resumes as a dedup re-copy)
+                    // — never NO checkpoint, which a resume would read as a
+                    // dedup-off fresh copy and duplicate the preserved tail. The
+                    // dedup copy is idempotent: a true same-instance retry (crash
+                    // before the source delete, or a deferred delete of a grown
+                    // source) skips every already-present sample — copying nothing,
+                    // or only a grown tail; a genuine re-created/backfill source
+                    // (disjoint, gap-fill, or superset) copies exactly its
+                    // not-yet-present samples (no loss). (No append has happened
+                    // yet.)
                     debug!(
                         ?ckpt,
                         owner = ck.owner,
@@ -2145,6 +2146,69 @@ mod tests {
             count_samples(&d_path),
             25,
             "Committed+dedup deferred-delete resume re-deduped — no dup (a blind re-append would give 45)"
+        );
+        assert!(!s_path.exists());
+        assert!(!ckpt.exists());
+    }
+
+    #[tokio::test]
+    async fn move_file_committed_dedup_recreated_subset_source_never_truncates_tail() {
+        // Round-10 protocol Finding 1 (silent loss of committed archive data). A
+        // `Committed`/dedup=1 checkpoint whose `anchor` sits BELOW a committed
+        // tail, whose owner source was deleted (a crash in the
+        // delete→uncheckpoint window) then RE-CREATED as a gap-fill SUBSET that
+        // no longer holds the tail's samples. The truncate is gated on `state`,
+        // and ONLY `state`: a `Committed` tail is NEVER rolled back. Gating it on
+        // `dedup` (the pre-fix bug) would roll D back to `anchor`, dropping the
+        // committed tail [t20..t24] the re-created source cannot re-derive —
+        // silent loss. Correct behavior: preserve ALL of D and dedup-re-copy the
+        // subset AFTER it.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let pv = "SimpleSine";
+        let full: Vec<_> = (0..25)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let d_path = dest.file_path_for(pv, full[0].timestamp);
+        let ckpt = d_path.with_extension("pb.etl_ckpt");
+        let dbr = full[0].value.db_type();
+        // D holds [t0..t19] below `anchor` + a committed tail [t20..t24].
+        for e in &full[..20] {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+        let anchor = std::fs::metadata(&d_path).unwrap().len();
+        for e in &full[20..] {
+            dest.append_event(pv, dbr, e).await.unwrap();
+        }
+        dest.flush_writes().await.unwrap();
+
+        // The owner source was deleted then re-created as a gap-fill SUBSET — a
+        // single fresh backfilled sample in the same hour (so the same source
+        // filename / checkpoint owner), NOT the [t20..t24] committed tail.
+        let subset = vec![sample_at(BASE_SECS + 30, 30.0)];
+        let s_path = write_source_partition(&src, pv, &subset).await;
+        let s_filename = s_path.file_name().unwrap().to_str().unwrap();
+        dest.create_etl_sidecar(
+            &ckpt,
+            &ckpt_contents(CkptState::Committed, anchor, s_filename, true),
+        )
+        .unwrap();
+
+        exec.move_file(&s_path).await.unwrap();
+
+        // Committed tail [t20..t24] survives (never truncated); the subset's
+        // fresh sample is dedup-appended after it. D = 25 (t0..t24) + 1 = 26.
+        // The pre-fix `dedup`-gated truncate rolled D back to `anchor` =
+        // |t0..t19|, dropping the 5 tail samples → 21.
+        assert_eq!(
+            count_samples(&d_path),
+            26,
+            "committed tail preserved + subset appended (26); a dedup-gated \
+             truncate would drop the 5 tail samples (21)"
         );
         assert!(!s_path.exists());
         assert!(!ckpt.exists());
