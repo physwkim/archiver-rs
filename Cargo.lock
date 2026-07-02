@@ -939,9 +939,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
-version = "0.20.3"
+version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a052723658d977d125e13dae83470f4193ec2688fef9adcf3e2a0a222387e8bc"
+checksum = "758bf8455add8561007f93470538a52683ef064d6d2fa39edb524c486ffd8546"
 dependencies = [
  "epics-base-rs",
  "epics-ca-rs",
