@@ -1117,13 +1117,28 @@ impl PlainPbStoragePlugin {
     /// aggregated dest (finding #9). Duplication corrupts already-archived
     /// history and must not be coupled to the loss-tolerant data policy.
     pub fn create_etl_sidecar(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
-        // The sidecar shares its directory with the partition file it
-        // guards. For a brand-new dest partition that directory may not
-        // exist yet (it is normally created by the first append), but the
-        // checkpoint must be created BEFORE any append — so create the
-        // directory durably here, or the O_EXCL open fails with NotFound.
-        self.ensure_parent_dir(path)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // The sidecar shares its directory with the partition file it guards.
+        // For a brand-new dest partition that directory may not exist yet (it is
+        // normally created by the first append), but the checkpoint must be
+        // created BEFORE any append — so create the directory chain here, and
+        // DURABLY (fsync each level), UNCONDITIONALLY: this is the first op to
+        // create the dest-partition directory, and the checkpoint + D that share
+        // it must be crash-reachable before the source is deleted. A plain
+        // (page-cache-only) `create_dir_all` under the default config could let
+        // the directory's own entry vanish on a power loss after the durable
+        // source delete, taking D and the checkpoint with it — a loss no source
+        // remains to re-copy from. Same no-loss-chain rationale as the
+        // unconditional sidecar/data fsyncs; not gated on `fsync_on_flush`.
+        if let Some(parent) = path.parent() {
+            // `create_dir_all_synced` builds only the levels UNDER `root_folder`
+            // (it assumes root itself already exists — production creates it at
+            // startup). Create the full chain first so a fresh tree still works,
+            // then re-walk it durably: `create_dir_all_synced` fsyncs each
+            // level's entry (the redundant per-level create is tolerated as
+            // `AlreadyExists`), making the directory chain crash-reachable.
+            std::fs::create_dir_all(parent)?;
+            self.create_dir_all_synced(parent)?;
+        }
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
