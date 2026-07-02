@@ -263,7 +263,7 @@ impl EtlExecutor {
                     // checkpoint on a terminal partition wedges the next tier
                     // just as an orphan does.
                     warn!(?ckpt_path, "ETL reaping torn dest checkpoint");
-                    self.dest.remove_etl_sidecar(&ckpt_path)?;
+                    Self::remove_ckpt_off_worker(&self.dest, &ckpt_path).await?;
                     continue;
                 }
             };
@@ -310,7 +310,7 @@ impl EtlExecutor {
                 state = ck.state.as_str(),
                 "ETL reaping orphaned dest checkpoint (owner source gone)"
             );
-            self.dest.remove_etl_sidecar(&ckpt_path)?;
+            Self::remove_ckpt_off_worker(&self.dest, &ckpt_path).await?;
         }
         Ok(())
     }
@@ -391,6 +391,75 @@ impl EtlExecutor {
                 "ETL source-delete task panicked for {path:?}: {e}"
             )),
         }
+    }
+
+    /// Run a blocking, unconditionally-fsyncing dest checkpoint op OFF the
+    /// runtime worker. The ETL no-loss chain fsyncs its sidecar
+    /// create/overwrite/remove and `sync_partition_durable` UNCONDITIONALLY
+    /// (decoupled from `fsync_on_flush`); run inline on a tokio worker, a
+    /// blocking `fsync` on a hung mount would wedge that worker — and the copy
+    /// timeout cannot elapse-cancel a thread stuck in a blocking syscall.
+    /// `spawn_blocking` keeps the fsync on the blocking pool, matching the
+    /// discipline already used for `truncate_partition`/`delete_moved_source`.
+    ///
+    /// Every caller `.await`s to completion. The MUTATING wrappers
+    /// (create/overwrite/remove) run only OUTSIDE the copy timeout, so a
+    /// timeout-elapse can never detach a mutation past `_gate` (see the detach
+    /// note in `move_file`); `sync_partition_off_worker` runs inside the
+    /// timeout but is non-mutating (fsync only), so a detached-by-timeout sync
+    /// is harmless.
+    async fn ckpt_blocking<F>(what: &'static str, op: F) -> anyhow::Result<()>
+    where
+        F: FnOnce() -> std::io::Result<()> + Send + 'static,
+    {
+        match tokio::task::spawn_blocking(op).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow::anyhow!("ETL {what} failed: {e}")),
+            Err(e) => Err(anyhow::anyhow!("ETL {what} task panicked: {e}")),
+        }
+    }
+
+    async fn create_ckpt_off_worker(
+        dest: &Arc<PlainPbStoragePlugin>,
+        ckpt: &Path,
+        contents: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let (dest, ckpt) = (dest.clone(), ckpt.to_path_buf());
+        Self::ckpt_blocking("create checkpoint", move || {
+            dest.create_etl_sidecar(&ckpt, &contents)
+        })
+        .await
+    }
+
+    async fn overwrite_ckpt_off_worker(
+        dest: &Arc<PlainPbStoragePlugin>,
+        ckpt: &Path,
+        contents: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let (dest, ckpt) = (dest.clone(), ckpt.to_path_buf());
+        Self::ckpt_blocking("checkpoint overwrite", move || {
+            dest.overwrite_etl_sidecar(&ckpt, &contents)
+        })
+        .await
+    }
+
+    async fn remove_ckpt_off_worker(
+        dest: &Arc<PlainPbStoragePlugin>,
+        ckpt: &Path,
+    ) -> anyhow::Result<()> {
+        let (dest, ckpt) = (dest.clone(), ckpt.to_path_buf());
+        Self::ckpt_blocking("checkpoint removal", move || dest.remove_etl_sidecar(&ckpt)).await
+    }
+
+    async fn sync_partition_off_worker(
+        dest: &Arc<PlainPbStoragePlugin>,
+        path: &Path,
+    ) -> anyhow::Result<()> {
+        let (dest, path) = (dest.clone(), path.to_path_buf());
+        Self::ckpt_blocking("durable-sync of dest partition", move || {
+            dest.sync_partition_durable(&path)
+        })
+        .await
     }
 
     /// Move a single PB file from source to destination tier.
@@ -625,10 +694,12 @@ impl EtlExecutor {
                         "ETL committed-checkpoint owner retry; preserving its \
                          committed tail and re-anchoring (dedup re-copy)"
                     );
-                    dest.overwrite_etl_sidecar(
+                    Self::overwrite_ckpt_off_worker(
+                        &dest,
                         &ckpt,
-                        &ckpt_contents(CkptState::Copying, len_before, &s_filename, true),
-                    )?;
+                        ckpt_contents(CkptState::Copying, len_before, &s_filename, true),
+                    )
+                    .await?;
                     dedup_against_dest = true;
                     len_before
                 }
@@ -674,16 +745,18 @@ impl EtlExecutor {
                 if done_marker.exists() {
                     dedup_against_dest = true;
                 }
-                dest.remove_etl_sidecar(&ckpt)?;
-                dest.create_etl_sidecar(
+                Self::remove_ckpt_off_worker(&dest, &ckpt).await?;
+                Self::create_ckpt_off_worker(
+                    &dest,
                     &ckpt,
-                    &ckpt_contents(
+                    ckpt_contents(
                         CkptState::Copying,
                         len_before,
                         &s_filename,
                         dedup_against_dest,
                     ),
-                )?;
+                )
+                .await?;
                 len_before
             }
             None => {
@@ -693,7 +766,7 @@ impl EtlExecutor {
                 // it and re-anchor from len_before.
                 if ckpt.exists() {
                     warn!(?ckpt, "ETL discarding torn dest checkpoint");
-                    dest.remove_etl_sidecar(&ckpt)?;
+                    Self::remove_ckpt_off_worker(&dest, &ckpt).await?;
                 }
                 // v0.4.0 upgrade compat (primary path): no HEAD checkpoint, but a
                 // `.etl_done` marker means D already holds this source's copy —
@@ -702,15 +775,17 @@ impl EtlExecutor {
                 if done_marker.exists() {
                     dedup_against_dest = true;
                 }
-                dest.create_etl_sidecar(
+                Self::create_ckpt_off_worker(
+                    &dest,
                     &ckpt,
-                    &ckpt_contents(
+                    ckpt_contents(
                         CkptState::Copying,
                         len_before,
                         &s_filename,
                         dedup_against_dest,
                     ),
-                )?;
+                )
+                .await?;
                 len_before
             }
         };
@@ -804,9 +879,7 @@ impl EtlExecutor {
             // copy (finding #9 R10). So decouple it, exactly as the checkpoint
             // sidecar and source unlink were decoupled.
             dest.flush_writes().await?;
-            dest.sync_partition_durable(&d_path).map_err(|e| {
-                anyhow::anyhow!("ETL: durable-sync of dest partition {d_path:?} failed: {e}")
-            })?;
+            Self::sync_partition_off_worker(&dest, &d_path).await?;
             anyhow::Ok(())
         })
         .await
@@ -827,15 +900,17 @@ impl EtlExecutor {
         // decision-load-bearing only on a `Copying` checkpoint, where it selects
         // blind vs dedup re-copy of the partial tail. Written faithfully here so
         // the checkpoint records what this copy actually did.
-        dest.overwrite_etl_sidecar(
+        Self::overwrite_ckpt_off_worker(
+            &dest,
             &ckpt,
-            &ckpt_contents(
+            ckpt_contents(
                 CkptState::Committed,
                 anchor,
                 &s_filename,
                 dedup_against_dest,
             ),
-        )?;
+        )
+        .await?;
 
         // Commit. The copy is durable and the checkpoint is `committed`. Two
         // steps, in this order:
@@ -868,7 +943,7 @@ impl EtlExecutor {
             );
             return Ok(false);
         }
-        dest.remove_etl_sidecar(&ckpt)?;
+        Self::remove_ckpt_off_worker(&dest, &ckpt).await?;
         // The source is gone and its copy is committed in D, so any v0.4.0
         // `.etl_done` marker for it is now superseded — clear it so it does not
         // linger (the source it named no longer exists to re-trigger cleanup).
