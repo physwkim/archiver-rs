@@ -1,5 +1,80 @@
 # Changelog
 
+## v0.4.1 — 2026-07-02
+
+Data-integrity release. The headline is a from-scratch redesign of the
+ETL tier-to-tier copy to be **idempotent per source partition**
+(finding #9): a retry after any crash or dest-flush failure now yields
+exactly one copy of each sample in the coarser tier, by construction.
+Alongside it, a set of storage-durability and engine shard-lifecycle
+fixes that close silent-data-loss and drop-accounting gaps.
+
+### Added
+
+- **Idempotent ETL copy via an owner-stamped dest checkpoint
+  (finding #9).** Each finer→coarser move writes a `<dest>.pb.etl_ckpt`
+  sidecar (state, anchor length, owner source, dedup mode) before
+  appending, and commits in a crash-safe order: dest data durable →
+  checkpoint `Committed` → source unlinked → checkpoint removed. A
+  `Copying` checkpoint proves the same in-flight instance and its
+  partial tail is truncated on retry; a `Committed` tail is never
+  truncated. This replaces the previous `.etl_done` marker scheme,
+  which could duplicate the auto-flushed prefix of a large partition
+  when a dest flush failed mid-copy.
+- **`fsync_on_flush` config option (default off).** Opt-in power-loss
+  durability for fresh ingest — fsyncs data files and their parent
+  directory entries on flush. The ETL no-loss/idempotency chain fsyncs
+  unconditionally, decoupled from this flag.
+- **Loss-free `truncate_partition` + durable ETL sidecar primitives.**
+  Truncate-to-anchor evicts and discards a cached writer without
+  emitting a spurious dirty-loss marker; a length-gated
+  `remove_moved_partition_if_len` deletes the source only if it is still
+  exactly its copy-time length.
+- **Per-PV drop counters for shard-closed and shutdown-abandoned
+  samples**, separated from buffer-overflow drops.
+
+### Fixed
+
+- **Silent ETL data loss on the default config.** The copied dest data
+  was fsync'd only under `fsync_on_flush`, while the source delete was
+  always durable — a power loss between the two lost samples. Dest data
+  is now fsync'd (data + parent dir) before the source is deleted,
+  unconditionally.
+- **`Committed` tail truncation (finding #9).** An owner retry gated the
+  rollback-truncate on the persisted `dedup` flag rather than the
+  checkpoint `state`; a re-created subset source could truncate and lose
+  a durably-committed tail. Rollback is now gated on `state` alone — a
+  `Committed` tail is never truncated.
+- **Cross-tier ETL races.** All moves and orphan-checkpoint reaping
+  serialize on one chain-wide gate; a partition with a pending inbound
+  checkpoint is deferred; destructive move ops are awaited outside the
+  copy timeout so a timeout-elapse cannot detach a mutation; and the
+  unconditional fsyncs run on the blocking pool so a hung mount cannot
+  wedge a runtime worker.
+- **Committed-retry duplication.** A re-copy after a committed checkpoint
+  dedups against the dest's overlapping range (bounded to the source
+  partition), closing a duplicate the retired btime scheme could
+  produce; the dedup mode is persisted so a resumed re-copy re-dedups.
+- **Engine shard lifecycle.** The dispatcher owns shard spawn/respawn,
+  respawns dead shards under a sliding-window budget (no respawn storm),
+  and counts `Closed`-channel drops; backpressure stalls are no longer
+  miscounted as buffer-overflow drops.
+- **Loss markers drained only on observed flush success**, including the
+  MTS/LTS tiers in `TieredStorage::take_loss_markers`.
+- **`consolidateDataForPV` requires the PV paused**, and reports the
+  files actually moved rather than attempted.
+- **Monotonic `last_timestamp` enforced at the write boundary** in the
+  registry; ETL matches the paused set on canonicalized PV names.
+- **`rename_pv` directory changes fsync'd under `fsync_on_flush`.**
+
+### Changed
+
+- **Bumped `epics-rs` 0.16.2 → 0.20.4.**
+- **Added CI.** A strict lint+test gate on Linux x86_64 (fmt, clippy
+  `-D warnings`, nextest, doctests) plus a cross-platform build/test
+  matrix on Linux and macOS (x86_64 + arm64). Windows is not a target —
+  EPICS PV names contain `:`, which is illegal in Windows filenames.
+
 ## v0.4.0 — 2026-05-12
 
 ### Added
