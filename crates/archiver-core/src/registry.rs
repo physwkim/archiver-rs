@@ -350,10 +350,24 @@ impl PvRegistry {
         let now = Utc::now().to_rfc3339();
         let (mode_str, period) = sample_mode.to_db();
 
+        // UPSERT, not INSERT OR REPLACE: REPLACE deletes the row and
+        // re-inserts only the columns named here, which nulled
+        // last_timestamp, prec, egu, alias_for, archive_fields and
+        // policy_name every time an already-archived PV was
+        // re-registered (a repeated archivePV, a restart-time
+        // re-archive). Only the columns this call owns are updated.
         conn.execute(
-            "INSERT OR REPLACE INTO pv_info
+            "INSERT INTO pv_info
              (pv_name, dbr_type, sample_mode, sample_period, status, element_count, created_at, updated_at, protocol)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5, COALESCE((SELECT created_at FROM pv_info WHERE pv_name = ?1), ?6), ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?6, ?7)
+             ON CONFLICT(pv_name) DO UPDATE SET
+                 dbr_type = excluded.dbr_type,
+                 sample_mode = excluded.sample_mode,
+                 sample_period = excluded.sample_period,
+                 status = 'active',
+                 element_count = excluded.element_count,
+                 updated_at = excluded.updated_at,
+                 protocol = excluded.protocol",
             params![pv_name, dbr_type as i32, mode_str, period, element_count, now, protocol.as_str()],
         )?;
         Ok(())
@@ -949,6 +963,33 @@ fn is_duplicate_column_error(e: &rusqlite::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Re-registering an existing PV updates only the columns
+    /// register_pv owns; metadata and the committed last_timestamp
+    /// survive.
+    #[test]
+    fn reregister_preserves_columns_register_pv_does_not_own() {
+        let reg = PvRegistry::in_memory().unwrap();
+        reg.register_pv("PV:Re", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+        reg.update_metadata("PV:Re", Some("3"), Some("mm")).unwrap();
+        let ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        reg.batch_update_timestamps(&[("PV:Re", ts)]).unwrap();
+        reg.set_status("PV:Re", PvStatus::Paused).unwrap();
+        let before = reg.get_pv("PV:Re").unwrap().unwrap();
+        assert_eq!(before.last_timestamp, Some(ts), "test premise");
+
+        let scan = SampleMode::Scan { period_secs: 2.0 };
+        reg.register_pv("PV:Re", ArchDbType::ScalarDouble, &scan, 1)
+            .unwrap();
+        let after = reg.get_pv("PV:Re").unwrap().unwrap();
+        assert_eq!(after.prec.as_deref(), Some("3"));
+        assert_eq!(after.egu.as_deref(), Some("mm"));
+        assert_eq!(after.last_timestamp, Some(ts));
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.sample_mode, scan);
+        assert_eq!(after.status, PvStatus::Active);
+    }
 
     #[test]
     fn invalid_pv_names_rejected() {
