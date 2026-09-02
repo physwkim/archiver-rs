@@ -2959,19 +2959,31 @@ fn pv_field_extract_timestamp(field: &PvField) -> SystemTime {
     let Some(PvField::Structure(ts)) = s.get_field("timeStamp") else {
         return SystemTime::now();
     };
+    // Checked conversions throughout: a negative or absurd
+    // `secondsPastEpoch` (an IOC with an unset clock, a corrupt
+    // structure) is "not a usable timeStamp" per the contract above,
+    // not a reason to panic the reactor task — `Duration::new` and
+    // `UNIX_EPOCH + d` both panic on overflow, and a panic here kills
+    // the subscription for every PV sharing the reactor.
     let secs = match ts.get_field("secondsPastEpoch") {
-        Some(PvField::Scalar(ScalarValue::Long(v))) => *v as u64,
-        Some(PvField::Scalar(ScalarValue::ULong(v))) => *v,
-        Some(PvField::Scalar(ScalarValue::Int(v))) => *v as u64,
-        Some(PvField::Scalar(ScalarValue::UInt(v))) => *v as u64,
-        _ => return SystemTime::now(),
+        Some(PvField::Scalar(ScalarValue::Long(v))) => u64::try_from(*v).ok(),
+        Some(PvField::Scalar(ScalarValue::ULong(v))) => Some(*v),
+        Some(PvField::Scalar(ScalarValue::Int(v))) => u64::try_from(*v).ok(),
+        Some(PvField::Scalar(ScalarValue::UInt(v))) => Some(u64::from(*v)),
+        _ => None,
     };
     let nanos = match ts.get_field("nanoseconds") {
-        Some(PvField::Scalar(ScalarValue::Int(v))) => *v as u32,
-        Some(PvField::Scalar(ScalarValue::UInt(v))) => *v,
-        _ => 0,
+        Some(PvField::Scalar(ScalarValue::Int(v))) => u32::try_from(*v).ok(),
+        Some(PvField::Scalar(ScalarValue::UInt(v))) => Some(*v),
+        _ => Some(0),
     };
-    SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
+    let (Some(secs), Some(nanos)) = (secs, nanos) else {
+        return SystemTime::now();
+    };
+    Duration::from_secs(secs)
+        .checked_add(Duration::from_nanos(u64::from(nanos)))
+        .and_then(|d| SystemTime::UNIX_EPOCH.checked_add(d))
+        .unwrap_or_else(SystemTime::now)
 }
 
 /// Convert epics-base-rs DbFieldType to archiver ArchDbType.
@@ -4321,6 +4333,84 @@ mod pva_mapping_tests {
             .fields
             .push(("value".into(), PvField::Structure(value_inner)));
         PvField::Structure(table)
+    }
+
+    /// NTScalar with an explicit `timeStamp` sub-structure; `nanos`
+    /// `None` omits the `nanoseconds` field entirely.
+    fn nt_with_timestamp(secs: ScalarValue, nanos: Option<ScalarValue>) -> PvField {
+        let mut ts = PvStructure::new("time_t");
+        ts.fields
+            .push(("secondsPastEpoch".into(), PvField::Scalar(secs)));
+        if let Some(n) = nanos {
+            ts.fields.push(("nanoseconds".into(), PvField::Scalar(n)));
+        }
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        nt.fields.push(("timeStamp".into(), PvField::Structure(ts)));
+        PvField::Structure(nt)
+    }
+
+    fn assert_about_now(t: SystemTime, what: &str) {
+        let skew = t
+            .duration_since(SystemTime::now())
+            .or_else(|e| Ok::<_, ()>(e.duration()))
+            .unwrap();
+        assert!(
+            skew < Duration::from_secs(5),
+            "{what}: expected ~now, got {t:?}"
+        );
+    }
+
+    #[test]
+    fn timestamp_well_formed_is_exact() {
+        let t = pv_field_extract_timestamp(&nt_with_timestamp(
+            ScalarValue::Long(1_700_000_000),
+            Some(ScalarValue::Int(250_000_000)),
+        ));
+        assert_eq!(
+            t,
+            SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 250_000_000)
+        );
+        // Sub-second overflow carries into seconds rather than panicking.
+        let t = pv_field_extract_timestamp(&nt_with_timestamp(
+            ScalarValue::ULong(1_700_000_000),
+            Some(ScalarValue::UInt(1_500_000_000)),
+        ));
+        assert_eq!(
+            t,
+            SystemTime::UNIX_EPOCH + Duration::new(1_700_000_001, 500_000_000)
+        );
+    }
+
+    #[test]
+    fn timestamp_negative_seconds_falls_back_to_now() {
+        let t = pv_field_extract_timestamp(&nt_with_timestamp(ScalarValue::Long(-1), None));
+        assert_about_now(t, "Long(-1)");
+        let t = pv_field_extract_timestamp(&nt_with_timestamp(ScalarValue::Int(-7), None));
+        assert_about_now(t, "Int(-7)");
+    }
+
+    #[test]
+    fn timestamp_negative_nanos_falls_back_to_now() {
+        let t = pv_field_extract_timestamp(&nt_with_timestamp(
+            ScalarValue::Long(1_700_000_000),
+            Some(ScalarValue::Int(-5)),
+        ));
+        assert_about_now(t, "nanoseconds Int(-5)");
+    }
+
+    #[test]
+    fn timestamp_overflowing_seconds_does_not_panic() {
+        // Would overflow `SystemTime` (i64 seconds on Linux) — the old
+        // `UNIX_EPOCH + Duration::new(..)` panicked in the reactor task.
+        let t = pv_field_extract_timestamp(&nt_with_timestamp(ScalarValue::ULong(u64::MAX), None));
+        assert_about_now(t, "ULong(u64::MAX)");
+        let t = pv_field_extract_timestamp(&nt_with_timestamp(
+            ScalarValue::Long(i64::MAX),
+            Some(ScalarValue::UInt(u32::MAX)),
+        ));
+        assert_about_now(t, "Long(i64::MAX)");
     }
 
     #[test]
