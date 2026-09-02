@@ -1379,7 +1379,7 @@ impl PlainPbStoragePlugin {
         }
 
         if slot.writer.is_none() {
-            let needs_header = file_needs_header(path);
+            let needs_header = file_needs_header(path)?;
             // Whether the open below will CREATE the file (add a new
             // directory entry). Reliable under the per-PV slot lock: no
             // other writer targets this path. Gates the parent-dir
@@ -1677,48 +1677,63 @@ fn is_too_many_open_files(e: &std::io::Error) -> bool {
 }
 
 /// Decide whether a file at `path` needs a fresh PayloadInfo header
-/// written before sample data is appended. Returns `true` when:
+/// written before sample data is appended. Returns `Ok(true)` when:
 /// 1. the file doesn't exist,
 /// 2. the file exists but is 0 bytes (Java parity 651c3a6b: a crash
 ///    mid-create would otherwise leave a header-less file), OR
-/// 3. the file exists with bytes but `PbFileReader::open` cannot
-///    parse the header — in that case we **truncate** the file so
-///    the caller's `create+append` opens cleanly. Without this
-///    third branch, a partial-header crash makes the file forever
-///    unreadable AND every subsequent append silently piles garbage
-///    onto a corrupt prefix.
-fn file_needs_header(path: &Path) -> bool {
-    if !path.exists() {
-        return true;
-    }
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+/// 3. the file is readable but its header line does not decode — in
+///    that case we **truncate** the file so the caller's
+///    `create+append` opens cleanly. Without this third branch, a
+///    partial-header crash makes the file forever unreadable AND
+///    every subsequent append silently piles garbage onto a corrupt
+///    prefix.
+///
+/// Only branch 3 — a header that was READ and failed to DECODE — may
+/// truncate. An I/O error while stat-ing or reading the file (EACCES,
+/// EIO, EMFILE, a hung NFS mount) is propagated instead: the file's
+/// contents are unknown, and treating "cannot read" as "corrupt" wiped
+/// a whole partition of good samples every time the fd table or the
+/// mount hiccupped. The caller fails this one append; the next sample
+/// re-probes. A failed truncate is likewise an error, not `true`:
+/// returning `true` would append a second header mid-file.
+fn file_needs_header(path: &Path) -> anyhow::Result<bool> {
+    let size = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("stat {path:?}"))),
+    };
     if size == 0 {
-        return true;
+        return Ok(true);
     }
-    if PbFileReader::open(path).is_err() {
-        tracing::warn!(
-            ?path,
-            "PB file has unreadable header; truncating so a fresh \
-             header gets written"
-        );
-        if let Err(e) = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(path)
-        {
-            tracing::warn!(?path, "Failed to truncate corrupt PB file: {e}");
+    match PbFileReader::open(path) {
+        Ok(_) => {}
+        Err(e) if e.downcast_ref::<std::io::Error>().is_some() => {
+            return Err(e.context(format!("cannot read PB header of {path:?}")));
         }
-        return true;
+        Err(e) => {
+            tracing::warn!(
+                ?path,
+                "PB file has undecodable header ({e}); truncating so a \
+                 fresh header gets written"
+            );
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .map_err(|e| anyhow::anyhow!("failed to truncate corrupt PB file {path:?}: {e}"))?;
+            return Ok(true);
+        }
     }
     // Header is valid; defend against a tail with a partial sample
     // (writer killed mid-flush). Truncating to the last NEWLINE
     // boundary loses at most one record but keeps the file readable
     // — without this, a reader hits the partial record and stops
-    // returning every sample after that point.
-    if let Err(e) = trim_to_last_newline(path) {
-        tracing::warn!(?path, "Failed to trim partial trailing record: {e}");
-    }
-    false
+    // returning every sample after that point. A failed trim leaves
+    // the partial record in place, so the append must not proceed
+    // (it would fuse the new frame onto the partial one).
+    trim_to_last_newline(path)
+        .map_err(|e| anyhow::anyhow!("failed to trim partial trailing record in {path:?}: {e}"))?;
+    Ok(false)
 }
 
 /// Truncate `path` to end at its last NEWLINE byte (inclusive). Used
@@ -2447,6 +2462,58 @@ fn total_pb_stats(root: &Path) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A header that cannot be READ is not a corrupt header: the stat
+    /// and the open/read error paths must propagate and leave the
+    /// file untouched, not truncate it.
+    #[cfg(unix)]
+    #[test]
+    fn file_needs_header_io_error_propagates_without_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // stat error (ELOOP): a self-referential symlink.
+        let looped = dir.path().join("loop:2024.pb");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        let err = file_needs_header(&looped).expect_err("ELOOP must propagate");
+        assert!(
+            err.to_string().contains("stat"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&looped).is_ok(),
+            "symlink must survive an unreadable-header probe"
+        );
+
+        // read error (EISDIR): a directory in the partition's place.
+        // `File::open` succeeds on a directory; the header read fails.
+        let dirp = dir.path().join("dir:2024.pb");
+        std::fs::create_dir(&dirp).unwrap();
+        std::fs::write(dirp.join("marker"), b"x").unwrap();
+        assert!(
+            std::fs::metadata(&dirp).unwrap().len() > 0,
+            "test premise: a non-empty directory reports a non-zero size"
+        );
+        let err = file_needs_header(&dirp).expect_err("EISDIR must propagate");
+        assert!(
+            err.to_string().contains("cannot read PB header"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            dirp.join("marker").exists(),
+            "directory must survive an unreadable-header probe"
+        );
+    }
+
+    /// The one case that MAY truncate: bytes were read and the header
+    /// does not decode.
+    #[test]
+    fn file_needs_header_truncates_only_undecodable_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad:2024.pb");
+        std::fs::write(&path, b"\xff\xff\xffnot a payload info\n").unwrap();
+        assert!(file_needs_header(&path).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
 
     #[test]
     fn canonical_pv_key_matches_path_derived_name() {
