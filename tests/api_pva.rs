@@ -111,7 +111,9 @@ async fn pva_rpc_get_data_end_to_end() {
     let (_resp_desc, resp_value) = client
         .pvrpc("archappl/getData", &req_desc, &req_value)
         .await
-        .expect("rpc call ok");
+        .expect("rpc call ok")
+        .into_value()
+        .expect("getData reply carries an NTTable, never RpcReply::Empty");
 
     // ── Inspect the NTTable: value.value column should contain 1.5, 2.5 ──
     let PvField::Structure(resp) = resp_value else {

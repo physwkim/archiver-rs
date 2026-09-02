@@ -8,6 +8,7 @@ use epics_rs::base::server::snapshot::DbrClass;
 use epics_rs::base::types::{DbFieldType, EpicsValue};
 use epics_rs::ca::client::{CaChannel, CaClient, ConnectionEvent};
 use epics_rs::pva::client_native::PvaClient;
+use epics_rs::pva::client_native::ops_v2::MonitorConnEvent;
 use epics_rs::pva::proto::ByteOrder;
 use epics_rs::pva::pvdata::encode::{encode_pv_field, encode_type_desc};
 use epics_rs::pva::pvdata::{PvField, ScalarType, ScalarValue, TypedScalarArray};
@@ -1492,7 +1493,46 @@ async fn monitor_loop_pva(
                     drift_secs,
                 );
             };
-            let handle = match pva_client.pvmonitor_handle(&pv_name, cb).await {
+            // Connection transitions come from the handle's
+            // `MonitorConnEvent` — the reactor's sanctioned signal,
+            // replacing the watchdog's event-gap approximation on this
+            // path. Mirrors the CA monitor-end block: resetting
+            // `last_event_time` re-arms `first_after_connect` so a
+            // reconnect backfill sample bypasses the drift filter
+            // instead of being dropped. The `was_connected` guard keeps
+            // the counter single-owner against the watchdog, which may
+            // have marked the PV disconnected already.
+            let conn_info_ev = conn_info.clone();
+            let counters_ev = counters.clone();
+            let pv_name_ev = pv_name.clone();
+            let on_conn = move |ev: MonitorConnEvent| match ev {
+                MonitorConnEvent::Connected { .. } => {
+                    let mut ci = conn_info_ev.lock().unwrap_or_else(|e| e.into_inner());
+                    if ci.connected_since.is_none() {
+                        ci.connected_since = Some(SystemTime::now());
+                    }
+                    ci.is_connected = true;
+                    ci.state = PvConnectionState::Connected;
+                }
+                MonitorConnEvent::Disconnected | MonitorConnEvent::Finished => {
+                    let was_connected = {
+                        let mut ci = conn_info_ev.lock().unwrap_or_else(|e| e.into_inner());
+                        let prev = ci.is_connected;
+                        ci.is_connected = false;
+                        ci.last_event_time = None;
+                        ci.state = PvConnectionState::Disconnected;
+                        prev
+                    };
+                    if was_connected {
+                        counters_ev.disconnect_count.fetch_add(1, Ordering::Relaxed);
+                        counters_ev
+                            .last_disconnect_unix_secs
+                            .store(unix_secs(SystemTime::now()), Ordering::Relaxed);
+                    }
+                    debug!(pv = pv_name_ev, "PVA monitor connection lost");
+                }
+            };
+            let handle = match pva_client.pvmonitor_handle(&pv_name, cb, on_conn).await {
                 Ok(h) => h,
                 Err(e) => {
                     counters
@@ -2228,6 +2268,7 @@ fn epics_value_to_field_string(val: &EpicsValue) -> String {
         // Transient NTEnum carrier: render the index, same as `Enum`.
         EpicsValue::EnumWithChoices { index, .. } => index.to_string(),
         EpicsValue::Char(v) => v.to_string(),
+        EpicsValue::UChar(v) => v.to_string(),
         EpicsValue::Long(v) => v.to_string(),
         EpicsValue::Int64(v) => v.to_string(),
         EpicsValue::UInt64(v) => v.to_string(),
@@ -2244,6 +2285,7 @@ fn epics_value_to_field_string(val: &EpicsValue) -> String {
         EpicsValue::UShortArray(v) => format!("{v:?}"),
         EpicsValue::ULongArray(v) => format!("{v:?}"),
         EpicsValue::CharArray(v) => String::from_utf8_lossy(v).into_owned(),
+        EpicsValue::UCharArray(v) => String::from_utf8_lossy(v).into_owned(),
         EpicsValue::StringArray(v) => format!("{v:?}"),
     }
 }
@@ -2833,7 +2875,9 @@ fn dbr_field_to_arch_type(field_type: DbFieldType) -> ArchDbType {
         DbFieldType::Short => ArchDbType::ScalarShort,
         DbFieldType::Float => ArchDbType::ScalarFloat,
         DbFieldType::Enum => ArchDbType::ScalarEnum,
-        DbFieldType::Char => ArchDbType::ScalarByte,
+        // DBF_UCHAR promotes to DBR_CHAR over CA (identical 1-byte
+        // payload), so both land in the ScalarByte slot.
+        DbFieldType::Char | DbFieldType::UChar => ArchDbType::ScalarByte,
         DbFieldType::Long => ArchDbType::ScalarInt,
         // PB PayloadType has no SCALAR_LONG (i64) — values outside i32 range
         // are truncated by the i32 cast in epics_value_to_archiver. The
@@ -2858,6 +2902,7 @@ fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
         // Transient NTEnum carrier: archive the index, same as `Enum`.
         EpicsValue::EnumWithChoices { index, .. } => ArchiverValue::ScalarEnum(*index as i32),
         EpicsValue::Char(v) => ArchiverValue::ScalarByte(vec![*v]),
+        EpicsValue::UChar(v) => ArchiverValue::ScalarByte(vec![*v]),
         EpicsValue::Long(v) => ArchiverValue::ScalarInt(*v),
         // i64/u64/u32 fold into the i32 ScalarInt slot (out-of-range values
         // truncate) — matches the `DbFieldType` registration mapping above.
@@ -2888,6 +2933,7 @@ fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
             ArchiverValue::VectorShort(v.iter().map(|x| *x as i32).collect())
         }
         EpicsValue::CharArray(v) => ArchiverValue::VectorChar(v.clone()),
+        EpicsValue::UCharArray(v) => ArchiverValue::VectorChar(v.clone()),
         EpicsValue::StringArray(v) => {
             ArchiverValue::VectorString(v.iter().map(|s| s.to_string()).collect())
         }

@@ -843,14 +843,18 @@ dependencies = [
 
 [[package]]
 name = "epics-base-rs"
-version = "0.20.3"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e509a355ac8d5fa81450df13b08b9aca691dd12a67dbabce4e0b4e60c282bac7"
+checksum = "ffc5fb8c868e1114e589680551fd5dcc48df339a51c042e92a5415285a83cb3e"
 dependencies = [
+ "arc-swap",
+ "async-trait",
  "bytes",
  "chrono",
  "clap",
+ "epics-libcom-rs",
  "epics-macros-rs",
+ "epics-rtems-boot",
  "hostname",
  "if-addrs",
  "libc",
@@ -865,9 +869,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.20.3"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "511fefc270b9874dad78a8d57b7eb0b187b72c8e6797731cde9360b117dad048"
+checksum = "07d093efafb055a711069a2e2985004f29a55198167892e52410a1d053eeea51"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -875,6 +879,7 @@ dependencies = [
  "clap",
  "dashmap",
  "epics-base-rs",
+ "epics-rtems-boot",
  "futures-util",
  "if-addrs",
  "libc",
@@ -884,13 +889,31 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "epics-libcom-rs"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a5794b250cda69b1fe724af5826d37831f8c9bf2a333359025fc9bae47d4b2c"
+dependencies = [
+ "chrono",
+ "epics-rtems-boot",
+ "hostname",
+ "if-addrs",
+ "libc",
+ "parking_lot",
+ "socket2 0.5.10",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.20.3"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afece7651f6cc6b6b52286bbf99774b968297891e532d03bf046d0d16dc0ffc3"
+checksum = "d4574f2e2c8c5317e6f0983276feccae4cc5d45535620f9d9bb42987c663e229"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -900,9 +923,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.20.3"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0e58ef561ffb4f66b739bc0ecb78e36b7c795ce014a4713c30a0bdfbc8099a4"
+checksum = "67defd7fb25c002a023aa1750617c10ace4eba91400c82c61b7632fcf0525352"
 dependencies = [
  "bytes",
  "chrono",
@@ -939,13 +962,23 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
-version = "0.20.4"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758bf8455add8561007f93470538a52683ef064d6d2fa39edb524c486ffd8546"
+checksum = "17a8d56c5d94ee6c8cf7c7e206427244a485638809c870f8a5007dd8c896805c"
 dependencies = [
  "epics-base-rs",
  "epics-ca-rs",
  "epics-pva-rs",
+]
+
+[[package]]
+name = "epics-rtems-boot"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac25b14a69d693209a239812b356096de7c8051ec87af3f98da29ac21fdd7ff8"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]
