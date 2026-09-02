@@ -525,6 +525,17 @@ impl EtlExecutor {
         let source_name = self.source.name().to_string();
         let dest_name = self.dest.name().to_string();
 
+        // Route by the PATH-derived name, never by the header's
+        // `pvname`. The path is the identity every other step uses
+        // (grouping, the pause check, writer-slot lookups), and
+        // `rename_pv` moves partitions without rewriting headers, so
+        // after renamePV A→B a B partition still says A inside —
+        // routing by it migrated B's data under A, where no reader
+        // looks for it.
+        let pv_name = source.pv_name_from_path(&source_path).ok_or_else(|| {
+            anyhow::anyhow!("ETL: cannot derive PV name from partition path {source_path:?}")
+        })?;
+
         let mut reader = match PbFileReader::open(&source_path) {
             Ok(r) => r,
             Err(e)
@@ -574,7 +585,7 @@ impl EtlExecutor {
             return Ok(removed);
         };
 
-        let d_path = dest.file_path_for(&desc.pv_name, first_sample.timestamp);
+        let d_path = dest.file_path_for(&pv_name, first_sample.timestamp);
         let ckpt = d_path.with_extension("pb.etl_ckpt");
         let s_filename = source_path
             .file_name()
@@ -851,11 +862,11 @@ impl EtlExecutor {
             let already_in_dest =
                 |ts: SystemTime| dest_ts.as_ref().is_some_and(|set| set.contains(&ts));
             if !already_in_dest(first_sample.timestamp) {
-                dest.append_event_with_meta(&desc.pv_name, dbr_type, &first_sample, &append_meta)
+                dest.append_event_with_meta(&pv_name, dbr_type, &first_sample, &append_meta)
                     .await?;
             }
             while let Some(sample) = reader.next_event()? {
-                if dest.file_path_for(&desc.pv_name, sample.timestamp) != d_path {
+                if dest.file_path_for(&pv_name, sample.timestamp) != d_path {
                     return Err(anyhow::anyhow!(
                         "ETL: a sample timestamp in {source_path:?} maps to a different dest \
                          partition than {d_path:?}; refusing to split the copy"
@@ -864,7 +875,7 @@ impl EtlExecutor {
                 if already_in_dest(sample.timestamp) {
                     continue;
                 }
-                dest.append_event_with_meta(&desc.pv_name, dbr_type, &sample, &append_meta)
+                dest.append_event_with_meta(&pv_name, dbr_type, &sample, &append_meta)
                     .await?;
             }
             // Durability BEFORE the commit. Flush all dest writers, then fsync
@@ -1294,6 +1305,44 @@ mod tests {
         assert_eq!(count_samples(&d_path), 50, "dest holds every sample once");
         assert!(!s_path.exists(), "source deleted after durable copy");
         assert!(!ckpt.exists(), "checkpoint cleared on commit");
+    }
+
+    /// renamePV moves partitions without rewriting their headers, so a
+    /// renamed partition's header still names the OLD PV. The move must
+    /// route by the path (the new name), not the header.
+    #[tokio::test]
+    async fn move_file_routes_by_path_name_not_header_pvname() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = plugin(tmp.path().join("sts"), "STS", PartitionGranularity::Hour);
+        let dest = plugin(tmp.path().join("mts"), "MTS", PartitionGranularity::Day);
+        let exec = EtlExecutor::new(src.clone(), dest.clone(), 3600, 0, 100);
+
+        let samples: Vec<_> = (0..20)
+            .map(|i| sample_at(BASE_SECS + i, i as f64))
+            .collect();
+        let old_path = write_source_partition(&src, "Old:PV", &samples).await;
+        // What rename_pv does on disk: move the file, header untouched.
+        let new_path = src.file_path_for("New:PV", samples[0].timestamp);
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        std::fs::rename(&old_path, &new_path).unwrap();
+        assert_eq!(
+            PbFileReader::open(&new_path).unwrap().description().pv_name,
+            "Old:PV",
+            "test premise: header still carries the old name"
+        );
+
+        assert!(exec.move_file(&new_path).await.unwrap());
+
+        let d_new = dest.file_path_for("New:PV", samples[0].timestamp);
+        let d_old = dest.file_path_for("Old:PV", samples[0].timestamp);
+        assert_eq!(count_samples(&d_new), 20, "data lands under the NEW name");
+        assert!(!d_old.exists(), "nothing may land under the old name");
+        assert_eq!(
+            PbFileReader::open(&d_new).unwrap().description().pv_name,
+            "New:PV",
+            "dest header is written with the routed name"
+        );
+        assert!(!new_path.exists(), "source deleted after durable copy");
     }
 
     #[tokio::test]
