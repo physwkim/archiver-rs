@@ -2417,7 +2417,13 @@ impl StoragePlugin for PlainPbStoragePlugin {
             }
         }
 
-        let mut moved = 0u64;
+        // Plan every move first and refuse if any destination already
+        // exists: std::fs::rename silently replaces an existing file,
+        // so a partition already under `to` (a stale earlier rename, a
+        // manual copy, a registry/disk skew the API's registry-only
+        // guard cannot see) would be destroyed. Checking up front
+        // keeps a refusal from leaving `from` half-renamed.
+        let mut planned: Vec<(&PathBuf, PathBuf)> = Vec::with_capacity(from_files.len());
         for src in &from_files {
             let file_name = src
                 .file_name()
@@ -2432,6 +2438,16 @@ impl StoragePlugin for PlainPbStoragePlugin {
                 })?;
             let new_name = format!("{to_leaf}:{suffix}");
             let dst = to_dir.join(new_name);
+            if dst.try_exists()? {
+                anyhow::bail!(
+                    "rename {from} -> {to}: destination partition {dst:?} already \
+                     exists; refusing to overwrite it"
+                );
+            }
+            planned.push((src, dst));
+        }
+        let mut moved = 0u64;
+        for (src, dst) in planned {
             std::fs::rename(src, &dst)?;
             moved += 1;
         }

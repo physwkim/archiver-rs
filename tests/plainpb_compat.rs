@@ -795,6 +795,56 @@ async fn ghost_file_path_records_loss() {
     );
 }
 
+/// rename_pv must not clobber a partition that already exists under
+/// the destination name; both PVs' data must survive the refusal.
+#[tokio::test]
+async fn rename_pv_refuses_to_overwrite_existing_destination_partition() {
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap().into();
+    let (src, dst) = ("TEST:RenSrc", "TEST:RenDst");
+    for (pv, v) in [(src, 1.0), (dst, 2.0)] {
+        let s = ArchiverSample::new(ts1, ArchiverValue::ScalarDouble(v));
+        plugin
+            .append_event(pv, ArchDbType::ScalarDouble, &s)
+            .await
+            .unwrap();
+    }
+    plugin.flush_writes().await.unwrap();
+
+    let err = plugin
+        .rename_pv(src, dst)
+        .await
+        .expect_err("rename onto an existing partition must be refused");
+    assert!(
+        err.to_string().contains("already exists"),
+        "unexpected error: {err:#}"
+    );
+
+    for (pv, v) in [(src, 1.0), (dst, 2.0)] {
+        let mut rdr = PbFileReader::open(&plugin.file_path_for(pv, ts1)).unwrap();
+        let mut vals = Vec::new();
+        while let Some(s) = rdr.next_event().unwrap() {
+            vals.push(s.value);
+        }
+        assert_eq!(
+            vals,
+            vec![ArchiverValue::ScalarDouble(v)],
+            "{pv} must be intact"
+        );
+    }
+    // The refused rename must not leave the source slot tombstoned.
+    let s = ArchiverSample::new(
+        ts1 + std::time::Duration::from_secs(1),
+        ArchiverValue::ScalarDouble(3.0),
+    );
+    plugin
+        .append_event(src, ArchDbType::ScalarDouble, &s)
+        .await
+        .expect("source PV must stay writable after a refused rename");
+}
+
 /// A partition's header fixes its type. After a restart (fresh plugin,
 /// no cached writer) a sample of another type for the same partition
 /// must be refused, not appended as a frame the reader decodes with
