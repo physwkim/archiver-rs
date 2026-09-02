@@ -390,14 +390,11 @@ impl PvRegistry {
         pv_name: &str,
         timestamp: SystemTime,
     ) -> anyhow::Result<()> {
-        let conn = self.lock_conn()?;
-        let dt = DateTime::<Utc>::from(timestamp).to_rfc3339();
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE pv_info SET last_timestamp = ?1, updated_at = ?2 WHERE pv_name = ?3",
-            params![dt, now, pv_name],
-        )?;
-        Ok(())
+        // Single-PV form of `batch_update_timestamps`, which is the one
+        // owner of the last_timestamp commit rule (never regress). A
+        // second, unguarded UPDATE here would let any caller move the
+        // watermark backwards.
+        self.batch_update_timestamps(&[(pv_name, timestamp)])
     }
 
     /// Remove a PV from the registry entirely.
@@ -989,6 +986,27 @@ mod tests {
         assert_eq!(after.created_at, before.created_at);
         assert_eq!(after.sample_mode, scan);
         assert_eq!(after.status, PvStatus::Active);
+    }
+
+    #[test]
+    fn update_last_timestamp_never_regresses() {
+        let reg = PvRegistry::in_memory().unwrap();
+        reg.register_pv(
+            "PV:Single",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        reg.update_last_timestamp("PV:Single", newer).unwrap();
+        reg.update_last_timestamp("PV:Single", older).unwrap();
+        assert_eq!(
+            reg.get_pv("PV:Single").unwrap().unwrap().last_timestamp,
+            Some(newer),
+            "single-PV update must obey the same monotonic rule as the batch"
+        );
     }
 
     #[test]
