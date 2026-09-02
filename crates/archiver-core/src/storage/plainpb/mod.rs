@@ -1365,8 +1365,13 @@ impl PlainPbStoragePlugin {
         // Drop via `drop_writer_file_gone` so dirty bytes get a loss marker
         // (flushing to a deleted inode is meaningless; bytes are lost
         // regardless).
+        //
+        // Only a definite `Ok(false)` counts as gone. A stat ERROR
+        // (EACCES, EIO, ENOTDIR from a mount flap) says nothing about
+        // the inode, and `Path::exists` folds it into `false` — which
+        // discarded the dirty buffer of a file that was still there.
         if let Some(existing) = slot.writer.as_ref()
-            && !existing.path.exists()
+            && matches!(existing.path.try_exists(), Ok(false))
         {
             tracing::warn!(
                 pv,

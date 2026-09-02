@@ -4,7 +4,9 @@ use std::time::SystemTime;
 
 use archiver_core::storage::partition::PartitionGranularity;
 use archiver_core::storage::plainpb::codec;
+use archiver_core::storage::plainpb::reader::PbFileReader;
 use archiver_core::storage::plainpb::{FdBudget, PlainPbStoragePlugin};
+use archiver_core::storage::traits::EventStream;
 use archiver_core::storage::traits::StoragePlugin;
 use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
 
@@ -790,6 +792,68 @@ async fn ghost_file_path_records_loss() {
     assert!(
         losses.iter().any(|p| p == pv),
         "ghost-file path must record loss for {pv}; got losses={losses:?}"
+    );
+}
+
+/// A stat ERROR on the cached writer's path is not "file gone": the
+/// dirty buffer must be kept and land once the path is stat-able
+/// again. Provoked with ENOTDIR — the partition's parent directory is
+/// swapped for a regular file while the writer's fd stays open.
+#[cfg(unix)]
+#[tokio::test]
+async fn ghost_check_stat_error_keeps_dirty_writer() {
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+
+    let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap().into();
+    let ts2 = ts1 + std::time::Duration::from_secs(60);
+    let pv = "TEST:GhostStat";
+
+    let s1 = ArchiverSample::new(ts1, ArchiverValue::ScalarDouble(1.0));
+    plugin
+        .append_event(pv, ArchDbType::ScalarDouble, &s1)
+        .await
+        .unwrap();
+
+    // Make stat(path) fail with ENOTDIR without touching the inode.
+    let path = plugin.file_path_for(pv, ts1);
+    let parent = path.parent().unwrap().to_path_buf();
+    let aside = dir.path().join("aside");
+    std::fs::rename(&parent, &aside).unwrap();
+    std::fs::write(&parent, b"not a directory").unwrap();
+    assert!(
+        path.try_exists().is_err(),
+        "test premise: stat must error, not report absent"
+    );
+
+    let s2 = ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(2.0));
+    plugin
+        .append_event(pv, ArchDbType::ScalarDouble, &s2)
+        .await
+        .unwrap();
+
+    // Restore the directory; the writer's fd still points at the file.
+    std::fs::remove_file(&parent).unwrap();
+    std::fs::rename(&aside, &parent).unwrap();
+    plugin.flush_writes().await.unwrap();
+
+    assert!(
+        plugin.take_loss_markers().is_empty(),
+        "a stat error must not be classified as loss"
+    );
+    let mut rdr = PbFileReader::open(&path).unwrap();
+    let mut vals = Vec::new();
+    while let Some(s) = rdr.next_event().unwrap() {
+        vals.push(s.value);
+    }
+    assert_eq!(
+        vals,
+        vec![
+            ArchiverValue::ScalarDouble(1.0),
+            ArchiverValue::ScalarDouble(2.0)
+        ],
+        "both samples must land in the file that never went away"
     );
 }
 
