@@ -795,6 +795,56 @@ async fn ghost_file_path_records_loss() {
     );
 }
 
+/// A partition's header fixes its type. After a restart (fresh plugin,
+/// no cached writer) a sample of another type for the same partition
+/// must be refused, not appended as a frame the reader decodes with
+/// the header's type.
+#[tokio::test]
+async fn append_refuses_type_that_differs_from_partition_header() {
+    let dir = temp_dir();
+    let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap().into();
+    let ts2 = ts1 + std::time::Duration::from_secs(60);
+    let pv = "TEST:Retyped";
+
+    let path = {
+        let plugin =
+            PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+        let s1 = ArchiverSample::new(ts1, ArchiverValue::ScalarDouble(1.0));
+        plugin
+            .append_event(pv, ArchDbType::ScalarDouble, &s1)
+            .await
+            .unwrap();
+        plugin.flush_writes().await.unwrap();
+        plugin.file_path_for(pv, ts1)
+    };
+    let len_before = std::fs::metadata(&path).unwrap().len();
+
+    // "Restart": a new plugin over the same root, PV now typed Int.
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let s2 = ArchiverSample::new(ts2, ArchiverValue::ScalarInt(2));
+    let err = plugin
+        .append_event(pv, ArchDbType::ScalarInt, &s2)
+        .await
+        .expect_err("a foreign-type append must be refused");
+    assert!(
+        err.to_string().contains("holds ScalarDouble"),
+        "unexpected error: {err:#}"
+    );
+    let _ = plugin.flush_writes().await;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        len_before,
+        "refused append must leave the partition untouched"
+    );
+    let mut rdr = PbFileReader::open(&path).unwrap();
+    let mut vals = Vec::new();
+    while let Some(s) = rdr.next_event().unwrap() {
+        vals.push(s.value);
+    }
+    assert_eq!(vals, vec![ArchiverValue::ScalarDouble(1.0)]);
+}
+
 /// The partition directory is removed out from under a plugin that
 /// already created it (operator cleanup). The next append must
 /// recreate it and land, not fail on the stale `known_dirs` entry

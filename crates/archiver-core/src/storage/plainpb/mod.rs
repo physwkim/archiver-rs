@@ -1395,7 +1395,25 @@ impl PlainPbStoragePlugin {
         }
 
         if slot.writer.is_none() {
-            let needs_header = file_needs_header(path)?;
+            // A partition's header fixes the type readers decode every
+            // frame with. Appending a sample of another type (the PV
+            // was retyped at the IOC, or changeTypeForPV ran without a
+            // partition roll) would write frames the reader cannot
+            // decode — and, worse, ones it stops at, hiding every
+            // later sample in the file. Refuse here, at the one place
+            // partitions are opened for append, so the file stays
+            // decodable and the loss is a counted write error.
+            let header_type = partition_header(path)?;
+            if let Some(existing) = header_type
+                && existing != dbr_type
+            {
+                return Err(anyhow::anyhow!(
+                    "PB partition {path:?} holds {existing:?} samples; refusing to \
+                     append a {dbr_type:?} sample (type changed — the partition \
+                     keeps its header type until it rolls)"
+                ));
+            }
+            let needs_header = header_type.is_none();
             // Whether the open below will CREATE the file (add a new
             // directory entry). Reliable under the per-PV slot lock: no
             // other writer targets this path. Gates the parent-dir
@@ -1519,7 +1537,7 @@ impl PlainPbStoragePlugin {
                     // the bytes as lost. (Principle: failure-
                     // classified resource never goes through the
                     // normal destructor path.) The created file
-                    // exists on disk; `file_needs_header` on the
+                    // exists on disk; `partition_header` on the
                     // next attempt sees the unreadable header and
                     // truncates.
                     let (_file, _buffered) = bw.into_parts();
@@ -1563,7 +1581,7 @@ impl PlainPbStoragePlugin {
             // would compound the corruption (tail garbage, repeated
             // failures). Evict so the next call goes through the
             // create+append+header path which validates the file
-            // and reopens fresh. Tail-trim runs in `file_needs_header`
+            // and reopens fresh. Tail-trim runs in `partition_header`
             // on that next open and removes any partial record.
             //
             // Use `into_parts` to discard buffered bytes WITHOUT
@@ -1711,8 +1729,11 @@ fn is_too_many_open_files(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(23) | Some(24))
 }
 
-/// Decide whether a file at `path` needs a fresh PayloadInfo header
-/// written before sample data is appended. Returns `Ok(true)` when:
+/// Inspect the partition at `path` before an append. Returns
+/// `Ok(Some(type))` when a valid PayloadInfo header is present —
+/// `type` is what the header declares, and every frame in the file
+/// is decoded by readers as that type — or `Ok(None)` when a fresh
+/// header must be written first, i.e. when:
 /// 1. the file doesn't exist,
 /// 2. the file exists but is 0 bytes (Java parity 651c3a6b: a crash
 ///    mid-create would otherwise leave a header-less file), OR
@@ -1730,18 +1751,18 @@ fn is_too_many_open_files(e: &std::io::Error) -> bool {
 /// a whole partition of good samples every time the fd table or the
 /// mount hiccupped. The caller fails this one append; the next sample
 /// re-probes. A failed truncate is likewise an error, not `true`:
-/// returning `true` would append a second header mid-file.
-fn file_needs_header(path: &Path) -> anyhow::Result<bool> {
+/// returning `None` would append a second header mid-file.
+fn partition_header(path: &Path) -> anyhow::Result<Option<ArchDbType>> {
     let size = match std::fs::metadata(path) {
         Ok(m) => m.len(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(anyhow::Error::from(e).context(format!("stat {path:?}"))),
     };
     if size == 0 {
-        return Ok(true);
+        return Ok(None);
     }
-    match PbFileReader::open(path) {
-        Ok(_) => {}
+    let header_type = match PbFileReader::open(path) {
+        Ok(r) => r.description().db_type,
         Err(e) if e.downcast_ref::<std::io::Error>().is_some() => {
             return Err(e.context(format!("cannot read PB header of {path:?}")));
         }
@@ -1756,9 +1777,9 @@ fn file_needs_header(path: &Path) -> anyhow::Result<bool> {
                 .truncate(true)
                 .open(path)
                 .map_err(|e| anyhow::anyhow!("failed to truncate corrupt PB file {path:?}: {e}"))?;
-            return Ok(true);
+            return Ok(None);
         }
-    }
+    };
     // Header is valid; defend against a tail with a partial sample
     // (writer killed mid-flush). Truncating to the last NEWLINE
     // boundary loses at most one record but keeps the file readable
@@ -1768,7 +1789,7 @@ fn file_needs_header(path: &Path) -> anyhow::Result<bool> {
     // (it would fuse the new frame onto the partial one).
     trim_to_last_newline(path)
         .map_err(|e| anyhow::anyhow!("failed to trim partial trailing record in {path:?}: {e}"))?;
-    Ok(false)
+    Ok(Some(header_type))
 }
 
 /// Truncate `path` to end at its last NEWLINE byte (inclusive). Used
@@ -2503,13 +2524,13 @@ mod tests {
     /// file untouched, not truncate it.
     #[cfg(unix)]
     #[test]
-    fn file_needs_header_io_error_propagates_without_truncating() {
+    fn partition_header_io_error_propagates_without_truncating() {
         let dir = tempfile::tempdir().unwrap();
 
         // stat error (ELOOP): a self-referential symlink.
         let looped = dir.path().join("loop:2024.pb");
         std::os::unix::fs::symlink(&looped, &looped).unwrap();
-        let err = file_needs_header(&looped).expect_err("ELOOP must propagate");
+        let err = partition_header(&looped).expect_err("ELOOP must propagate");
         assert!(
             err.to_string().contains("stat"),
             "unexpected error: {err:#}"
@@ -2528,7 +2549,7 @@ mod tests {
             std::fs::metadata(&dirp).unwrap().len() > 0,
             "test premise: a non-empty directory reports a non-zero size"
         );
-        let err = file_needs_header(&dirp).expect_err("EISDIR must propagate");
+        let err = partition_header(&dirp).expect_err("EISDIR must propagate");
         assert!(
             err.to_string().contains("cannot read PB header"),
             "unexpected error: {err:#}"
@@ -2542,11 +2563,11 @@ mod tests {
     /// The one case that MAY truncate: bytes were read and the header
     /// does not decode.
     #[test]
-    fn file_needs_header_truncates_only_undecodable_header() {
+    fn partition_header_truncates_only_undecodable_header() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad:2024.pb");
         std::fs::write(&path, b"\xff\xff\xffnot a payload info\n").unwrap();
-        assert!(file_needs_header(&path).unwrap());
+        assert!(partition_header(&path).unwrap().is_none());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     }
 
