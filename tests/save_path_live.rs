@@ -325,6 +325,41 @@ async fn pva_reconnect_first_sample_bypasses_drift_filter() {
     live.shutdown().await;
 }
 
+/// An IOC that connects with a far-future clock (booted before NTP
+/// sync) and is corrected afterwards. The first-after-connect waiver
+/// covers only the past side of the drift window; a future stamp is
+/// dropped even on the first sample, because the write pool's per-PV
+/// monotonic guard would otherwise reject every later, correctly
+/// stamped sample until restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn future_first_sample_must_not_block_corrected_clock() {
+    let t0 = SystemTime::now();
+    let future = t0 + Duration::from_secs(2 * 3600);
+    let live = Live::start(nt_double(0.0, future)).await;
+    live.mgr
+        .archive_pv(PV, &SampleMode::Monitor, Protocol::Pva)
+        .await
+        .expect("archive_pv over PVA");
+    live.wait_connected(true, Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    live.pv
+        .try_post(nt_double(1.0, t0 + Duration::from_secs(1)));
+    let from = t0 - Duration::from_secs(60);
+    let to = t0 + Duration::from_secs(3 * 3600);
+    let got = live
+        .wait_stored(from, to, &[1.0], Duration::from_secs(15))
+        .await;
+    assert!(
+        !got.iter().any(|(_, v)| *v == 0.0),
+        "future-stamped sample must not be archived: {got:?}"
+    );
+    let c = live.counters();
+    assert_eq!(c.timestamp_drops, 1, "{c:?}");
+
+    live.shutdown().await;
+}
+
 /// Library contract the fast path's re-subscribe relies on: a
 /// server-side `SharedPV::close()` ends the `pvmonitor_handle` stream
 /// with `MonitorConnEvent::Finished` (pvxs parity: `SharedPV::close()`

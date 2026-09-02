@@ -34,15 +34,26 @@ const CA_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// stale uninitialised IOC clock or a sentinel.
 const PAST_CUTOFF_UNIX_SECS: i64 = 662_688_000; // 1991-01-01 00:00:00 UTC
 
-/// Filter a freshly-received sample timestamp against the wall clock and
-/// the floor. Returns `Some(ts)` if accepted, `None` if it should be
-/// dropped (caller bumps `timestamp_drops`).
+/// The one timestamp gate for every ingest path that carries an IOC
+/// timestamp. Returns `true` if the sample is accepted, `false` if the
+/// caller must drop it (and bump `timestamp_drops`).
 ///
-/// `drift_secs` is the configured `server_ioc_drift_secs` (Java parity
-/// 6538631), so per-site tuning doesn't require recompiling. `now` is
-/// passed in (rather than calling `SystemTime::now()` here) so the test
-/// suite can pin time deterministically.
-fn ioc_timestamp_in_window(ts: SystemTime, now: SystemTime, drift_secs: u64) -> bool {
+/// Three bounds: the 1991 floor, and `now ± drift_secs`
+/// (`server_ioc_drift_secs`, Java parity 6538631). `first_after_connect`
+/// waives only the past side — a reconnect backfill legitimately
+/// carries older stamps. The floor and the future bound hold for every
+/// sample: the write pool's per-PV monotonic guard rejects anything
+/// older than the last accepted stamp, so a single accepted future
+/// stamp (an IOC booted before NTP sync) would reject every correctly
+/// stamped sample that follows until restart.
+///
+/// `now` is passed in so tests can pin time deterministically.
+fn accept_ioc_timestamp(
+    ts: SystemTime,
+    now: SystemTime,
+    drift_secs: u64,
+    first_after_connect: bool,
+) -> bool {
     let unix = ts
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -50,13 +61,58 @@ fn ioc_timestamp_in_window(ts: SystemTime, now: SystemTime, drift_secs: u64) -> 
     if unix < PAST_CUTOFF_UNIX_SECS {
         return false;
     }
-    // Within ±drift_secs of `now`?
     let now_unix = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let delta = (unix - now_unix).unsigned_abs();
-    delta <= drift_secs
+    let drift = i64::try_from(drift_secs).unwrap_or(i64::MAX);
+    if unix > now_unix.saturating_add(drift) {
+        return false;
+    }
+    first_after_connect || unix >= now_unix.saturating_sub(drift)
+}
+
+#[cfg(test)]
+mod ioc_timestamp_gate_tests {
+    use super::*;
+
+    const DRIFT: i64 = 1800;
+    const NOW: i64 = 1_700_000_000;
+
+    fn at(unix: i64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(unix as u64)
+    }
+
+    fn accept(unix: i64, first_after_connect: bool) -> bool {
+        accept_ioc_timestamp(at(unix), at(NOW), DRIFT as u64, first_after_connect)
+    }
+
+    #[test]
+    fn window_edges_inclusive_either_way() {
+        for first in [false, true] {
+            assert!(accept(NOW - DRIFT, first));
+            assert!(accept(NOW, first));
+            assert!(accept(NOW + DRIFT, first));
+        }
+    }
+
+    #[test]
+    fn past_beyond_window_only_first_after_connect() {
+        assert!(!accept(NOW - DRIFT - 1, false));
+        assert!(accept(NOW - DRIFT - 1, true));
+    }
+
+    #[test]
+    fn future_beyond_window_rejected_even_first_after_connect() {
+        assert!(!accept(NOW + DRIFT + 1, false));
+        assert!(!accept(NOW + DRIFT + 1, true));
+    }
+
+    #[test]
+    fn below_1991_floor_rejected_even_first_after_connect() {
+        assert!(!accept(PAST_CUTOFF_UNIX_SECS - 1, true));
+        assert!(accept(PAST_CUTOFF_UNIX_SECS, true));
+    }
 }
 
 /// Discrete connection state for `getPVDetails` (Java parity dea7acb).
@@ -1308,7 +1364,7 @@ fn pva_handle_event(
     };
 
     let ts = pv_field_extract_timestamp(field);
-    if !first_after_connect && !ioc_timestamp_in_window(ts, now, drift_secs) {
+    if !accept_ioc_timestamp(ts, now, drift_secs, first_after_connect) {
         counters.timestamp_drops.fetch_add(1, Ordering::Relaxed);
         debug!(
             pv = pv_name,
@@ -2017,14 +2073,11 @@ async fn monitor_loop(
                             let now = SystemTime::now();
                             // Java parity (11e554d0): use the IOC-reported
                             // timestamp, not receive-time, so latency
-                            // doesn't smear sample times. First sample
-                            // after connect is accepted unconditionally
-                            // — legitimate backfill on reconnect can
-                            // include older timestamps. Subsequent
-                            // samples whose IOC clock is more than
-                            // SERVER_IOC_DRIFT_SECS away from wall clock,
-                            // or earlier than the 1991 floor, are
-                            // dropped + counted.
+                            // doesn't smear sample times. The first
+                            // sample after connect may be older than the
+                            // drift window (reconnect backfill); the 1991
+                            // floor and the future bound apply to every
+                            // sample — see `accept_ioc_timestamp`.
                             let first_after_connect = {
                                 let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
                                 let first = ci.last_event_time.is_none();
@@ -2036,13 +2089,12 @@ async fn monitor_loop(
                                 ci.state = PvConnectionState::Connected;
                                 first
                             };
-                            if !first_after_connect
-                                && !ioc_timestamp_in_window(
-                                    snapshot.timestamp.into(),
-                                    now,
-                                    server_ioc_drift_secs,
-                                )
-                            {
+                            if !accept_ioc_timestamp(
+                                snapshot.timestamp.into(),
+                                now,
+                                server_ioc_drift_secs,
+                                first_after_connect,
+                            ) {
                                 counters.timestamp_drops.fetch_add(1, Ordering::Relaxed);
                                 debug!(
                                     pv = pv_name,
