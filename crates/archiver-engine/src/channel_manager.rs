@@ -1401,10 +1401,22 @@ fn pva_handle_event(
         element_count: Some(elem_count),
         counters: Some(counters.clone()),
     };
-    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(pv_sample) {
-        counters
-            .buffer_overflow_drops
-            .fetch_add(1, Ordering::Relaxed);
+    // Non-blocking by design (this runs on the epics-rs reactor task),
+    // so a full channel drops the sample: count it AND say so. A
+    // closed channel means the write pool is gone (shutdown); the
+    // sample is dropped either way, and a silent drop of both cases
+    // was indistinguishable from a healthy PV in the logs.
+    match tx.try_send(pv_sample) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            counters
+                .buffer_overflow_drops
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(pv = pv_name, "write channel full; PVA sample dropped");
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            debug!(pv = pv_name, "write channel closed; PVA sample dropped");
+        }
     }
 }
 
