@@ -117,6 +117,9 @@ pub struct PvCountersDto {
     /// so operators can tell a wedged storage tier apart from a
     /// slow writer.
     pub storage_append_timeouts: u64,
+    /// Storage `append_event_with_meta` calls that returned an error or
+    /// panicked — the sample is lost.
+    pub storage_write_errors: u64,
     /// Events dropped because the shard's channel was closed (worker
     /// death / respawn budget spent) — distinct from
     /// `buffer_overflow_drops` (channel full but the worker is alive).

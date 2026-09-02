@@ -210,6 +210,12 @@ pub struct PvCounters {
     /// operator can tell "the storage tier is wedged" apart from
     /// "the writer can't keep up with the producer".
     pub storage_append_timeouts: AtomicU64,
+    /// Number of `storage.append_event_with_meta` calls that returned an
+    /// error or panicked — the sample is gone (disk full, EIO, codec
+    /// mismatch). Distinct from `storage_append_timeouts` (the write may
+    /// still land late) and `buffer_overflow_drops` (never reached
+    /// storage). Aggregated as `archiver_storage_write_errors_total`.
+    pub storage_write_errors: AtomicU64,
     /// Number of events dropped because the shard's channel was closed —
     /// the worker task died (loop panic) or its respawn budget was spent.
     /// Distinct from `buffer_overflow_drops` (channel full but the worker
@@ -240,6 +246,7 @@ impl Default for PvCounters {
             latest_observed_dbr: AtomicI32::new(-1),
             metadata_fetch_failures: AtomicU64::new(0),
             storage_append_timeouts: AtomicU64::new(0),
+            storage_write_errors: AtomicU64::new(0),
             shard_closed_drops: AtomicU64::new(0),
             shutdown_abandoned_drops: AtomicU64::new(0),
         }
@@ -264,6 +271,7 @@ pub struct PvCountersSnapshot {
     pub latest_observed_dbr: Option<i32>,
     pub metadata_fetch_failures: u64,
     pub storage_append_timeouts: u64,
+    pub storage_write_errors: u64,
     pub shard_closed_drops: u64,
     pub shutdown_abandoned_drops: u64,
 }
@@ -292,6 +300,7 @@ impl From<&PvCounters> for PvCountersSnapshot {
             },
             metadata_fetch_failures: c.metadata_fetch_failures.load(Ordering::Relaxed),
             storage_append_timeouts: c.storage_append_timeouts.load(Ordering::Relaxed),
+            storage_write_errors: c.storage_write_errors.load(Ordering::Relaxed),
             shard_closed_drops: c.shard_closed_drops.load(Ordering::Relaxed),
             shutdown_abandoned_drops: c.shutdown_abandoned_drops.load(Ordering::Relaxed),
         }
@@ -4070,9 +4079,11 @@ async fn shard_handle_sample(
             // Report already went out from inside the closure.
         }
         Ok(Ok(Err(e))) => {
+            record_write_error(&counters_for_post);
             error!(shard = shard_idx, pv = pv_name_for_post, "Write error: {e}");
         }
         Ok(Err(join_err)) => {
+            record_write_error(&counters_for_post);
             error!(
                 shard = shard_idx,
                 pv = pv_name_for_post,
@@ -4097,6 +4108,17 @@ async fn shard_handle_sample(
             }
         }
     }
+}
+
+/// Account a sample lost to a storage append error or panic. Single
+/// owner of `storage_write_errors`: both terminal failure branches of
+/// `shard_handle_sample` route through here, so the loss is visible
+/// on the PV's counters and in Prometheus, not only in the log.
+fn record_write_error(counters: &Option<Arc<PvCounters>>) {
+    if let Some(c) = counters.as_ref() {
+        c.storage_write_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    metrics::counter!("archiver_storage_write_errors_total").increment(1);
 }
 
 /// Drain the shard's remaining buffered samples on shutdown,

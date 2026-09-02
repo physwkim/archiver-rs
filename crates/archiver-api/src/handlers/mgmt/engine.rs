@@ -314,6 +314,7 @@ pub async fn pv_status_action(
             "bufferOverflowDrops": c.buffer_overflow_drops,
             "timestampDrops": c.timestamp_drops,
             "typeChangeDrops": c.type_change_drops,
+            "storageWriteErrors": c.storage_write_errors,
             "shardClosedDrops": c.shard_closed_drops,
             "shutdownAbandonedDrops": c.shutdown_abandoned_drops,
             "disconnectCount": c.disconnect_count,

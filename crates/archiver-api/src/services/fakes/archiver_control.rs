@@ -105,6 +105,7 @@ impl ArchiverQuery for FakeArchiverControl {
                         latest_observed_dbr: None,
                         metadata_fetch_failures: 0,
                         storage_append_timeouts: 0,
+                        storage_write_errors: 0,
                         shard_closed_drops: 0,
                         shutdown_abandoned_drops: 0,
                     },

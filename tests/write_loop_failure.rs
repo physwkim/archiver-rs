@@ -1034,6 +1034,13 @@ async fn shard_error_bumps_last_ts_for_ordering() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    // The errored append is a lost sample; it must be visible on the
+    // PV's own counters, not only in the error log.
+    assert_eq!(
+        counters.storage_write_errors.load(Ordering::Relaxed),
+        1,
+        "storage append error must increment storage_write_errors"
+    );
     // The older sample must have been dropped at the shard's
     // ordering check, not reached storage.
     assert!(
