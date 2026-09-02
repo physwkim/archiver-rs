@@ -929,6 +929,56 @@ async fn flush_timeout_does_not_consume_loss_markers_then_no_overcommit() {
 /// The final flush should wait for the in-flight flush to
 /// complete (within budget), then commit the new sample's
 /// timestamp to the registry.
+/// Shutdown ordering: the final flush + commit must cover every
+/// sample the shard drain appends, however long the drain takes
+/// within `drain_total_budget`. Before, the owner's final flush ran
+/// ~200 ms after the shutdown signal while the shard was still
+/// draining, so the tail of the drain was appended but its
+/// timestamps were never committed to the registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_final_flush_runs_after_shard_drain() {
+    let storage = InjectingStorage::new();
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    let counters = Arc::new(PvCounters::default());
+    let n = 30u64;
+    let pvs: Vec<String> = (0..n).map(|i| format!("PV:Drain{i}")).collect();
+    for pv in &pvs {
+        registry
+            .register_pv(pv, ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+        // 30 × 30 ms ≈ 900 ms of sequential drain — far past the
+        // owner's 200 ms grace, well inside fast_cfg's 2 s budget.
+        storage.set_append_hang(pv, Duration::from_millis(30));
+    }
+    let cfg = fast_cfg();
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry.clone(), cfg);
+
+    for (i, pv) in pvs.iter().enumerate() {
+        tx.send(pv_sample(pv, ts(i as u64), 1.0, &counters))
+            .await
+            .unwrap();
+    }
+    sd_tx.send(true).unwrap();
+    join.await.unwrap();
+
+    let uncommitted: Vec<&String> = pvs
+        .iter()
+        .filter(|pv| {
+            registry
+                .get_pv(pv)
+                .unwrap()
+                .unwrap()
+                .last_timestamp
+                .is_none()
+        })
+        .collect();
+    assert!(
+        uncommitted.is_empty(),
+        "every drained sample must be committed by the final flush; \
+         uncommitted: {uncommitted:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_final_flush_waits_for_in_flight_to_clear() {
     // Tighter timing for a fast test, but still within fast_cfg

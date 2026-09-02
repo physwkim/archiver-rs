@@ -180,6 +180,13 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
     };
+    // The write pool's worst-case shutdown is the shard drain budget
+    // followed by the final flush + registry commit. The supervisor
+    // must outlast both: aborting the pool mid-final-flush leaves the
+    // drained tail on disk with its timestamps never committed.
+    let write_pool_shutdown_budget = pool_cfg.write_loop.drain_total_budget
+        + pool_cfg.write_loop.shutdown_flush_timeout
+        + Duration::from_secs(5);
     info!(
         shards = pool_cfg.shards,
         per_shard_buffer = pool_cfg.per_shard_buffer,
@@ -415,7 +422,7 @@ async fn main() -> anyhow::Result<()> {
         server.await?;
     }
 
-    supervisor.shutdown(Duration::from_secs(30)).await;
+    supervisor.shutdown(write_pool_shutdown_budget).await;
     info!("Archiver stopped");
     Ok(())
 }

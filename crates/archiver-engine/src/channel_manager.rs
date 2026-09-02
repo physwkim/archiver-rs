@@ -3208,11 +3208,16 @@ pub async fn run_sharded_write_pool(
 
     // Spawn the global flush owner first so it's ready to flush
     // as soon as shards start appending.
+    // Fired once every shard worker has returned, so the flush
+    // owner's final flush + commit runs AFTER the drain, not
+    // concurrently with it.
+    let (shards_done_tx, shards_done_rx) = tokio::sync::oneshot::channel::<()>();
     let flush_owner_handle = tokio::spawn(flush_owner_loop(
         storage.clone(),
         registry.clone(),
         pending.clone(),
         shutdown.clone(),
+        shards_done_rx,
         cfg.write_loop.clone(),
     ));
 
@@ -3248,9 +3253,9 @@ pub async fn run_sharded_write_pool(
         .await;
     }
 
-    // Flush owner uses its own shutdown-watch + drain_total_budget
-    // grace timer, not an EOS signal — see flush_owner_loop. Wait
-    // for it to finish.
+    // Every shard has returned: nothing will append or post to
+    // `pending` again. Release the flush owner's final flush.
+    let _ = shards_done_tx.send(());
     let _ = flush_owner_handle.await;
 }
 
@@ -4208,6 +4213,7 @@ async fn flush_owner_loop(
     registry: Arc<PvRegistry>,
     pending: Arc<PendingReports>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shards_done: tokio::sync::oneshot::Receiver<()>,
     cfg: WriteLoopConfig,
 ) {
     let flush_period = cfg.flush_period;
@@ -4262,7 +4268,16 @@ async fn flush_owner_loop(
         }
     }
 
-    // Phase 2: shutdown grace. Two windows in one budget:
+    // Phase 2: shutdown grace. Three windows in one budget:
+    //
+    //   0. Wait for the shard workers to finish draining. A shard
+    //      keeps appending — and posting ts_updates into `pending`
+    //      — for as long as its drain runs, so a final flush taken
+    //      while the drain was still going left the tail of the
+    //      drain sitting in BufWriters with its ts_updates never
+    //      committed. `run_sharded_write_pool` fires `shards_done`
+    //      once every shard has returned; a dropped sender (the
+    //      pool unwound) counts as done.
     //
     //   1. A brief minimum sleep so any in-flight spawn_blocking
     //      late-success closures can coalesce their reports into
@@ -4275,13 +4290,23 @@ async fn flush_owner_loop(
     //      short-circuit, and skip every entry in `pending` —
     //      data on disk but no registry commit.
     //
-    // Both windows fit inside the operator-configured
-    // `drain_total_budget`. If a flush is genuinely wedged past
-    // the budget, we proceed to final flush; that call will see
-    // `in_flight` still set and short-circuit, but at least we
+    // All windows fit inside the operator-configured
+    // `drain_total_budget`. If a drain or flush is genuinely wedged
+    // past the budget, we proceed to final flush; that call will
+    // see `in_flight` still set and short-circuit, but at least we
     // didn't pin the process forever. Future samples on restart
     // will re-populate `pending` and the registry catches up.
     let phase2_deadline = std::time::Instant::now() + drain_total_budget;
+    if tokio::time::timeout(drain_total_budget, shards_done)
+        .await
+        .is_err()
+    {
+        warn!(
+            "Shutdown drain budget ({drain_total_budget:?}) exhausted before the \
+             shard workers finished; final flush will not cover the rest of \
+             the drain"
+        );
+    }
     let min_grace = std::cmp::min(drain_total_budget, Duration::from_millis(200));
     if !min_grace.is_zero() {
         tokio::time::sleep(min_grace).await;
