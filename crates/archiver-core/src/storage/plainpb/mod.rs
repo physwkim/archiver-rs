@@ -1209,6 +1209,17 @@ impl PlainPbStoragePlugin {
     }
 
     /// Ensure a parent directory exists, using a cached set to skip repeated syscalls.
+    /// Drop `path`'s parent from the `known_dirs` cache. The cache is
+    /// positive-only (a directory once created is assumed to persist);
+    /// this is its single invalidation point, used when an open reports
+    /// NotFound for a path whose parent the cache still claims.
+    fn forget_parent_dir(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            let mut dirs = self.known_dirs.lock().unwrap_or_else(|e| e.into_inner());
+            dirs.remove(parent);
+        }
+    }
+
     fn ensure_parent_dir(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             let needs_create = {
@@ -1433,6 +1444,25 @@ impl PlainPbStoragePlugin {
                         "Hit OS file-handle limit; evicted LRU writer and \
                          retrying open"
                     );
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)?
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // `create(true)` can only report NotFound when the
+                    // parent directory is gone — removed after
+                    // `known_dirs` recorded it (operator cleanup, a
+                    // remount). The cache is positive-only, so without
+                    // this every append under that prefix failed until
+                    // restart. Forget the entry, recreate, retry once.
+                    tracing::warn!(
+                        ?path,
+                        "partition directory vanished; recreating and \
+                         retrying open"
+                    );
+                    self.forget_parent_dir(path);
+                    self.ensure_parent_dir(path)?;
                     std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)

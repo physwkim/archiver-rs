@@ -795,6 +795,45 @@ async fn ghost_file_path_records_loss() {
     );
 }
 
+/// The partition directory is removed out from under a plugin that
+/// already created it (operator cleanup). The next append must
+/// recreate it and land, not fail on the stale `known_dirs` entry
+/// until restart.
+#[tokio::test]
+async fn append_recreates_partition_dir_removed_after_creation() {
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+
+    let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap().into();
+    let ts2 = ts1 + std::time::Duration::from_secs(60);
+    let pv = "TEST:DirGone";
+
+    let s1 = ArchiverSample::new(ts1, ArchiverValue::ScalarDouble(1.0));
+    plugin
+        .append_event(pv, ArchDbType::ScalarDouble, &s1)
+        .await
+        .unwrap();
+    plugin.flush_writes().await.unwrap();
+
+    let path = plugin.file_path_for(pv, ts1);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+    let s2 = ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(2.0));
+    plugin
+        .append_event(pv, ArchDbType::ScalarDouble, &s2)
+        .await
+        .expect("append must recreate the vanished partition directory");
+    plugin.flush_writes().await.unwrap();
+
+    let mut rdr = PbFileReader::open(&path).expect("partition recreated with a header");
+    let mut vals = Vec::new();
+    while let Some(s) = rdr.next_event().unwrap() {
+        vals.push(s.value);
+    }
+    assert_eq!(vals, vec![ArchiverValue::ScalarDouble(2.0)]);
+}
+
 /// A stat ERROR on the cached writer's path is not "file gone": the
 /// dirty buffer must be kept and land once the path is stat-able
 /// again. Provoked with ENOTDIR — the partition's parent directory is
