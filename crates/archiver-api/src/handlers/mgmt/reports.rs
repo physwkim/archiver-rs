@@ -174,7 +174,7 @@ pub async fn get_pvs_by_storage_consumed(
         let files: u64 = summaries.iter().filter_map(|s| s.pv_file_count).sum();
         entries.push((pv, bytes, files));
     }
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
     entries.truncate(limit);
 
     let json: Vec<serde_json::Value> = entries
