@@ -715,9 +715,11 @@ impl ChannelManager {
     }
 
     /// PVA equivalent of `start_archiving_internal`. Spawns a single
-    /// callback-driven monitor task; pvAccess auto-reconnect inside
-    /// `pvmonitor_handle` removes the explicit reconnect loop the CA
-    /// path needs. PVA records use `channel: None` on the [`PvHandle`]
+    /// callback-driven monitor task. `pvmonitor_handle` reconnects on
+    /// its own only across circuit loss; a server-side stream end
+    /// (`Finished`, fatal/remote error) ends its reactor task, and
+    /// `monitor_loop_pva` re-subscribes from there. PVA records use
+    /// `channel: None` on the [`PvHandle`]
     /// and skip per-field "extras" subscriptions (`.HIHI`/`.LOLO`/…)
     /// since pvAccess wraps those in the NTScalar value structure
     /// rather than separate channels.
@@ -1393,8 +1395,10 @@ async fn monitor_loop_pva(
     // Subscribe loop with retry. The custom-request path uses
     // `pvmonitor_with_request` (no SubscriptionHandle) inside a
     // tokio::select! so cancellation drops the future cleanly; the
-    // empty-request path keeps the original SubscriptionHandle form
-    // since that's the simpler path for the common case.
+    // empty-request path keeps the SubscriptionHandle form and
+    // watches its reactor task through `SubscriptionEnd`. Both paths
+    // follow one rule: a subscription that ends for any reason other
+    // than our own cancel waits `CA_RETRY_DELAY` and re-subscribes.
     loop {
         if let Some(ref req) = request_expr {
             // Custom-request path: 1-arg callback. `pvmonitor_with_request`
@@ -1502,34 +1506,44 @@ async fn monitor_loop_pva(
             // instead of being dropped. The `was_connected` guard keeps
             // the counter single-owner against the watchdog, which may
             // have marked the PV disconnected already.
+            // One `Notify` per subscription generation, so a permit
+            // left by a generation that failed to subscribe cannot
+            // fire into the next one.
+            let ended = Arc::new(tokio::sync::Notify::new());
+            let end_guard = SubscriptionEnd(ended.clone());
             let conn_info_ev = conn_info.clone();
             let counters_ev = counters.clone();
             let pv_name_ev = pv_name.clone();
-            let on_conn = move |ev: MonitorConnEvent| match ev {
-                MonitorConnEvent::Connected { .. } => {
-                    let mut ci = conn_info_ev.lock().unwrap_or_else(|e| e.into_inner());
-                    if ci.connected_since.is_none() {
-                        ci.connected_since = Some(SystemTime::now());
-                    }
-                    ci.is_connected = true;
-                    ci.state = PvConnectionState::Connected;
-                }
-                MonitorConnEvent::Disconnected | MonitorConnEvent::Finished => {
-                    let was_connected = {
+            let on_conn = move |ev: MonitorConnEvent| {
+                // Captured so the guard lives in the reactor task and
+                // drops when the task ends.
+                let _ = &end_guard;
+                match ev {
+                    MonitorConnEvent::Connected { .. } => {
                         let mut ci = conn_info_ev.lock().unwrap_or_else(|e| e.into_inner());
-                        let prev = ci.is_connected;
-                        ci.is_connected = false;
-                        ci.last_event_time = None;
-                        ci.state = PvConnectionState::Disconnected;
-                        prev
-                    };
-                    if was_connected {
-                        counters_ev.disconnect_count.fetch_add(1, Ordering::Relaxed);
-                        counters_ev
-                            .last_disconnect_unix_secs
-                            .store(unix_secs(SystemTime::now()), Ordering::Relaxed);
+                        if ci.connected_since.is_none() {
+                            ci.connected_since = Some(SystemTime::now());
+                        }
+                        ci.is_connected = true;
+                        ci.state = PvConnectionState::Connected;
                     }
-                    debug!(pv = pv_name_ev, "PVA monitor connection lost");
+                    MonitorConnEvent::Disconnected | MonitorConnEvent::Finished => {
+                        let was_connected = {
+                            let mut ci = conn_info_ev.lock().unwrap_or_else(|e| e.into_inner());
+                            let prev = ci.is_connected;
+                            ci.is_connected = false;
+                            ci.last_event_time = None;
+                            ci.state = PvConnectionState::Disconnected;
+                            prev
+                        };
+                        if was_connected {
+                            counters_ev.disconnect_count.fetch_add(1, Ordering::Relaxed);
+                            counters_ev
+                                .last_disconnect_unix_secs
+                                .store(unix_secs(SystemTime::now()), Ordering::Relaxed);
+                        }
+                        debug!(pv = pv_name_ev, "PVA monitor connection lost");
+                    }
                 }
             };
             let handle = match pva_client.pvmonitor_handle(&pv_name, cb, on_conn).await {
@@ -1546,11 +1560,42 @@ async fn monitor_loop_pva(
                 }
             };
             debug!(pv = pv_name, "PVA monitor active");
-            cancel_token.cancelled().await;
-            debug!(pv = pv_name, "PVA monitor cancelled; dropping subscription");
-            drop(handle);
-            return;
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    debug!(pv = pv_name, "PVA monitor cancelled; dropping subscription");
+                    drop(handle);
+                    return;
+                }
+                _ = ended.notified() => {
+                    debug!(pv = pv_name, "PVA monitor subscription ended; resubscribing");
+                    drop(handle);
+                }
+            }
+            tokio::select! {
+                _ = cancel_token.cancelled() => return,
+                _ = tokio::time::sleep(CA_RETRY_DELAY) => continue,
+            }
         }
+    }
+}
+
+/// Fires when the reactor task behind a `pvmonitor_handle`
+/// subscription stops running. `SubscriptionHandle` exposes no
+/// completion future, but the task owns the `on_conn` closure, so
+/// the closure's captures drop exactly when the task ends — on
+/// `Finished` (server closed the stream), on a fatal/remote error
+/// (surfaced only as `Disconnected`, indistinguishable from a
+/// circuit loss the task retries itself), or on channel close.
+/// `monitor_loop_pva` selects on this next to `cancel_token`, so
+/// every task end re-subscribes through the same retry rule as the
+/// custom-request path.
+struct SubscriptionEnd(Arc<tokio::sync::Notify>);
+
+impl Drop for SubscriptionEnd {
+    fn drop(&mut self) {
+        // Stores a permit when nobody is waiting yet, so an end that
+        // races ahead of `notified()` is not lost.
+        self.0.notify_one();
     }
 }
 
