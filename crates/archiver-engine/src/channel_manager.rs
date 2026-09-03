@@ -5841,3 +5841,75 @@ mod shard_lifecycle_tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+mod quiesce_bound_tests {
+    use super::*;
+    use archiver_core::registry::{PvRegistry, PvStatus, SampleMode};
+
+    const PV: &str = "BOUND:PV";
+
+    /// A manager over an in-memory registry with `PV` registered. Under
+    /// the paused clock [`QUIESCE_TIMEOUT`] elapses as soon as the
+    /// runtime is idle, so the bounds are checked at their real value.
+    async fn manager() -> Arc<ChannelManager> {
+        let registry = Arc::new(PvRegistry::in_memory().unwrap());
+        registry
+            .register_pv(PV, ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+        let (mgr, _rx) = ChannelManager::new(registry, None).await.unwrap();
+        Arc::new(mgr)
+    }
+
+    fn status(mgr: &ChannelManager) -> PvStatus {
+        mgr.registry.get_pv(PV).unwrap().unwrap().status
+    }
+
+    /// An operation queued behind a held op lock fails after the bound
+    /// instead of waiting the holder out, and leaves the PV untouched.
+    #[tokio::test(start_paused = true)]
+    async fn an_operation_behind_a_held_op_lock_fails_after_the_bound() {
+        let mgr = manager().await;
+        let before = status(&mgr);
+        let _held = mgr.op_lock(PV).lock_owned().await;
+
+        let started = tokio::time::Instant::now();
+        let err = mgr.pause_pv(PV).await.expect_err("bounded lock wait");
+        assert!(err.to_string().contains("still in progress after"), "{err}");
+        assert!(started.elapsed() >= QUIESCE_TIMEOUT);
+        assert_eq!(status(&mgr), before);
+    }
+
+    /// A stop transition still quiescing after the bound reports it,
+    /// keeps the op lock, and still finalizes when the queue drains.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_transition_still_quiescing_after_the_bound_completes_later() {
+        let mgr = manager().await;
+        let counters = Arc::new(PvCounters::default());
+        mgr.counters.insert(PV.to_string(), counters.clone());
+        let in_flight = InFlight::new(Some(counters));
+
+        let started = tokio::time::Instant::now();
+        let err = mgr.pause_pv(PV).await.expect_err("bounded quiesce");
+        assert!(err.to_string().contains("still quiescing after"), "{err}");
+        assert!(started.elapsed() >= QUIESCE_TIMEOUT);
+        assert_ne!(status(&mgr), PvStatus::Paused);
+        // The parked transition still owns the lock.
+        let err = mgr
+            .resume_pv(PV)
+            .await
+            .expect_err("lock held by the transition");
+        assert!(err.to_string().contains("still in progress after"), "{err}");
+
+        drop(in_flight);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while status(&mgr) != PvStatus::Paused {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "transition never finalized"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(mgr.lock_op(PV).await.is_ok(), "lock not released");
+    }
+}
