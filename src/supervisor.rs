@@ -34,6 +34,20 @@ impl RuntimeSupervisor {
         self.shutdown_tx.subscribe()
     }
 
+    /// Resolves once shutdown has been requested — including when the
+    /// request happened before this call. `changed()` on a receiver
+    /// obtained here cannot express that case: `subscribe` marks the
+    /// current value as seen, so a critical task that died before the
+    /// caller subscribed would never wake it.
+    pub fn shutdown_requested(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.shutdown_tx.subscribe();
+        async move {
+            // Err means every sender is gone, which only happens on
+            // the way out — treat it as "requested".
+            let _ = rx.wait_for(|requested| *requested).await;
+        }
+    }
+
     pub fn spawn(
         &mut self,
         name: &str,
@@ -191,6 +205,23 @@ mod tests {
         sup.shutdown(Duration::from_secs(1))
             .await
             .expect("exit after a requested shutdown is normal");
+    }
+
+    #[tokio::test]
+    async fn shutdown_requested_resolves_for_a_death_before_the_call() {
+        let (tx, rx) = watch::channel(false);
+        let mut sup = RuntimeSupervisor::new(tx);
+        sup.spawn_critical("pool", async {});
+        assert!(
+            wait_for_shutdown(rx).await,
+            "early exit must request shutdown"
+        );
+        // The death is already recorded; a waiter created only now
+        // must still resolve.
+        tokio::time::timeout(Duration::from_secs(1), sup.shutdown_requested())
+            .await
+            .expect("a waiter created after the death must resolve");
+        assert!(sup.shutdown(Duration::from_secs(1)).await.is_err());
     }
 
     #[tokio::test]

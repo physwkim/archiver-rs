@@ -391,11 +391,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Graceful-shutdown trigger for the HTTP server: the OS signal, or
     // the supervisor flipping the watch because a critical task died.
-    let mut supervisor_shutdown = supervisor.shutdown_rx();
+    let supervisor_shutdown = supervisor.shutdown_requested();
     let shutdown_signal = async move {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => info!("Shutdown signal received"),
-            _ = supervisor_shutdown.changed() => {
+            _ = supervisor_shutdown => {
                 tracing::warn!("Shutdown requested by the supervisor");
             }
         }
