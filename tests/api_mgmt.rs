@@ -1649,6 +1649,99 @@ async fn test_p2_change_type_for_pv_converts_stored_data() {
     );
 }
 
+/// changeTypeForPV must serialize with the ETL chain's move gate. The
+/// ETL skips paused PVs only when a run starts, so a move that began
+/// before the pause could delete the source partition after the
+/// conversion opened it; the converted rewrite would then resurrect
+/// the partition next to the coarser tier's old-type copy.
+#[tokio::test]
+async fn test_p2_change_type_for_pv_waits_for_the_etl_move_gate() {
+    use archiver_core::etl::executor::EtlExecutor;
+    use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sts = Arc::new(PlainPbStoragePlugin::new(
+        "sts",
+        dir.path().join("sts"),
+        PartitionGranularity::Hour,
+    ));
+    let mts = Arc::new(PlainPbStoragePlugin::new(
+        "mts",
+        dir.path().join("mts"),
+        PartitionGranularity::Day,
+    ));
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry
+        .register_pv(
+            "SIM:Sine",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
+    registry.set_status("SIM:Sine", PvStatus::Paused).unwrap();
+    let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    sts.append_event(
+        "SIM:Sine",
+        ArchDbType::ScalarDouble,
+        &ArchiverSample::new(ts, ArchiverValue::ScalarDouble(3.7)),
+    )
+    .await
+    .unwrap();
+    sts.flush_writes().await.unwrap();
+
+    let executor = Arc::new(EtlExecutor::new(sts.clone(), mts.clone(), 3600, 5, 3));
+    let gate = executor.move_gate();
+    let (channel_mgr, _rx) = ChannelManager::new(sts.clone(), registry.clone(), None)
+        .await
+        .unwrap();
+    let repo = Arc::new(RegistryRepository::new(registry.clone()));
+    let archiver = Arc::new(ChannelArchiverControl::new(Arc::new(channel_mgr)));
+    let state = AppState {
+        storage: sts.clone(),
+        pv_query: repo.clone(),
+        pv_cmd: repo,
+        archiver_query: archiver.clone(),
+        archiver_cmd: archiver,
+        cluster: None,
+        api_keys: None,
+        cluster_api_key: None,
+        metrics_handle: None,
+        rate_limiter: None,
+        trust_proxy_headers: false,
+        failover: None,
+        etl_chain: vec![executor],
+        reassign_appliance_enabled: false,
+    };
+    let app = build_router(state, &SecurityConfig::default());
+
+    // An ETL move in flight holds the gate.
+    let in_flight_move = gate.lock().await;
+    let app_for_req = app.clone();
+    let newtype = ArchDbType::ScalarInt as i32;
+    let request = tokio::spawn(async move {
+        app_for_req
+            .oneshot(get_request(&format!(
+                "/mgmt/bpl/changeTypeForPV?pv=SIM:Sine&newtype={newtype}"
+            )))
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !request.is_finished(),
+        "changeTypeForPV must wait for the in-flight ETL move"
+    );
+    drop(in_flight_move);
+    let resp = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("request completes once the move gate is released")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["partitionsConverted"], 1);
+}
+
 #[tokio::test]
 async fn test_p2_aggregated_appliance_info_standalone() {
     let (app, _reg, _dir) = build_test_app_with_pvs().await;

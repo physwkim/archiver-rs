@@ -106,6 +106,14 @@ impl EtlExecutor {
         self
     }
 
+    /// The move gate this executor serializes its moves on. Held by
+    /// operations outside the ETL that rewrite a partition in place
+    /// (changeTypeForPV's conversion) so they cannot interleave with a
+    /// move of the same file.
+    pub fn move_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.move_gate.clone()
+    }
+
     /// Wire a PV registry so the executor can skip paused PVs in
     /// `run_once`. Java parity (92db337): without this, PB files for a
     /// paused PV continue to migrate out of the STS, which surprises

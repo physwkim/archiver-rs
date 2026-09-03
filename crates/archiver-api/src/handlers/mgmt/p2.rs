@@ -199,6 +199,24 @@ pub async fn change_type_for_pv(
     // (the storage layer refuses such appends). Files are the truth: a
     // crash between the conversion and the registry update is repaired
     // by re-issuing the request — converted partitions are skipped.
+    //
+    // Held under the ETL chain's move gates: the ETL skips paused PVs
+    // only when a run starts, so a move that began before the pause
+    // could delete the source partition after the conversion opened
+    // it, and the converted rewrite would then resurrect the partition
+    // next to the coarser tier's old-type copy. main shares one gate
+    // across the chain; distinct gates are taken in chain order.
+    let mut gates: Vec<std::sync::Arc<tokio::sync::Mutex<()>>> = Vec::new();
+    for exec in &state.etl_chain {
+        let gate = exec.move_gate();
+        if !gates.iter().any(|g| std::sync::Arc::ptr_eq(g, &gate)) {
+            gates.push(gate);
+        }
+    }
+    let mut no_moves_in_flight = Vec::with_capacity(gates.len());
+    for gate in &gates {
+        no_moves_in_flight.push(gate.lock().await);
+    }
     let converted = match state.storage.convert_pv_type(&canonical, new_type).await {
         Ok(n) => n,
         Err(e) => {
@@ -209,6 +227,7 @@ pub async fn change_type_for_pv(
             .into_response();
         }
     };
+    drop(no_moves_in_flight);
     if let Err(e) = state.pv_cmd.import_pv(
         &canonical,
         new_type,
