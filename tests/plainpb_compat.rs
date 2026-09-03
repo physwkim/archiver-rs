@@ -795,6 +795,25 @@ async fn ghost_file_path_records_loss() {
     );
 }
 
+/// A timestamp outside chrono's calendar must fail the append with an
+/// error, not panic the shard's spawn_blocking task.
+#[tokio::test]
+async fn append_with_unrepresentable_timestamp_errors_without_panic() {
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let huge = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 62);
+    let s = ArchiverSample::new(huge, ArchiverValue::ScalarDouble(1.0));
+    let err = plugin
+        .append_event("TEST:HugeTs", ArchDbType::ScalarDouble, &s)
+        .await
+        .expect_err("out-of-range timestamp must be refused");
+    assert!(
+        err.to_string().contains("outside the representable"),
+        "unexpected error: {err:#}"
+    );
+}
+
 /// rename_pv must not clobber a partition that already exists under
 /// the destination name; both PVs' data must survive the refusal.
 #[tokio::test]

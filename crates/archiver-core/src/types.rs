@@ -145,18 +145,30 @@ impl ArchiverSample {
     }
 
     /// Decompose timestamp into (year, seconds_into_year, nanos).
-    pub fn decompose_timestamp(&self) -> (i32, u32, u32) {
-        let datetime = chrono::DateTime::<Utc>::from(self.timestamp);
+    ///
+    /// Errors instead of panicking when the timestamp lies outside the
+    /// calendar range chrono can represent (|year| > 262143): the PB
+    /// frame and the partition name both need a civil year, and a
+    /// panic here unwinds whichever task carried the sample (a shard's
+    /// append, an ETL move, a retrieval handler).
+    pub fn decompose_timestamp(&self) -> anyhow::Result<(i32, u32, u32)> {
+        let datetime = utc_datetime_checked(self.timestamp).ok_or_else(|| {
+            anyhow::anyhow!(
+                "sample timestamp {:?} is outside the representable calendar range",
+                self.timestamp
+            )
+        })?;
         let year = datetime.year();
+        // Jan 1 00:00:00 of a year chrono already represents is valid.
         let year_start = NaiveDateTime::new(
-            chrono::NaiveDate::from_ymd_opt(year, 1, 1).expect("year from valid SystemTime"),
+            chrono::NaiveDate::from_ymd_opt(year, 1, 1).expect("Jan 1 of an in-range year"),
             chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight"),
         )
         .and_utc();
         let duration = datetime.signed_duration_since(year_start);
         let seconds_into_year = duration.num_seconds() as u32;
         let nanos = datetime.timestamp_subsec_nanos();
-        (year, seconds_into_year, nanos)
+        Ok((year, seconds_into_year, nanos))
     }
 
     /// Reconstruct a SystemTime from year + seconds_into_year + nanos.
@@ -181,6 +193,30 @@ impl ArchiverSample {
         let ts = SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
         Self::new(ts, value)
     }
+}
+
+/// Non-panicking `SystemTime` → `DateTime<Utc>` conversion. `From` in
+/// chrono unwraps and panics once the year leaves ±262143; every
+/// timestamp that reaches storage or retrieval goes through here (or
+/// the clamping variant in `partition`) instead.
+pub fn utc_datetime_checked(ts: SystemTime) -> Option<chrono::DateTime<Utc>> {
+    let (secs, nanos) = match ts.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => (i64::try_from(d.as_secs()).ok()?, d.subsec_nanos()),
+        Err(e) => {
+            // Before the epoch: borrow one second so nanos stay positive.
+            let d = e.duration();
+            let s = i64::try_from(d.as_secs()).ok()?;
+            if d.subsec_nanos() == 0 {
+                (s.checked_neg()?, 0)
+            } else {
+                (
+                    s.checked_neg()?.checked_sub(1)?,
+                    1_000_000_000 - d.subsec_nanos(),
+                )
+            }
+        }
+    };
+    chrono::DateTime::<Utc>::from_timestamp(secs, nanos)
 }
 
 /// Description of an event stream (used in reader).
@@ -251,5 +287,46 @@ pub fn finite_or_null(f: f64) -> serde_json::Value {
         f.into()
     } else {
         serde_json::Value::Null
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn decompose_timestamp_round_trips_through_epoch_parts() {
+        let ts = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 250);
+        let s = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(0.0));
+        let (year, secs, nanos) = s.decompose_timestamp().unwrap();
+        assert_eq!(year, 2023);
+        assert_eq!(nanos, 250);
+        assert_eq!(
+            ArchiverSample::timestamp_from_epoch_parts(year, secs, nanos),
+            Some(ts)
+        );
+    }
+
+    #[test]
+    fn decompose_timestamp_errors_instead_of_panicking_out_of_range() {
+        // ~1.4e11 years past the epoch: representable as SystemTime,
+        // far outside chrono's ±262143-year calendar.
+        let ts = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(1 << 62))
+            .expect("SystemTime holds i64 seconds on this platform");
+        let s = ArchiverSample::new(ts, ArchiverValue::ScalarDouble(0.0));
+        let err = s.decompose_timestamp().unwrap_err();
+        assert!(err.to_string().contains("outside the representable"));
+        assert!(utc_datetime_checked(ts).is_none());
+    }
+
+    #[test]
+    fn utc_datetime_checked_handles_pre_epoch_fractions() {
+        let ts = SystemTime::UNIX_EPOCH - Duration::new(1, 500_000_000);
+        let dt = utc_datetime_checked(ts).unwrap();
+        assert_eq!(dt.timestamp(), -2);
+        assert_eq!(dt.timestamp_subsec_nanos(), 500_000_000);
+        assert_eq!(dt.year(), 1969);
     }
 }

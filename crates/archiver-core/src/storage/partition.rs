@@ -40,6 +40,19 @@ impl PartitionGranularity {
     }
 }
 
+/// `SystemTime` → `DateTime<Utc>` for partition arithmetic. Timestamps
+/// beyond chrono's calendar clamp to `MIN_UTC` / `MAX_UTC` instead of
+/// panicking in `From`; the storage write path rejects such samples
+/// separately (`ArchiverSample::decompose_timestamp`), so clamping
+/// here only keeps path derivation and range walks total.
+fn utc_datetime_clamped(ts: SystemTime) -> chrono::DateTime<Utc> {
+    crate::types::utc_datetime_checked(ts).unwrap_or(if ts < SystemTime::UNIX_EPOCH {
+        chrono::DateTime::<Utc>::MIN_UTC
+    } else {
+        chrono::DateTime::<Utc>::MAX_UTC
+    })
+}
+
 /// Generate the partition name string for a given timestamp.
 /// Matches Java archiver's TimeUtils.getPartitionName().
 ///
@@ -50,7 +63,7 @@ impl PartitionGranularity {
 ///   Hour  → "2024_03_15_09"
 ///   5Min  → "2024_03_15_09_30"
 pub fn partition_name(ts: SystemTime, granularity: PartitionGranularity) -> String {
-    let dt = chrono::DateTime::<Utc>::from(ts);
+    let dt = utc_datetime_clamped(ts);
     let y = dt.year();
     let m = dt.month();
     let d = dt.day();
@@ -120,7 +133,7 @@ pub fn recent_partitions(
 /// Compute the start of the partition CONTAINING `ts` — the lower bound of
 /// that partition's half-open time range `[partition_start, next_partition_start)`.
 pub fn partition_start(ts: SystemTime, granularity: PartitionGranularity) -> SystemTime {
-    let dt = chrono::DateTime::<Utc>::from(ts);
+    let dt = utc_datetime_clamped(ts);
 
     let start = match granularity {
         PartitionGranularity::Year => NaiveDate::from_ymd_opt(dt.year(), 1, 1)
@@ -159,87 +172,74 @@ pub fn partition_start(ts: SystemTime, granularity: PartitionGranularity) -> Sys
 }
 
 /// Compute the start of the next partition after the one containing `ts`.
+///
+/// Saturates at the end of chrono's calendar instead of panicking:
+/// past `MAX_UTC` there is no next partition, and callers that walk
+/// forward (`partitions_in_range`) stop when the value no longer
+/// advances.
 pub fn next_partition_start(ts: SystemTime, granularity: PartitionGranularity) -> SystemTime {
-    let dt = chrono::DateTime::<Utc>::from(ts);
+    let dt = utc_datetime_clamped(ts);
+    let midnight = |d: NaiveDate| d.and_hms_opt(0, 0, 0).map(|n| n.and_utc());
 
     let next = match granularity {
-        PartitionGranularity::Year => NaiveDate::from_ymd_opt(dt.year() + 1, 1, 1)
-            .expect("Jan 1 is always valid")
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is always valid")
-            .and_utc(),
+        PartitionGranularity::Year => {
+            NaiveDate::from_ymd_opt(dt.year() + 1, 1, 1).and_then(midnight)
+        }
         PartitionGranularity::Month => {
             let (y, m) = if dt.month() == 12 {
                 (dt.year() + 1, 1)
             } else {
                 (dt.year(), dt.month() + 1)
             };
-            NaiveDate::from_ymd_opt(y, m, 1)
-                .expect("1st of month is always valid")
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid")
-                .and_utc()
+            NaiveDate::from_ymd_opt(y, m, 1).and_then(midnight)
         }
-        PartitionGranularity::Day => (dt.date_naive() + Duration::days(1))
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is always valid")
-            .and_utc(),
-        PartitionGranularity::Hour => {
-            let current_hour = dt
-                .date_naive()
-                .and_hms_opt(dt.hour(), 0, 0)
-                .expect("hour from valid DateTime")
-                .and_utc();
-            current_hour + Duration::hours(1)
-        }
+        PartitionGranularity::Day => dt
+            .date_naive()
+            .checked_add_signed(Duration::days(1))
+            .and_then(midnight),
+        PartitionGranularity::Hour => dt
+            .date_naive()
+            .and_hms_opt(dt.hour(), 0, 0)
+            .map(|n| n.and_utc())
+            .and_then(|h| h.checked_add_signed(Duration::hours(1))),
         PartitionGranularity::FiveMin
         | PartitionGranularity::FifteenMin
         | PartitionGranularity::ThirtyMin => {
             let approx_min = granularity.approx_minutes();
             let start_min = (dt.minute() / approx_min) * approx_min;
-            let current_start = dt
-                .date_naive()
+            dt.date_naive()
                 .and_hms_opt(dt.hour(), start_min, 0)
-                .expect("aligned minute from valid DateTime")
-                .and_utc();
-            current_start + Duration::minutes(approx_min as i64)
+                .map(|n| n.and_utc())
+                .and_then(|s| s.checked_add_signed(Duration::minutes(approx_min as i64)))
         }
     };
 
-    next.into()
+    next.unwrap_or(chrono::DateTime::<Utc>::MAX_UTC).into()
 }
 
 /// Compute the last moment of the previous partition before `ts`.
+/// Saturates at `MIN_UTC` instead of panicking (see
+/// `next_partition_start`).
 fn prev_partition_end(ts: SystemTime, granularity: PartitionGranularity) -> SystemTime {
-    let dt = chrono::DateTime::<Utc>::from(ts);
+    let dt = utc_datetime_clamped(ts);
+    let last_second = |d: NaiveDate| d.and_hms_opt(23, 59, 59).map(|n| n.and_utc());
 
     let prev_end = match granularity {
-        PartitionGranularity::Year => NaiveDate::from_ymd_opt(dt.year() - 1, 12, 31)
-            .expect("Dec 31 is always valid")
-            .and_hms_opt(23, 59, 59)
-            .expect("23:59:59 is always valid")
-            .and_utc(),
-        PartitionGranularity::Month => {
-            let first_of_month = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
-                .expect("1st of month is always valid");
-            let prev = first_of_month - Duration::days(1);
-            prev.and_hms_opt(23, 59, 59)
-                .expect("23:59:59 is always valid")
-                .and_utc()
+        PartitionGranularity::Year => {
+            NaiveDate::from_ymd_opt(dt.year() - 1, 12, 31).and_then(last_second)
         }
-        PartitionGranularity::Day => {
-            let prev = dt.date_naive() - Duration::days(1);
-            prev.and_hms_opt(23, 59, 59)
-                .expect("23:59:59 is always valid")
-                .and_utc()
-        }
-        PartitionGranularity::Hour => {
-            dt.date_naive()
-                .and_hms_opt(dt.hour(), 0, 0)
-                .expect("hour from valid DateTime")
-                .and_utc()
-                - Duration::seconds(1)
-        }
+        PartitionGranularity::Month => NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
+            .and_then(|d| d.checked_sub_signed(Duration::days(1)))
+            .and_then(last_second),
+        PartitionGranularity::Day => dt
+            .date_naive()
+            .checked_sub_signed(Duration::days(1))
+            .and_then(last_second),
+        PartitionGranularity::Hour => dt
+            .date_naive()
+            .and_hms_opt(dt.hour(), 0, 0)
+            .map(|n| n.and_utc())
+            .and_then(|h| h.checked_sub_signed(Duration::seconds(1))),
         PartitionGranularity::FiveMin
         | PartitionGranularity::FifteenMin
         | PartitionGranularity::ThirtyMin => {
@@ -247,19 +247,40 @@ fn prev_partition_end(ts: SystemTime, granularity: PartitionGranularity) -> Syst
             let start_min = (dt.minute() / approx_min) * approx_min;
             dt.date_naive()
                 .and_hms_opt(dt.hour(), start_min, 0)
-                .expect("aligned minute from valid DateTime")
-                .and_utc()
-                - Duration::seconds(1)
+                .map(|n| n.and_utc())
+                .and_then(|s| s.checked_sub_signed(Duration::seconds(1)))
         }
     };
 
-    prev_end.into()
+    prev_end.unwrap_or(chrono::DateTime::<Utc>::MIN_UTC).into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// Out-of-calendar timestamps must clamp/saturate, never panic:
+    /// `file_path_for` runs inside the shard's append and the ETL move.
+    #[test]
+    fn partition_arithmetic_saturates_out_of_range() {
+        let huge = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 62);
+        let max: SystemTime = chrono::DateTime::<Utc>::MAX_UTC.into();
+        let min: SystemTime = chrono::DateTime::<Utc>::MIN_UTC.into();
+        for g in [
+            PartitionGranularity::Year,
+            PartitionGranularity::Month,
+            PartitionGranularity::Day,
+            PartitionGranularity::Hour,
+            PartitionGranularity::FiveMin,
+        ] {
+            assert_eq!(partition_name(huge, g), partition_name(max, g));
+            assert!(next_partition_start(max, g) >= max, "{g:?}");
+            assert!(prev_partition_end(min, g) <= min, "{g:?}");
+            assert!(partition_start(huge, g) <= huge, "{g:?}");
+            assert_eq!(partitions_in_range(max, max, g).len(), 1, "{g:?}");
+        }
+    }
 
     #[test]
     fn test_partition_name_year() {

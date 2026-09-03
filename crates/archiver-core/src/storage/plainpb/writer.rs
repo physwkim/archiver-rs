@@ -52,7 +52,7 @@ impl<'a> PbFileWriter<'a> {
             .await?;
 
         if !file_exists {
-            let (year, _, _) = sample.decompose_timestamp();
+            let (year, _, _) = sample.decompose_timestamp()?;
             let header = build_payload_info(pv, dbr_type, year, element_count, headers);
             let header_bytes = header.encode_to_vec();
             let escaped = codec::escape(&header_bytes);
@@ -115,7 +115,7 @@ fn field_values_to_pb(fvs: &[(String, String)]) -> Vec<FieldValue> {
 
 /// Encode an ArchiverSample into protobuf bytes (before line-escaping).
 pub fn encode_sample(dbr_type: ArchDbType, sample: &ArchiverSample) -> anyhow::Result<Vec<u8>> {
-    let (_, secs, nanos) = sample.decompose_timestamp();
+    let (_, secs, nanos) = sample.decompose_timestamp()?;
     let fvs = field_values_to_pb(&sample.field_values);
     let severity = if sample.severity != 0 {
         Some(sample.severity)

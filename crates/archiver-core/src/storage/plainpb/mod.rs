@@ -1512,7 +1512,7 @@ impl PlainPbStoragePlugin {
             let mut bw = BufWriter::with_capacity(64 * 1024, file);
 
             if needs_header {
-                let (year, _, _) = sample.decompose_timestamp();
+                let (year, _, _) = sample.decompose_timestamp()?;
                 let header = writer::build_payload_info(
                     pv,
                     dbr_type,

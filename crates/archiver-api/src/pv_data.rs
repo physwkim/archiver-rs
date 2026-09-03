@@ -244,9 +244,12 @@ async fn get_data_at_time(
             }
         };
 
-        let entry = match pick {
-            Some(s) => {
-                let (year, secs, nanos) = s.decompose_timestamp();
+        let entry = match pick.map(|s| (s.decompose_timestamp(), s)) {
+            Some((Err(e), _)) => {
+                tracing::warn!(pv, "getDataAtTime: sample timestamp unrepresentable: {e}");
+                serde_json::Value::Null
+            }
+            Some((Ok((year, secs, nanos)), s)) => {
                 let val = archiver_value_to_json_v4(&s.value);
                 // Java parity (9b55268): include a "meta" object carrying the
                 // PB field values (EGU, PREC, cnxlost markers, etc.) so
@@ -257,12 +260,11 @@ async fn get_data_at_time(
                     .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect();
                 serde_json::json!({
-                    "secs": SystemTime::from(
-                        chrono::DateTime::<chrono::Utc>::from(s.timestamp)
-                    )
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
+                    "secs": s
+                        .timestamp
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
                     "nanos": nanos,
                     "year": year,
                     "secondsIntoYear": secs,
