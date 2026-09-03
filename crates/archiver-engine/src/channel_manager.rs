@@ -228,6 +228,16 @@ pub struct PvCounters {
     /// appended. Distinct from `shard_closed_drops` (channel closed): the
     /// channel was open and draining, but time ran out.
     pub shutdown_abandoned_drops: AtomicU64,
+    /// Ordering high-water for the shard's out-of-order drop: the
+    /// newest timestamp the write pool has handed to storage for this
+    /// archiving task, as unix nanoseconds (0 = none yet). It lives
+    /// with the task rather than in a shard-lifetime map so it dies
+    /// with the task: a deletePV + re-archive, or a resume, starts
+    /// from a clean slate instead of inheriting a dead task's last
+    /// timestamp and dropping its first samples. Written only by the
+    /// shard that owns the PV (the dispatcher's consistent hash pins
+    /// each PV to one shard); not part of the reported snapshot.
+    pub ordering_last_ts_nanos: AtomicU64,
 }
 
 impl Default for PvCounters {
@@ -249,6 +259,7 @@ impl Default for PvCounters {
             storage_write_errors: AtomicU64::new(0),
             shard_closed_drops: AtomicU64::new(0),
             shutdown_abandoned_drops: AtomicU64::new(0),
+            ordering_last_ts_nanos: AtomicU64::new(0),
         }
     }
 }
@@ -2186,6 +2197,15 @@ async fn monitor_loop(
     }
 }
 
+/// Unix nanoseconds for the shard ordering high-water; 0 for any
+/// pre-epoch time (the "none yet" sentinel — such timestamps never
+/// pass `accept_ioc_timestamp`), saturating past the u64 range.
+fn unix_nanos(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 fn unix_secs(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -3341,11 +3361,11 @@ fn record_closed_drop(shard: usize, s: &PvSample, phase: &'static str) {
 /// the worker panicked; restart it and retry once rather than
 /// dropping this shard's ~1/N of all PVs forever.
 ///
-/// The respawned shard starts with an empty in-shard ordering map
-/// (`last_ts`). That is safe: the PB reader tolerates non-monotonic
-/// timestamps (clock backsteps, late backfills), and the per-PV
-/// writer-slot Mutex inside the storage layer — not the shard's map —
-/// is the real append-ordering owner.
+/// The respawned shard carries no per-PV state of its own: the
+/// ordering high-water lives in each task's `PvCounters`, and the
+/// per-PV writer-slot Mutex inside the storage layer — not the shard
+/// — is the real append-ordering owner (the PB reader tolerates
+/// non-monotonic timestamps: clock backsteps, late backfills).
 /// How long a spent respawn budget takes to refill.
 const RESPAWN_WINDOW: Duration = Duration::from_secs(60);
 /// Max respawns allowed per shard within [`RESPAWN_WINDOW`].
@@ -3914,11 +3934,10 @@ pub async fn write_loop_with_config(
 /// [`PendingReports`] map so the global flush owner sees it on
 /// the next flush cycle.
 ///
-/// The shard worker holds NO ts_updates / flush state of its own.
-/// It tracks `last_ts` only for the per-PV ordering drop check;
-/// that map is local to the shard because the dispatcher's
-/// consistent hash pins each PV to one shard. The type-change
-/// check is stateless (see `shard_handle_sample`).
+/// The shard worker holds NO per-PV state of its own: the ordering
+/// drop reads and bumps `PvCounters::ordering_last_ts_nanos` carried
+/// by each sample, and the type-change check is stateless (see
+/// `shard_handle_sample`).
 async fn shard_append_loop(
     shard_idx: usize,
     storage: Arc<dyn StoragePlugin>,
@@ -3929,11 +3948,6 @@ async fn shard_append_loop(
 ) {
     let append_timeout = cfg.append_timeout;
     info!(shard = shard_idx, "Shard append loop started");
-    // Per-PV state for the in-shard ordering drop. The dispatcher's
-    // consistent hash keeps each PV in one shard, so this map
-    // never sees cross-shard PVs.
-    let mut last_ts: std::collections::HashMap<String, SystemTime> =
-        std::collections::HashMap::new();
 
     loop {
         tokio::select! {
@@ -3943,7 +3957,6 @@ async fn shard_append_loop(
                     &storage,
                     &pending,
                     pv_sample,
-                    &mut last_ts,
                     append_timeout,
                 )
                 .await;
@@ -3954,7 +3967,6 @@ async fn shard_append_loop(
                     &storage,
                     &pending,
                     &mut sample_rx,
-                    &mut last_ts,
                     &cfg,
                 )
                 .await;
@@ -3974,30 +3986,28 @@ async fn shard_handle_sample(
     storage: &Arc<dyn StoragePlugin>,
     pending: &Arc<PendingReports>,
     pv_sample: PvSample,
-    last_ts: &mut std::collections::HashMap<String, SystemTime>,
     append_timeout: Duration,
 ) {
     let ts = pv_sample.sample.timestamp;
+    let ts_nanos = unix_nanos(ts);
 
-    // Out-of-order timestamp drop. Storage requires monotonic
-    // appends per PV; an older timestamp would produce a corrupt
-    // partition. Tracked via shard-local `last_ts` so the check
-    // survives flush cycles (the legacy ts_updates-based check
-    // only caught within-cycle reorderings).
-    if let Some(prev_ts) = last_ts.get(&pv_sample.pv_name)
-        && ts < *prev_ts
-    {
-        if let Some(ref c) = pv_sample.counters {
+    // Out-of-order timestamp drop. The high-water lives in the
+    // archiving task's `PvCounters` (see `ordering_last_ts_nanos`),
+    // so it survives flush cycles but not the task: a sample without
+    // counters has no task and no ordering state.
+    if let Some(ref c) = pv_sample.counters {
+        let prev = c.ordering_last_ts_nanos.load(Ordering::Relaxed);
+        if prev != 0 && ts_nanos < prev {
             c.timestamp_drops.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                shard = shard_idx,
+                pv = pv_sample.pv_name,
+                ?ts,
+                prev_nanos = prev,
+                "Dropping out-of-order sample"
+            );
+            return;
         }
-        debug!(
-            shard = shard_idx,
-            pv = pv_sample.pv_name,
-            ?ts,
-            ?prev_ts,
-            "Dropping out-of-order sample"
-        );
-        return;
     }
 
     // Type-change drop, stateless. `pv_sample.dbr_type` is the
@@ -4081,8 +4091,8 @@ async fn shard_handle_sample(
     });
     let res = tokio::time::timeout(append_timeout, join).await;
     // Conservative ordering high-water (principle 5). Bump
-    // `last_ts` on EVERY storage-layer return path — success,
-    // error, panic, timeout — not just on Ok and timeout.
+    // `ordering_last_ts_nanos` on EVERY storage-layer return path —
+    // success, error, panic, timeout — not just on Ok and timeout.
     //
     // Why all four:
     //   * Ok       — sample on disk; obvious bump.
@@ -4099,7 +4109,10 @@ async fn shard_handle_sample(
     // out-of-order and type-changed samples BEFORE we get here,
     // so this bump only ever sets the high-water to a ts the
     // shard explicitly accepted into the storage layer.
-    last_ts.insert(pv_name_for_post.clone(), ts);
+    if let Some(ref c) = counters_for_post {
+        c.ordering_last_ts_nanos
+            .fetch_max(ts_nanos, Ordering::Relaxed);
+    }
     match res {
         Ok(Ok(Ok(()))) => {
             // Report already went out from inside the closure.
@@ -4154,7 +4167,6 @@ async fn shard_drain_on_shutdown(
     storage: &Arc<dyn StoragePlugin>,
     pending: &Arc<PendingReports>,
     sample_rx: &mut mpsc::Receiver<PvSample>,
-    last_ts: &mut std::collections::HashMap<String, SystemTime>,
     cfg: &WriteLoopConfig,
 ) {
     let drain_per_sample_timeout = cfg.drain_per_sample_timeout;
@@ -4181,7 +4193,6 @@ async fn shard_drain_on_shutdown(
             storage,
             pending,
             pv_sample,
-            last_ts,
             drain_per_sample_timeout,
         )
         .await;

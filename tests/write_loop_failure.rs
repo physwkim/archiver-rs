@@ -1392,12 +1392,16 @@ async fn sharded_pool_routes_all_pvs_correctly() {
         run_sharded_write_pool(storage_for_pool, registry_for_pool, rx, sd_rx, cfg).await
     });
 
-    let counters = Arc::new(PvCounters::default());
+    // One PvCounters per PV: counters belong to one archiving task,
+    // and the shard's ordering high-water lives in them.
+    let counters: Vec<Arc<PvCounters>> = (0..N_PVS)
+        .map(|_| Arc::new(PvCounters::default()))
+        .collect();
     // Send 5 samples per PV with strictly increasing timestamps.
     for s in 0..SAMPLES_PER_PV {
         for (i, name) in pv_names.iter().enumerate() {
             let t = ts(10_000 + (i as u64) * 100 + s as u64);
-            tx.send(pv_sample(name, t, s as f64, &counters))
+            tx.send(pv_sample(name, t, s as f64, &counters[i]))
                 .await
                 .unwrap();
         }
@@ -1790,5 +1794,42 @@ async fn type_gate_drops_value_that_disagrees_with_registry_type() {
         "latest_observed_dbr must name the type the IOC now sends"
     );
     assert_eq!(counters.storage_write_errors.load(Ordering::Relaxed), 0);
+    shutdown(sd_tx, join).await;
+}
+
+/// Ordering state belongs to the archiving task. After deletePV +
+/// re-archive the new task must not inherit the dead task's last
+/// timestamp and drop its (legitimately older) first samples.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordering_state_dies_with_the_archiving_task() {
+    let storage = InjectingStorage::new();
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry
+        .register_pv("A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry.clone(), fast_cfg());
+
+    let gen1 = Arc::new(PvCounters::default());
+    tx.send(pv_sample("A", ts(1000), 1.0, &gen1)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Same task: an older sample is still an ordering drop.
+    tx.send(pv_sample("A", ts(900), 9.0, &gen1)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(gen1.timestamp_drops.load(Ordering::Relaxed), 1);
+
+    // New task (deletePV + re-archive): older than gen1's last, must be stored.
+    let gen2 = Arc::new(PvCounters::default());
+    tx.send(pv_sample("A", ts(900), 2.0, &gen2)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let a: Vec<_> = storage
+        .appends_snapshot()
+        .into_iter()
+        .filter(|r| r.pv == "A")
+        .map(|r| r.timestamp)
+        .collect();
+    assert_eq!(a, vec![ts(1000), ts(900)], "appends: {a:?}");
+    assert_eq!(gen2.timestamp_drops.load(Ordering::Relaxed), 0);
     shutdown(sd_tx, join).await;
 }
