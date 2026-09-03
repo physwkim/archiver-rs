@@ -1342,24 +1342,23 @@ impl ChannelManager {
             .collect()
     }
 
-    /// Snapshot the diagnostic counters for one PV. Returns None if the
-    /// PV isn't actively archived. The returned Arc is the live counter
-    /// — callers read with `Ordering::Relaxed`.
+    /// The live counters of one PV: any PV this process has started
+    /// since boot, paused included, until `destroy_pv` removes it. The
+    /// returned Arc is the live counter — callers read with
+    /// `Ordering::Relaxed`.
     pub fn pv_counters(&self, pv_name: &str) -> Option<Arc<PvCounters>> {
-        self.channels.get(pv_name).map(|h| h.counters.clone())
+        self.counters.get(pv_name).map(|c| c.value().clone())
     }
 
-    /// Snapshot every active PV's counters. Returns `(pv_name,
-    /// PvCountersSnapshot)` so callers don't have to handle Arc.
+    /// Snapshot the counters of every PV this process has started,
+    /// paused included: Java keeps a stopped channel in the engine's
+    /// channel list, so the drop and event-rate reports still cover it.
+    /// Returns `(pv_name, PvCountersSnapshot)` so callers don't have to
+    /// handle Arc.
     pub fn all_pv_counters(&self) -> Vec<(String, PvCountersSnapshot)> {
-        self.channels
+        self.counters
             .iter()
-            .map(|e| {
-                (
-                    e.key().clone(),
-                    PvCountersSnapshot::from(&*e.value().counters),
-                )
-            })
+            .map(|e| (e.key().clone(), PvCountersSnapshot::from(&**e.value())))
             .collect()
     }
 

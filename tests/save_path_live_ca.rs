@@ -535,3 +535,30 @@ async fn pause_returns_promptly_while_producers_wait_to_connect() {
 
     s.finish().await;
 }
+
+/// A paused PV keeps its process-lifetime counters in the reports: Java
+/// keeps the stopped channel in the engine's channel list, so the drop
+/// and event-rate reports still show it. `destroy_pv` is what removes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_pv_stays_in_the_counters_reports() {
+    let s = Stack::start().await;
+    let t0 = SystemTime::now();
+    s.archive().await;
+    let first = vec![1.0, 2.0, 3.0];
+    s.ch.put(&EpicsValue::DoubleArray(first.clone()))
+        .await
+        .expect("caput");
+    wait_on_disk(&s, t0, &first).await;
+    let before = counters(&s.mgr, PV);
+
+    s.mgr.pause_pv(PV).await.unwrap();
+    let after = counters(&s.mgr, PV);
+    assert_eq!(after.events_received, before.events_received, "{after:?}");
+    assert!(s.mgr.pv_counters(PV).is_some());
+
+    s.mgr.destroy_pv(PV).await.unwrap();
+    assert!(s.mgr.pv_counters(PV).is_none());
+    assert!(s.mgr.all_pv_counters().iter().all(|(n, _)| n != PV));
+
+    s.finish().await;
+}
