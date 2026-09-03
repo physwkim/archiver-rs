@@ -128,8 +128,8 @@ async fn main() -> anyhow::Result<()> {
     let storage: Arc<dyn StoragePlugin> = tiered.clone();
 
     // Shutdown signal.
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut supervisor = RuntimeSupervisor::new(shutdown_rx);
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    let mut supervisor = RuntimeSupervisor::new(shutdown_tx.clone());
 
     // Load policy config if specified.
     let policy =
@@ -193,7 +193,12 @@ async fn main() -> anyhow::Result<()> {
         ?flush_period,
         "Spawning sharded write pool"
     );
-    supervisor.spawn("write_loop", async move {
+    // Critical: if the pool ends before shutdown was requested, every
+    // producer sees a closed channel and stops silently while the API
+    // keeps reporting the PVs as Active. The supervisor turns that
+    // into a shutdown and a non-zero exit so the service manager
+    // restarts the process.
+    supervisor.spawn_critical("write_loop", async move {
         channel_manager::run_sharded_write_pool(
             write_storage,
             write_registry,
@@ -382,6 +387,19 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = format!("{}:{}", config.listen_addr, config.listen_port);
 
+    // Graceful-shutdown trigger for the HTTP server: the OS signal, or
+    // the supervisor flipping the watch because a critical task died.
+    let mut supervisor_shutdown = supervisor.shutdown_rx();
+    let shutdown_signal = async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("Shutdown signal received"),
+            _ = supervisor_shutdown.changed() => {
+                tracing::warn!("Shutdown requested by the supervisor");
+            }
+        }
+        let _ = shutdown_tx.send(true);
+    };
+
     // Serve with optional TLS.
     if let Some(ref tls) = config.tls {
         // Install ring crypto provider for rustls (ignore if already installed).
@@ -395,9 +413,7 @@ async fn main() -> anyhow::Result<()> {
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            info!("Shutdown signal received");
-            let _ = shutdown_tx.send(true);
+            shutdown_signal.await;
             shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
         });
 
@@ -414,15 +430,11 @@ async fn main() -> anyhow::Result<()> {
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .with_graceful_shutdown(async move {
-            tokio::signal::ctrl_c().await.ok();
-            info!("Shutdown signal received");
-            let _ = shutdown_tx.send(true);
-        });
+        .with_graceful_shutdown(shutdown_signal);
         server.await?;
     }
 
-    supervisor.shutdown(write_pool_shutdown_budget).await;
+    supervisor.shutdown(write_pool_shutdown_budget).await?;
     info!("Archiver stopped");
     Ok(())
 }
