@@ -109,22 +109,27 @@ pub fn is_valid_pv_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 256 {
         return false;
     }
+    // `/` is the on-disk form of `:` (`pv_name_to_key` maps `:` → `/`),
+    // so a `/` in a PV name would alias another PV's partition files
+    // (`A/B` and `A:B` → one file, two writer slots) and could not be
+    // inverted by `pv_name_from_path`. Rejecting it keeps the key
+    // encoding injective, which every path-derived lookup (ETL, evict,
+    // truncate) relies on.
+    if name.contains('/') {
+        return false;
+    }
     // Leading separator → after pv_name_to_key the result begins with
     // `/`, and `Path::join(root, "/abs/path")` ignores `root` entirely
     // (Rust semantics) → escapes the storage root. Same for the `.` /
     // `-` cases.
-    if name.starts_with('.')
-        || name.starts_with('-')
-        || name.starts_with('/')
-        || name.starts_with(':')
-    {
+    if name.starts_with('.') || name.starts_with('-') || name.starts_with(':') {
         return false;
     }
-    for component in name.split([':', '/']) {
+    for component in name.split(':') {
         // `..` / `.` are obvious traversal. An empty segment (`A::B`,
-        // `A//B`, trailing `:`/`/`) maps to a `//` in the filesystem
-        // path which most OSes collapse but some path-relative tools
-        // re-split, so just reject.
+        // trailing `:`) maps to a `//` in the filesystem path which
+        // most OSes collapse but some path-relative tools re-split, so
+        // just reject.
         if component.is_empty() || component == ".." || component == "." {
             return false;
         }
@@ -1026,6 +1031,10 @@ mod tests {
         assert!(!is_valid_pv_name("foo//bar"));
         assert!(!is_valid_pv_name("foo:"));
         assert!(!is_valid_pv_name("foo/"));
+        // `/` is the on-disk form of `:`; a name containing it would
+        // alias another PV's files.
+        assert!(!is_valid_pv_name("RING/DCCT"));
+        assert!(!is_valid_pv_name("A/B:C"));
         // shell metacharacters
         assert!(!is_valid_pv_name("foo;rm -rf /"));
         assert!(!is_valid_pv_name("foo|bar"));

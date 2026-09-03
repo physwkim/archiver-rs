@@ -1874,22 +1874,6 @@ pub(crate) fn pv_name_to_key(pv: &str) -> String {
     pv.replace(':', "/")
 }
 
-/// Canonical PV key for comparing a registry PV name against the name
-/// `pv_name_from_path` derives from a storage path.
-///
-/// The on-disk key encoding is lossy: `pv_name_to_key` maps `:` → `/`
-/// while leaving any existing `/` untouched, so both `A:B` and `A/B`
-/// share the key `A/B`, and `pv_name_from_path` maps that back to `A:B`.
-/// A raw registry name that contains `/` (a valid PV-name separator) is
-/// therefore NOT equal to its path-derived form — matching them by raw
-/// string silently fails (e.g. a paused `RING/DCCT` would not match the
-/// grouped key `RING:DCCT`). Routing both sides through this function —
-/// which reproduces `pv_name_from_path`'s final `/`→`:` step over the
-/// on-disk key — makes them comparable.
-pub(crate) fn canonical_pv_key(pv: &str) -> String {
-    pv_name_to_key(pv).replace('/', ":")
-}
-
 /// Read the last sample from a PB file by seeking near the end.
 /// Falls back to full sequential read for edge cases (e.g., very large single sample).
 fn read_last_sample_from_file(path: &Path) -> anyhow::Result<Option<ArchiverSample>> {
@@ -2587,28 +2571,26 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     }
 
+    /// The on-disk key encoding must be injective and exactly
+    /// inverted by `pv_name_from_path`: ETL grouping, the paused-set
+    /// check and every path-derived slot lookup compare the raw
+    /// registry name against the path-derived one. `/` in a name is
+    /// rejected by `is_valid_pv_name` precisely because it would
+    /// collide with the `:` → `/` encoding.
     #[test]
-    fn canonical_pv_key_matches_path_derived_name() {
+    fn pv_key_round_trips_exactly_for_valid_names() {
         let plugin =
             PlainPbStoragePlugin::new("t", PathBuf::from("/root"), PartitionGranularity::Hour);
-        // For every PV name, the key that ETL's `paused` set must use
-        // (canonical_pv_key) must equal the key `grouped` uses
-        // (pv_name_from_path over the PV's storage path) — including
-        // valid names that contain '/', where the raw registry name
-        // differs from the path-derived form.
-        for pv in ["SIM:Sine", "RING/DCCT", "A/B:C", "PLAIN"] {
+        for pv in ["SIM:Sine", "RING:DCCT:AVG", "PLAIN", "IOC[A]:val<x>"] {
             let key = pv_name_to_key(pv);
             let path = PathBuf::from(format!("/root/{key}:2024_01_01_00.pb"));
-            let from_path = plugin.pv_name_from_path(&path).unwrap();
             assert_eq!(
-                canonical_pv_key(pv),
-                from_path,
-                "canonical_pv_key must equal pv_name_from_path for {pv:?}"
+                plugin.pv_name_from_path(&path).as_deref(),
+                Some(pv),
+                "pv_name_from_path must invert pv_name_to_key for {pv:?}"
             );
         }
-        // The raw-name comparison ETL used before is exactly what breaks
-        // for a '/'-containing name.
-        assert_ne!("RING/DCCT", canonical_pv_key("RING/DCCT"));
+        assert!(!crate::registry::is_valid_pv_name("RING/DCCT"));
     }
 
     #[tokio::test]
