@@ -1649,6 +1649,53 @@ async fn test_p2_change_type_for_pv_converts_stored_data() {
     );
 }
 
+/// changeTypeForPV refuses a scalar target for an array PV: the
+/// registry would promote the imported type back to the waveform form
+/// after the partitions had been converted to the scalar type.
+#[tokio::test]
+async fn test_p2_change_type_for_pv_refuses_a_scalar_type_for_an_array_pv() {
+    use archiver_core::types::ArchDbType;
+
+    let (app, reg, _dir) = build_test_app_with_pvs().await;
+    reg.register_pv(
+        "SIM:Wave",
+        ArchDbType::WaveformDouble,
+        &SampleMode::Monitor,
+        4,
+    )
+    .unwrap();
+    let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=SIM:Wave");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let newtype = ArchDbType::ScalarInt as i32;
+    let req = get_request(&format!(
+        "/mgmt/bpl/changeTypeForPV?pv=SIM:Wave&newtype={newtype}"
+    ));
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reg.get_pv("SIM:Wave").unwrap().unwrap().dbr_type,
+        ArchDbType::WaveformDouble
+    );
+
+    // The waveform form of the target family is accepted.
+    let newtype = ArchDbType::WaveformInt as i32;
+    let req = get_request(&format!(
+        "/mgmt/bpl/changeTypeForPV?pv=SIM:Wave&newtype={newtype}"
+    ));
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        reg.get_pv("SIM:Wave").unwrap().unwrap().dbr_type,
+        ArchDbType::WaveformInt
+    );
+}
+
 /// changeTypeForPV must serialize with the ETL chain's move gate. The
 /// ETL skips paused PVs only when a run starts, so a move that began
 /// before the pause could delete the source partition after the

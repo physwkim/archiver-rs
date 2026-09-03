@@ -193,6 +193,20 @@ pub async fn change_type_for_pv(
             return ApiError::BadRequest(format!("invalid newtype: {}", q.newtype)).into_response();
         }
     };
+    // The registry stores an array PV only in the waveform form
+    // (`ArchDbType::with_element_count`), so a scalar target here would
+    // convert the partitions to the scalar type while the registry row
+    // came back as the waveform type, and every later append would fail
+    // the partition header check. Refuse before touching the files.
+    let stored_type = new_type.with_element_count(record.element_count);
+    if stored_type != new_type {
+        return ApiError::BadRequest(format!(
+            "PV '{}' has element_count {}; {new_type:?} is a scalar type \
+             and would be stored as {stored_type:?}",
+            q.pv, record.element_count
+        ))
+        .into_response();
+    }
     // Java parity: changeTypeForPV converts the PV's stored data to the
     // new type (thru-number conversion) BEFORE the registry flips, so no
     // partition is left whose header disagrees with the archived type
