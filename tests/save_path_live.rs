@@ -106,9 +106,7 @@ impl Live {
             std::env::set_var("EPICS_PVA_ADDR_LIST", "");
         }
 
-        let (mgr, rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-            .await
-            .unwrap();
+        let (mgr, rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
         let mgr = Arc::new(mgr);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let pool = tokio::spawn(run_sharded_write_pool(

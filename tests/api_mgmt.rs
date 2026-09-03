@@ -22,9 +22,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         PartitionGranularity::Hour,
     ));
     let registry = Arc::new(PvRegistry::in_memory().unwrap());
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
@@ -82,9 +80,7 @@ async fn build_test_app_with_pvs() -> (axum::Router, Arc<PvRegistry>, tempfile::
         )
         .unwrap();
 
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry.clone()));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
@@ -509,9 +505,7 @@ async fn test_export_import_preserves_status() {
         PartitionGranularity::Hour,
     ));
     let registry2 = Arc::new(PvRegistry::in_memory().unwrap());
-    let (channel_mgr2, _rx2) = ChannelManager::new(storage2.clone(), registry2.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr2, _rx2) = ChannelManager::new(registry2.clone(), None).await.unwrap();
     let channel_mgr2 = Arc::new(channel_mgr2);
     let repo2 = Arc::new(RegistryRepository::new(registry2.clone()));
     let archiver2 = Arc::new(ChannelArchiverControl::new(channel_mgr2));
@@ -594,9 +588,7 @@ async fn build_test_app_with_auth() -> (axum::Router, tempfile::TempDir) {
             1,
         )
         .unwrap();
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
@@ -740,9 +732,7 @@ async fn test_rate_limiter_blocks_excess_requests() {
         PartitionGranularity::Hour,
     ));
     let registry = Arc::new(PvRegistry::in_memory().unwrap());
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
@@ -808,9 +798,7 @@ async fn test_rate_limiter_isolates_by_ip() {
         PartitionGranularity::Hour,
     ));
     let registry = Arc::new(PvRegistry::in_memory().unwrap());
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
@@ -1314,18 +1302,10 @@ async fn test_alias_excluded_from_count_and_status_queries() {
 #[tokio::test]
 async fn test_restore_from_registry_skips_aliases() {
     use archiver_core::registry::{PvRegistry, PvStatus, SampleMode};
-    use archiver_core::storage::partition::PartitionGranularity;
-    use archiver_core::storage::plainpb::PlainPbStoragePlugin;
     use archiver_core::types::ArchDbType;
     use archiver_engine::channel_manager::ChannelManager;
     use std::sync::Arc;
 
-    let dir = tempfile::tempdir().unwrap();
-    let storage = Arc::new(PlainPbStoragePlugin::new(
-        "sts",
-        dir.path().to_path_buf(),
-        PartitionGranularity::Hour,
-    ));
     let registry = Arc::new(PvRegistry::in_memory().unwrap());
     registry
         .register_pv("REAL:PV", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
@@ -1336,9 +1316,7 @@ async fn test_restore_from_registry_skips_aliases() {
     let alias_row = registry.get_pv("ALIAS:PV").unwrap().unwrap();
     assert_eq!(alias_row.status, PvStatus::Alias);
 
-    let (mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     // restore_from_registry must NOT try to archive the alias. We can't
     // verify CA channel creation in a unit test (no IOC), but we can
     // verify pvs_by_status(Active) returns only REAL:PV.
@@ -1366,13 +1344,10 @@ async fn test_consolidate_forwards_to_peer_for_remote_pv() {
     ));
     let registry = Arc::new(archiver_core::registry::PvRegistry::in_memory().unwrap());
     // Local has nothing — REMOTE:PV is owned by a peer.
-    let (channel_mgr, _rx) = archiver_engine::channel_manager::ChannelManager::new(
-        storage.clone(),
-        registry.clone(),
-        None,
-    )
-    .await
-    .unwrap();
+    let (channel_mgr, _rx) =
+        archiver_engine::channel_manager::ChannelManager::new(registry.clone(), None)
+            .await
+            .unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry.clone()));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
@@ -1744,9 +1719,7 @@ async fn test_p2_change_type_for_pv_waits_for_the_etl_move_gate() {
 
     let executor = Arc::new(EtlExecutor::new(sts.clone(), mts.clone(), 3600, 5, 3));
     let gate = executor.move_gate();
-    let (channel_mgr, _rx) = ChannelManager::new(sts.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let repo = Arc::new(RegistryRepository::new(registry.clone()));
     let archiver = Arc::new(ChannelArchiverControl::new(Arc::new(channel_mgr)));
     let state = AppState {
@@ -1901,9 +1874,7 @@ async fn test_d_get_data_at_time_stage_2_walkback() {
     }
     storage.flush_writes().await.unwrap();
 
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
@@ -1959,18 +1930,8 @@ async fn test_d_update_archive_fields_concurrent_no_duplicate_tasks() {
     //
     // We can't observe field_tokens directly through the public API, but we
     // can at least verify the registry persists the last update correctly.
-    let cm = Arc::new({
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Arc::new(PlainPbStoragePlugin::new(
-            "sts",
-            dir.path().to_path_buf(),
-            archiver_core::storage::partition::PartitionGranularity::Hour,
-        ));
-        let (cm, _rx) = ChannelManager::new(storage, registry.clone(), None)
-            .await
-            .unwrap();
-        cm
-    });
+    let (cm, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
+    let cm = Arc::new(cm);
 
     let mut handles = Vec::new();
     for i in 0..16 {

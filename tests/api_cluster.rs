@@ -21,9 +21,7 @@ async fn start_mock_peer(
     registry: Arc<PvRegistry>,
     storage: Arc<PlainPbStoragePlugin>,
 ) -> (String, tokio::task::JoinHandle<()>) {
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
@@ -58,10 +56,9 @@ async fn build_cluster_test_app(
     local_storage: Arc<PlainPbStoragePlugin>,
     peer_url: &str,
 ) -> axum::Router {
-    let (channel_mgr, _rx) =
-        ChannelManager::new(local_storage.clone(), local_registry.clone(), None)
-            .await
-            .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(local_registry.clone(), None)
+        .await
+        .unwrap();
     let channel_mgr = Arc::new(channel_mgr);
 
     let cluster_config = ClusterConfig {
@@ -659,10 +656,9 @@ async fn build_cluster_test_app_with_auth(
     local_storage: Arc<PlainPbStoragePlugin>,
     peer_url: &str,
 ) -> axum::Router {
-    let (channel_mgr, _rx) =
-        ChannelManager::new(local_storage.clone(), local_registry.clone(), None)
-            .await
-            .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(local_registry.clone(), None)
+        .await
+        .unwrap();
     let channel_mgr = Arc::new(channel_mgr);
 
     let cluster_config = ClusterConfig {
@@ -714,9 +710,7 @@ async fn start_mock_peer_with_auth(
     registry: Arc<PvRegistry>,
     storage: Arc<PlainPbStoragePlugin>,
 ) -> (String, tokio::task::JoinHandle<()>) {
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
@@ -889,9 +883,7 @@ async fn start_mock_peer_with_own_key(
     storage: Arc<PlainPbStoragePlugin>,
     inbound_key: &str,
 ) -> (String, tokio::task::JoinHandle<()>) {
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
@@ -937,9 +929,7 @@ async fn test_cluster_proxy_authenticates_with_per_peer_key() {
         start_mock_peer_with_own_key(peer_reg.clone(), peer_storage, PEER_SPECIFIC_KEY).await;
 
     let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
-    let (channel_mgr, _rx) = ChannelManager::new(local_storage.clone(), local_reg.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(local_reg.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
 
     let cluster_config = ClusterConfig {
@@ -1033,9 +1023,7 @@ async fn test_different_peers_get_different_keys() {
         start_mock_peer_with_own_key(peer1_reg.clone(), peer1_storage, PEER1_KEY).await;
 
     let (local_reg, local_storage, _local_dir) = new_registry_and_storage();
-    let (channel_mgr, _rx) = ChannelManager::new(local_storage.clone(), local_reg.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(local_reg.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
 
     let cluster_config = ClusterConfig {

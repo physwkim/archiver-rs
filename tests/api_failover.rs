@@ -151,9 +151,7 @@ async fn failover_merges_and_dedupes_peer_samples() {
     );
     let (peer_url, _peer_task) = start_fake_peer(peer_body).await;
 
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry.clone()));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));
@@ -237,9 +235,7 @@ async fn failover_tolerates_unreachable_peer() {
         .unwrap();
     storage.flush_writes().await.unwrap();
 
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let channel_mgr = Arc::new(channel_mgr);
     let repo = Arc::new(RegistryRepository::new(registry.clone()));
     let archiver = Arc::new(ChannelArchiverControl::new(channel_mgr));

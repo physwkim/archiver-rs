@@ -436,9 +436,6 @@ pub struct ChannelManager {
     /// PV. Without this, e.g. `pause_pv` racing with `resume_pv` can leave
     /// the registry status and the channel map disagreeing.
     op_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
-    /// Storage backend.
-    #[allow(dead_code)]
-    storage: Arc<dyn StoragePlugin>,
     /// PV metadata registry.
     registry: Arc<PvRegistry>,
     /// Sample sender for the write thread.
@@ -526,18 +523,16 @@ impl Drop for InFlight {
 
 impl ChannelManager {
     pub async fn new(
-        storage: Arc<dyn StoragePlugin>,
         registry: Arc<PvRegistry>,
         policy: Option<PolicyConfig>,
     ) -> anyhow::Result<(Self, mpsc::Receiver<PvSample>)> {
-        Self::new_with_drift(storage, registry, policy, 30 * 60).await
+        Self::new_with_drift(registry, policy, 30 * 60).await
     }
 
     /// Construct with an explicit IOC drift bound. Java parity (6538631):
     /// keeps tests + sites that don't surface `EngineConfig` on the
     /// existing default while letting the daemon plumb a configured value.
     pub async fn new_with_drift(
-        storage: Arc<dyn StoragePlugin>,
         registry: Arc<PvRegistry>,
         policy: Option<PolicyConfig>,
         server_ioc_drift_secs: u64,
@@ -552,7 +547,6 @@ impl ChannelManager {
             channels: DashMap::new(),
             pending_archives: DashMap::new(),
             op_locks: DashMap::new(),
-            storage,
             registry,
             sample_tx: tx,
             policy,

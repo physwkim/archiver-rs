@@ -101,9 +101,7 @@ impl Stack {
             std::env::set_var("EPICS_CA_SERVER_PORT", port.to_string());
         }
 
-        let (mgr, rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-            .await
-            .unwrap();
+        let (mgr, rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
         let mgr = Arc::new(mgr);
         let (pool_shutdown, _) = tokio::sync::watch::channel(false);
 
@@ -360,9 +358,7 @@ async fn restart_does_not_re_store_the_committed_value() {
     tokio::time::timeout(Duration::from_secs(10), s.mgr.shutdown())
         .await
         .expect("producers stop");
-    let (mgr2, rx2) = ChannelManager::new(s.storage.clone(), s.registry.clone(), None)
-        .await
-        .unwrap();
+    let (mgr2, rx2) = ChannelManager::new(s.registry.clone(), None).await.unwrap();
     let (pool2_shutdown, shutdown_rx2) = tokio::sync::watch::channel(false);
     let pool2 = tokio::spawn(run_sharded_write_pool(
         s.storage.clone(),

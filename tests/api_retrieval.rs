@@ -49,9 +49,7 @@ async fn build_retrieval_app() -> (axum::Router, SystemTime, SystemTime, tempfil
     let data_start = base_time;
     let data_end = base_time + Duration::from_secs(19);
 
-    let (channel_mgr, _rx) = ChannelManager::new(storage.clone(), registry.clone(), None)
-        .await
-        .unwrap();
+    let (channel_mgr, _rx) = ChannelManager::new(registry.clone(), None).await.unwrap();
     let repo = Arc::new(RegistryRepository::new(registry));
     let archiver = Arc::new(ChannelArchiverControl::new(Arc::new(channel_mgr)));
     let state = AppState {

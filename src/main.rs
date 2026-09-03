@@ -155,7 +155,6 @@ async fn main() -> anyhow::Result<()> {
     // Initialize channel manager + write loop. Drift bound is per-site
     // configurable (Java parity 6538631).
     let (channel_mgr, sample_rx) = ChannelManager::new_with_drift(
-        storage.clone(),
         registry.clone(),
         policy,
         config.engine.server_ioc_drift_secs,
