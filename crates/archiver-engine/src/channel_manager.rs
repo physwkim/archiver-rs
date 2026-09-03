@@ -29,11 +29,14 @@ const CA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CA_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay before retrying a failed CA subscription.
 const CA_RETRY_DELAY: Duration = Duration::from_secs(5);
-/// Longest `ChannelManager::stop_tasks` waits for a PV's tasks to exit
-/// and its queued samples to reach the store. Every producer wait is
-/// shorter (a CA `get` is bounded at 30 s, the PVA client at 5 s) and
-/// so is `WriteLoopConfig::append_timeout`, so only a storage append
-/// that hangs past that can exhaust it.
+/// Longest a caller of `ChannelManager::stop_and_finalize` waits for a
+/// PV's stop transition before it gets an error. The transition itself
+/// is not bounded: it sets the registry status when the PV's tasks
+/// have exited and its queued samples reached the store, however long
+/// a stalled store takes. Every producer wait is shorter (a CA `get`
+/// is bounded at 30 s, the PVA client at 5 s) and so is
+/// `WriteLoopConfig::append_timeout`, so only a storage append that
+/// hangs past that can exhaust it.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Hard floor on accepted timestamps. Mirrors Java's `PAST_CUTOFF_TIMESTAMP`
@@ -392,7 +395,7 @@ struct PvHandle {
     counters: Arc<PvCounters>,
     /// Every task of this PV generation: the producer loop, the PVA
     /// overflow drainer and refreshers, and the extra-field monitors.
-    /// `stop_tasks` waits on it so a stopped PV has no task left that
+    /// `stop_and_finalize` waits on it so a stopped PV has no task left that
     /// could still queue a sample.
     tasks: TaskTracker,
 }
@@ -455,7 +458,8 @@ pub struct ChannelManager {
     /// Per-PV counters for the life of the process, so a pause and
     /// resume continue the PV's statistics and ordering high-water
     /// (see [`Self::task_counters`]). `destroy_pv` removes the entry.
-    counters: DashMap<String, Arc<PvCounters>>,
+    /// Shared with the stop transitions, which run in their own tasks.
+    counters: Arc<DashMap<String, Arc<PvCounters>>>,
 }
 
 /// A sample ready to be written to storage. Built only through
@@ -553,7 +557,7 @@ impl ChannelManager {
             server_ioc_drift_secs,
             tasks: TaskTracker::new(),
             lifecycle: tokio::sync::RwLock::new(false),
-            counters: DashMap::new(),
+            counters: Arc::new(DashMap::new()),
         };
 
         Ok((mgr, rx))
@@ -616,7 +620,7 @@ impl ChannelManager {
     }
 
     /// Spawn a task of one PV generation: tracked by `pv_tasks` so
-    /// [`Self::stop_tasks`] can wait for it, and by `self.tasks` for
+    /// [`Self::stop_and_finalize`] can wait for it, and by `self.tasks` for
     /// [`Self::shutdown`].
     fn spawn_pv_task(
         &self,
@@ -1177,17 +1181,29 @@ impl ChannelManager {
         Ok(())
     }
 
-    /// Stop the PV's tasks and wait until nothing of it is in flight:
-    /// the tasks have exited and every sample they queued has been
-    /// appended or dropped. On return the store holds all the samples
-    /// this task generation will ever produce, so the caller may set
-    /// the registry status and a later rename, type change, reassign
-    /// or delete acts on the whole data set. Fails, with the status
-    /// untouched, if the wait exceeds [`QUIESCE_TIMEOUT`]; the tasks
-    /// stay cancelled and a retry waits again.
-    async fn stop_tasks(&self, pv_name: &str) -> anyhow::Result<()> {
-        let deadline = tokio::time::Instant::now() + QUIESCE_TIMEOUT;
-        if let Some((_key, handle)) = self.channels.remove(pv_name) {
+    /// Stop the PV's tasks and, once nothing of it is in flight, run
+    /// `finalize`: the tasks have exited and every sample they queued
+    /// has been appended or dropped, so the store holds all the
+    /// samples this task generation will ever produce and the registry
+    /// status `finalize` commits describes the whole data set for a
+    /// later rename, type change, reassign or delete.
+    ///
+    /// The transition is owned by a tracked task that holds the PV's
+    /// op lock until `finalize` ran, so a caller that gives up after
+    /// [`QUIESCE_TIMEOUT`] or is dropped mid-wait (the HTTP client went
+    /// away) cannot leave the registry saying Active for a PV whose
+    /// producers are stopped. The lock keeps resume and the other
+    /// transitions out until then; the caller gets an error after the
+    /// bound, and the status lands when the PV's queue drains.
+    async fn stop_and_finalize(
+        &self,
+        pv_name: &str,
+        finalize: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let guard = self.op_lock(pv_name).lock_owned().await;
+        // Nothing below awaits before the task owns the transition.
+        let handle = self.channels.remove(pv_name).map(|(_key, handle)| handle);
+        if let Some(handle) = &handle {
             let extra_count = handle.field_tokens.len() as f64;
             handle.cancel_token.cancel();
             metrics::gauge!("archiver_pvs_active").decrement(1.0);
@@ -1195,38 +1211,42 @@ impl ChannelManager {
                 metrics::gauge!("archiver_extra_field_tasks").decrement(extra_count);
             }
             handle.tasks.close();
-            if tokio::time::timeout_at(deadline, handle.tasks.wait())
-                .await
-                .is_err()
-            {
-                anyhow::bail!("{pv_name}: archiving tasks did not stop within {QUIESCE_TIMEOUT:?}");
+        }
+        let counters = self.counters.get(pv_name).map(|c| c.value().clone());
+        let transition = self.tasks.spawn(async move {
+            let _guard = guard;
+            if let Some(handle) = handle {
+                handle.tasks.wait().await;
             }
+            if let Some(counters) = counters {
+                counters.wait_in_flight().await;
+            }
+            finalize()
+        });
+        match tokio::time::timeout(QUIESCE_TIMEOUT, transition).await {
+            Ok(finished) => {
+                finished.map_err(|e| anyhow::anyhow!("{pv_name}: stop transition failed: {e}"))?
+            }
+            Err(_) => anyhow::bail!(
+                "{pv_name}: still quiescing after {QUIESCE_TIMEOUT:?}; \
+                 its status is set when the queue drains"
+            ),
         }
-        let Some(counters) = self.counters.get(pv_name).map(|c| c.value().clone()) else {
-            return Ok(());
-        };
-        if tokio::time::timeout_at(deadline, counters.wait_in_flight())
-            .await
-            .is_err()
-        {
-            anyhow::bail!(
-                "{pv_name}: {} samples still in flight after {QUIESCE_TIMEOUT:?}",
-                counters.in_flight.load(Ordering::SeqCst)
-            );
-        }
-        Ok(())
     }
 
     /// Pause archiving for a PV. Returns once the PV has nothing in
-    /// flight (see [`Self::stop_tasks`]), so a `Paused` registry status
-    /// means the store holds every sample the PV produced.
+    /// flight and is Paused (see [`Self::stop_and_finalize`]), so a
+    /// `Paused` registry status means the store holds every sample the
+    /// PV produced.
     pub async fn pause_pv(&self, pv_name: &str) -> anyhow::Result<()> {
-        let lock = self.op_lock(pv_name);
-        let _g = lock.lock().await;
-        self.stop_tasks(pv_name).await?;
-        self.registry.set_status(pv_name, PvStatus::Paused)?;
-        info!(pv = pv_name, "Paused archiving");
-        Ok(())
+        let registry = self.registry.clone();
+        let pv = pv_name.to_string();
+        self.stop_and_finalize(pv_name, move || {
+            registry.set_status(&pv, PvStatus::Paused)?;
+            info!(pv = %pv, "Paused archiving");
+            Ok(())
+        })
+        .await
     }
 
     /// Resume a paused PV. Only paused or error PVs can be resumed;
@@ -1269,30 +1289,35 @@ impl ChannelManager {
     /// Stop archiving a PV without removing it from the registry.
     /// Sets the PV status to Inactive (data retained, monitoring stopped).
     pub async fn stop_pv(&self, pv_name: &str) -> anyhow::Result<()> {
-        let lock = self.op_lock(pv_name);
-        let _g = lock.lock().await;
-        self.stop_tasks(pv_name).await?;
-        self.registry.set_status(pv_name, PvStatus::Inactive)?;
-        info!(pv = pv_name, "Stopped archiving (inactive)");
-        Ok(())
+        let registry = self.registry.clone();
+        let pv = pv_name.to_string();
+        self.stop_and_finalize(pv_name, move || {
+            registry.set_status(&pv, PvStatus::Inactive)?;
+            info!(pv = %pv, "Stopped archiving (inactive)");
+            Ok(())
+        })
+        .await
     }
 
     /// Remove a PV from archiving entirely.
     pub async fn destroy_pv(&self, pv_name: &str) -> anyhow::Result<()> {
-        let lock = self.op_lock(pv_name);
-        let _g = lock.lock().await;
-        self.stop_tasks(pv_name).await?;
-        // The next task under this name is a new PV: its high-water
-        // and statistics must not carry over.
-        self.counters.remove(pv_name);
-        self.registry.remove_pv(pv_name)?;
+        let registry = self.registry.clone();
+        let counters = self.counters.clone();
+        let pv = pv_name.to_string();
         // Don't remove the op_locks entry here: a concurrent caller may have
         // already taken a clone of this Arc and be queued on it; removing
         // would let a fresh caller obtain a new mutex and the queued one
         // would race them. The map is bounded by the lifetime universe of
         // PV names, which is acceptable.
-        info!(pv = pv_name, "Destroyed archiving channel");
-        Ok(())
+        self.stop_and_finalize(pv_name, move || {
+            // The next task under this name is a new PV: its high-water
+            // and statistics must not carry over.
+            counters.remove(&pv);
+            registry.remove_pv(&pv)?;
+            info!(pv = %pv, "Destroyed archiving channel");
+            Ok(())
+        })
+        .await
     }
 
     /// List all currently archived PV names (from registry).
@@ -2918,7 +2943,7 @@ fn epics_value_to_field_string(val: &EpicsValue) -> String {
 impl ChannelManager {
     /// Spawn a long-running task that subscribes to `<pv>.<field>` and updates
     /// `extras` with each event. Owned by `parent_token` so pause/destroy cleans
-    /// it up alongside the main PV, and tracked by `pv_tasks` so `stop_tasks`
+    /// it up alongside the main PV, and tracked by `pv_tasks` so `stop_and_finalize`
     /// waits for it.
     fn spawn_extra_field_monitor(
         &self,

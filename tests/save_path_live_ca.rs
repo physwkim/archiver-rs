@@ -562,3 +562,46 @@ async fn paused_pv_stays_in_the_counters_reports() {
 
     s.finish().await;
 }
+
+/// A pause whose caller gives up (the HTTP client went away, or the
+/// 60 s bound passed) still completes: the transition runs in a task
+/// that owns the op lock, so the registry cannot stay Active for a PV
+/// whose producers are stopped. The pool starts only after the caller
+/// is gone; the queued sample lands and the status follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_pause_still_completes() {
+    let mut s = Stack::start_without_pool().await;
+    let t0 = SystemTime::now();
+    s.archive().await;
+
+    // The caller gives up while the connect-time sample is queued.
+    let gave_up = tokio::time::timeout(Duration::from_millis(500), s.mgr.pause_pv(PV)).await;
+    assert!(
+        gave_up.is_err(),
+        "pause returned without a pool: {gave_up:?}"
+    );
+    let rec = s.registry.get_pv(PV).unwrap().expect("registry row");
+    assert_eq!(rec.status, PvStatus::Active);
+
+    s.start_pool();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rec = s.registry.get_pv(PV).unwrap().expect("registry row");
+        if rec.status == PvStatus::Paused {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "abandoned pause never completed: {rec:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(stored_arrays(&s, t0).await, vec![vec![0.0; NELM as usize]]);
+
+    // The transition released the lock: a resume goes through.
+    tokio::time::timeout(Duration::from_secs(10), s.mgr.resume_pv(PV))
+        .await
+        .expect("resume is not blocked by the finished transition")
+        .expect("resume_pv");
+    s.finish().await;
+}
