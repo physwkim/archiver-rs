@@ -108,6 +108,7 @@ impl ArchiverQuery for FakeArchiverControl {
                         storage_write_errors: 0,
                         shard_closed_drops: 0,
                         shutdown_abandoned_drops: 0,
+                        flush_losses: 0,
                     },
                 )
             })

@@ -127,6 +127,9 @@ pub struct PvCountersDto {
     /// Buffered events abandoned during graceful shutdown because the
     /// drain budget expired before they could be appended.
     pub shutdown_abandoned_drops: u64,
+    /// Flush cycles in which this PV's buffered bytes were lost after
+    /// their appends had already been counted in `events_stored`.
+    pub flush_losses: u64,
 }
 
 // --- ArchiverCommand (async — write operations on archiver engine) ---

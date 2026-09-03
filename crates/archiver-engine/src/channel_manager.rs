@@ -228,6 +228,12 @@ pub struct PvCounters {
     /// appended. Distinct from `shard_closed_drops` (channel closed): the
     /// channel was open and draining, but time ran out.
     pub shutdown_abandoned_drops: AtomicU64,
+    /// Flush cycles in which this PV's buffered bytes were lost:
+    /// `flush_ingest_writes` reported the PV failed, or its writer was
+    /// evicted dirty (`take_loss_markers`). Those samples were counted
+    /// in `events_stored` when their append succeeded, so this is the
+    /// only per-PV trace that they never reached disk.
+    pub flush_losses: AtomicU64,
     /// Ordering high-water for the shard's out-of-order drop: the
     /// newest timestamp the write pool has handed to storage for this
     /// archiving task, as unix nanoseconds (0 = none yet). It lives
@@ -259,6 +265,7 @@ impl Default for PvCounters {
             storage_write_errors: AtomicU64::new(0),
             shard_closed_drops: AtomicU64::new(0),
             shutdown_abandoned_drops: AtomicU64::new(0),
+            flush_losses: AtomicU64::new(0),
             ordering_last_ts_nanos: AtomicU64::new(0),
         }
     }
@@ -285,6 +292,7 @@ pub struct PvCountersSnapshot {
     pub storage_write_errors: u64,
     pub shard_closed_drops: u64,
     pub shutdown_abandoned_drops: u64,
+    pub flush_losses: u64,
 }
 
 impl From<&PvCounters> for PvCountersSnapshot {
@@ -314,6 +322,7 @@ impl From<&PvCounters> for PvCountersSnapshot {
             storage_write_errors: c.storage_write_errors.load(Ordering::Relaxed),
             shard_closed_drops: c.shard_closed_drops.load(Ordering::Relaxed),
             shutdown_abandoned_drops: c.shutdown_abandoned_drops.load(Ordering::Relaxed),
+            flush_losses: c.flush_losses.load(Ordering::Relaxed),
         }
     }
 }
@@ -3697,6 +3706,8 @@ async fn run_flush_and_commit(
             // occasional under-commit that the next sample
             // resolves.
             if !failed.is_empty() {
+                metrics::counter!("archiver_storage_flush_losses_total")
+                    .increment(failed.len() as u64);
                 pending.remove_failed(&failed);
                 error!(
                     "STS flush dropped {} PV(s) from timestamp commit \
@@ -3825,7 +3836,14 @@ async fn run_flush_and_commit(
 /// committed value.
 #[derive(Default)]
 pub struct PendingReports {
-    inner: dashmap::DashMap<String, SystemTime>,
+    inner: dashmap::DashMap<String, PendingEntry>,
+}
+
+struct PendingEntry {
+    ts: SystemTime,
+    /// Counters of the archiving task that appended the pending
+    /// bytes, so a flush-time loss is attributed to the PV.
+    counters: Option<Arc<PvCounters>>,
 }
 
 impl PendingReports {
@@ -3836,18 +3854,21 @@ impl PendingReports {
     /// Coalescing report. If `pv` already has a newer timestamp,
     /// no-op. Always succeeds — this is the channel-replacement
     /// invariant that makes silent-PV under-commit impossible.
-    pub fn report(&self, pv: &str, ts: SystemTime) {
-        // DashMap's entry() locks one shard internally. Fast-path
-        // updates use `and_modify`; brand-new PVs go through
-        // `or_insert`. No external lock contention across shards.
-        self.inner
+    pub fn report(&self, pv: &str, ts: SystemTime, counters: Option<Arc<PvCounters>>) {
+        // DashMap's entry() locks one shard internally. No external
+        // lock contention across shards.
+        let mut entry = self
+            .inner
             .entry(pv.to_string())
-            .and_modify(|cur| {
-                if *cur < ts {
-                    *cur = ts;
-                }
-            })
-            .or_insert(ts);
+            .or_insert_with(|| PendingEntry { ts, counters: None });
+        if entry.ts < ts {
+            entry.ts = ts;
+        }
+        // The latest reporter owns the attribution: a respawned task
+        // for the same PV must not credit its losses to a dead one.
+        if counters.is_some() {
+            entry.counters = counters;
+        }
     }
 
     /// Snapshot the entire map for a flush cycle. Returns a
@@ -3856,7 +3877,7 @@ impl PendingReports {
     pub fn snapshot(&self) -> std::collections::HashMap<String, SystemTime> {
         self.inner
             .iter()
-            .map(|kv| (kv.key().clone(), *kv.value()))
+            .map(|kv| (kv.key().clone(), kv.value().ts))
             .collect()
     }
 
@@ -3868,7 +3889,7 @@ impl PendingReports {
         for (pv, &committed_ts) in committed {
             // remove_if applies the predicate atomically inside
             // the DashMap shard lock.
-            let _ = self.inner.remove_if(pv, |_, v| *v == committed_ts);
+            let _ = self.inner.remove_if(pv, |_, v| v.ts == committed_ts);
         }
     }
 
@@ -3891,7 +3912,11 @@ impl PendingReports {
     /// over-commit is never acceptable.
     pub fn remove_failed(&self, failed: &[String]) {
         for pv in failed {
-            let _ = self.inner.remove(pv);
+            if let Some((_, entry)) = self.inner.remove(pv)
+                && let Some(c) = entry.counters
+            {
+                c.flush_losses.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -4085,7 +4110,7 @@ async fn shard_handle_sample(
             // a PV that goes silent right after a successful
             // append still gets its `last_event` committed once
             // the owner gets to its next flush cycle.
-            pending_for_task.report(&pv_sample.pv_name, ts);
+            pending_for_task.report(&pv_sample.pv_name, ts, counters_in_task);
         }
         res
     });

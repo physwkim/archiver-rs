@@ -317,6 +317,7 @@ pub async fn pv_status_action(
             "storageWriteErrors": c.storage_write_errors,
             "shardClosedDrops": c.shard_closed_drops,
             "shutdownAbandonedDrops": c.shutdown_abandoned_drops,
+            "flushLosses": c.flush_losses,
             "disconnectCount": c.disconnect_count,
             "lastDisconnectEpochSecs": c.last_disconnect_unix_secs,
         })

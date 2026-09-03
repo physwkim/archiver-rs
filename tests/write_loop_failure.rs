@@ -1878,3 +1878,76 @@ async fn shutdown_waits_for_in_flight_flush_beyond_drain_budget() {
         "final flush must run once the in-flight flush finishes"
     );
 }
+
+/// A flush-time loss is charged to the PV that lost bytes and to no
+/// other, once per loss: the storage reports B failed on every
+/// flush, but B has pending bytes only in the first cycle.
+#[tokio::test]
+async fn flush_failed_pv_charges_only_its_flush_losses_counter() {
+    let storage = InjectingStorage::new();
+    storage.set_flush_failed(vec!["B".to_string()]);
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    for pv in ["A", "B", "C", "T"] {
+        registry
+            .register_pv(pv, ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+    }
+    let a = Arc::new(PvCounters::default());
+    let b = Arc::new(PvCounters::default());
+    let c = Arc::new(PvCounters::default());
+    let t = Arc::new(PvCounters::default());
+    let cfg = fast_cfg();
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry.clone(), cfg.clone());
+    tx.send(pv_sample("A", ts(10), 1.0, &a)).await.unwrap();
+    tx.send(pv_sample("B", ts(20), 2.0, &b)).await.unwrap();
+    tx.send(pv_sample("C", ts(30), 3.0, &c)).await.unwrap();
+    for i in 0..2u64 {
+        tokio::time::sleep(cfg.flush_period + Duration::from_millis(50)).await;
+        tx.send(pv_sample("T", ts(40 + i), 9.0, &t)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        b.flush_losses.load(Ordering::Relaxed),
+        1,
+        "B lost bytes in one flush"
+    );
+    assert_eq!(a.flush_losses.load(Ordering::Relaxed), 0);
+    assert_eq!(c.flush_losses.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        b.events_stored.load(Ordering::Relaxed),
+        1,
+        "the append succeeded; flush_losses is the only trace of the loss"
+    );
+    shutdown(sd_tx, join).await;
+}
+
+/// A dirty-writer eviction reaches the flush owner through
+/// `take_loss_markers`; it charges the same counter as a failed flush.
+#[tokio::test]
+async fn dirty_eviction_loss_marker_charges_flush_losses() {
+    let storage = InjectingStorage::new();
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    for pv in ["A", "T"] {
+        registry
+            .register_pv(pv, ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+    }
+    let a = Arc::new(PvCounters::default());
+    let t = Arc::new(PvCounters::default());
+    let cfg = fast_cfg();
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry.clone(), cfg.clone());
+    // Marker queued before the append so the first flush finds A
+    // pending and lost at the same time.
+    storage.push_loss("A");
+    tx.send(pv_sample("A", ts(10), 1.0, &a)).await.unwrap();
+    tokio::time::sleep(cfg.flush_period + Duration::from_millis(50)).await;
+    tx.send(pv_sample("T", ts(40), 9.0, &t)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(a.flush_losses.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        registry.get_pv("A").unwrap().unwrap().last_timestamp,
+        None,
+        "a PV whose bytes were lost must not have its timestamp committed"
+    );
+    shutdown(sd_tx, join).await;
+}

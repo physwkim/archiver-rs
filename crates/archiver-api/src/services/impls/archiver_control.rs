@@ -61,6 +61,7 @@ impl ArchiverQuery for ChannelArchiverControl {
                         storage_write_errors: c.storage_write_errors,
                         shard_closed_drops: c.shard_closed_drops,
                         shutdown_abandoned_drops: c.shutdown_abandoned_drops,
+                        flush_losses: c.flush_losses,
                     },
                 )
             })
