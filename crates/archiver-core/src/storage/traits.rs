@@ -196,6 +196,18 @@ pub trait StoragePlugin: Send + Sync {
     async fn rename_pv(&self, _from: &str, _to: &str) -> anyhow::Result<u64> {
         anyhow::bail!("rename_pv not implemented for this storage plugin")
     }
+
+    /// Rewrite every partition of `pv` to `new_type`, converting each
+    /// sample "through a number" (`ArchiverValue::convert_to`). This is
+    /// what `changeTypeForPV` runs before the registry flips the PV's
+    /// type, so no partition is left whose header disagrees with the
+    /// type the PV is archived as. Partitions already of `new_type` are
+    /// skipped, so a re-run after a crash finishes the job. Returns the
+    /// number of partitions rewritten. Defaults to error so missing
+    /// implementations surface explicitly.
+    async fn convert_pv_type(&self, _pv: &str, _new_type: ArchDbType) -> anyhow::Result<u64> {
+        anyhow::bail!("convert_pv_type not implemented for this storage plugin")
+    }
 }
 
 /// Post-processor trait for data reduction (mean, max, min, etc.).

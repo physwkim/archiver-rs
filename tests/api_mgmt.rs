@@ -1601,6 +1601,54 @@ async fn test_p2_change_type_for_pv_requires_pause() {
     assert_eq!(body["newType"], 2);
 }
 
+/// changeTypeForPV converts the stored partitions (Java parity), not
+/// only the registry row.
+#[tokio::test]
+async fn test_p2_change_type_for_pv_converts_stored_data() {
+    use archiver_core::storage::plainpb::reader::PbFileReader;
+    use archiver_core::storage::traits::EventStream as _;
+    use archiver_core::types::{ArchDbType, ArchiverSample, ArchiverValue};
+
+    let (app, reg, dir) = build_test_app_with_pvs().await;
+    // Seed a Double partition through a second plugin over the same root.
+    let seed =
+        PlainPbStoragePlugin::new("sts", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    seed.append_event(
+        "SIM:Sine",
+        ArchDbType::ScalarDouble,
+        &ArchiverSample::new(ts, ArchiverValue::ScalarDouble(3.7)),
+    )
+    .await
+    .unwrap();
+    seed.flush_writes().await.unwrap();
+
+    let req = get_request("/mgmt/bpl/pauseArchivingPV?pv=SIM:Sine");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let newtype = ArchDbType::ScalarInt as i32;
+    let req = get_request(&format!(
+        "/mgmt/bpl/changeTypeForPV?pv=SIM:Sine&newtype={newtype}"
+    ));
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_to_json(resp.into_body()).await;
+    assert_eq!(body["partitionsConverted"], 1);
+
+    let mut rdr = PbFileReader::open(&seed.file_path_for("SIM:Sine", ts)).unwrap();
+    assert_eq!(rdr.description().db_type, ArchDbType::ScalarInt);
+    assert_eq!(
+        rdr.next_event().unwrap().unwrap().value,
+        ArchiverValue::ScalarInt(3)
+    );
+    assert_eq!(
+        reg.get_pv("SIM:Sine").unwrap().unwrap().dbr_type,
+        ArchDbType::ScalarInt
+    );
+}
+
 #[tokio::test]
 async fn test_p2_aggregated_appliance_info_standalone() {
     let (app, _reg, _dir) = build_test_app_with_pvs().await;

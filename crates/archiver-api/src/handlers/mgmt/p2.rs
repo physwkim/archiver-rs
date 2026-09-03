@@ -193,6 +193,22 @@ pub async fn change_type_for_pv(
             return ApiError::BadRequest(format!("invalid newtype: {}", q.newtype)).into_response();
         }
     };
+    // Java parity: changeTypeForPV converts the PV's stored data to the
+    // new type (thru-number conversion) BEFORE the registry flips, so no
+    // partition is left whose header disagrees with the archived type
+    // (the storage layer refuses such appends). Files are the truth: a
+    // crash between the conversion and the registry update is repaired
+    // by re-issuing the request — converted partitions are skipped.
+    let converted = match state.storage.convert_pv_type(&canonical, new_type).await {
+        Ok(n) => n,
+        Err(e) => {
+            return ApiError::internal(e.context(format!(
+                "converting stored data of '{}' to {new_type:?}",
+                q.pv
+            )))
+            .into_response();
+        }
+    };
     if let Err(e) = state.pv_cmd.import_pv(
         &canonical,
         new_type,
@@ -213,6 +229,7 @@ pub async fn change_type_for_pv(
         "pv": canonical,
         "oldType": record.dbr_type as i32,
         "newType": q.newtype,
+        "partitionsConverted": converted,
     }))
     .into_response()
 }

@@ -106,6 +106,85 @@ impl ArchiverValue {
         }
     }
 
+    /// Convert to another archived type "through a number" — the rule
+    /// `changeTypeForPV` applies to a PV's existing partitions (Java
+    /// parity: `ThruNumberConversion`). Numeric families convert via
+    /// `f64` with `as` semantics (truncation toward zero, saturation at
+    /// the target's bounds); strings parse and format; a scalar becomes
+    /// a one-element waveform and a waveform collapses to its first
+    /// element. `V4GenericBytes` is opaque and converts neither way.
+    pub fn convert_to(&self, target: ArchDbType) -> anyhow::Result<ArchiverValue> {
+        if self.db_type() == target {
+            return Ok(self.clone());
+        }
+        let elems = self.elements()?;
+        let first = || -> anyhow::Result<&Elem> {
+            elems.first().ok_or_else(|| {
+                anyhow::anyhow!("cannot convert an empty waveform to scalar {target:?}")
+            })
+        };
+        let all_num = || -> anyhow::Result<Vec<f64>> { elems.iter().map(Elem::to_f64).collect() };
+        Ok(match target {
+            ArchDbType::ScalarString => Self::ScalarString(first()?.to_text()),
+            ArchDbType::ScalarByte => Self::ScalarByte(vec![first()?.to_f64()? as i8 as u8]),
+            ArchDbType::ScalarShort => Self::ScalarShort(first()?.to_f64()? as i16 as i32),
+            ArchDbType::ScalarEnum => Self::ScalarEnum(first()?.to_f64()? as i16 as i32),
+            ArchDbType::ScalarInt => Self::ScalarInt(first()?.to_f64()? as i32),
+            ArchDbType::ScalarFloat => Self::ScalarFloat(first()?.to_f64()? as f32),
+            ArchDbType::ScalarDouble => Self::ScalarDouble(first()?.to_f64()?),
+            ArchDbType::WaveformString => {
+                Self::VectorString(elems.iter().map(Elem::to_text).collect())
+            }
+            ArchDbType::WaveformByte => {
+                Self::VectorChar(all_num()?.into_iter().map(|f| f as i8 as u8).collect())
+            }
+            ArchDbType::WaveformShort => {
+                Self::VectorShort(all_num()?.into_iter().map(|f| f as i16 as i32).collect())
+            }
+            ArchDbType::WaveformEnum => {
+                Self::VectorEnum(all_num()?.into_iter().map(|f| f as i16 as i32).collect())
+            }
+            ArchDbType::WaveformInt => {
+                Self::VectorInt(all_num()?.into_iter().map(|f| f as i32).collect())
+            }
+            ArchDbType::WaveformFloat => {
+                Self::VectorFloat(all_num()?.into_iter().map(|f| f as f32).collect())
+            }
+            ArchDbType::WaveformDouble => Self::VectorDouble(all_num()?),
+            ArchDbType::V4GenericBytes => {
+                anyhow::bail!(
+                    "cannot convert {:?} to opaque V4GenericBytes",
+                    self.db_type()
+                )
+            }
+        })
+    }
+
+    /// Element-wise view for `convert_to`. Bytes are signed (EPICS
+    /// DBR_CHAR); a scalar is one element.
+    fn elements(&self) -> anyhow::Result<Vec<Elem>> {
+        Ok(match self {
+            Self::ScalarString(s) => vec![Elem::Text(s.clone())],
+            Self::ScalarByte(b) | Self::VectorChar(b) => {
+                b.iter().map(|x| Elem::Num(f64::from(*x as i8))).collect()
+            }
+            Self::ScalarShort(v) | Self::ScalarInt(v) | Self::ScalarEnum(v) => {
+                vec![Elem::Num(f64::from(*v))]
+            }
+            Self::ScalarFloat(v) => vec![Elem::Num(f64::from(*v))],
+            Self::ScalarDouble(v) => vec![Elem::Num(*v)],
+            Self::VectorString(v) => v.iter().map(|s| Elem::Text(s.clone())).collect(),
+            Self::VectorShort(v) | Self::VectorInt(v) | Self::VectorEnum(v) => {
+                v.iter().map(|x| Elem::Num(f64::from(*x))).collect()
+            }
+            Self::VectorFloat(v) => v.iter().map(|x| Elem::Num(f64::from(*x))).collect(),
+            Self::VectorDouble(v) => v.iter().map(|x| Elem::Num(*x)).collect(),
+            Self::V4GenericBytes(_) => {
+                anyhow::bail!("cannot convert opaque V4GenericBytes to another type")
+            }
+        })
+    }
+
     /// Try to extract a f64 representation (for postprocessors like mean/max/min).
     pub fn as_f64(&self) -> Option<f64> {
         match self {
@@ -192,6 +271,31 @@ impl ArchiverSample {
         let nanos = ((epoch_secs - secs as f64) * 1e9) as u32;
         let ts = SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
         Self::new(ts, value)
+    }
+}
+
+/// One element of an [`ArchiverValue`] as `convert_to` sees it.
+enum Elem {
+    Num(f64),
+    Text(String),
+}
+
+impl Elem {
+    fn to_f64(&self) -> anyhow::Result<f64> {
+        match self {
+            Self::Num(f) => Ok(*f),
+            Self::Text(s) => s
+                .trim()
+                .parse::<f64>()
+                .map_err(|e| anyhow::anyhow!("cannot convert string {s:?} to a number: {e}")),
+        }
+    }
+
+    fn to_text(&self) -> String {
+        match self {
+            Self::Num(f) => f.to_string(),
+            Self::Text(s) => s.clone(),
+        }
     }
 }
 
@@ -294,6 +398,103 @@ pub fn finite_or_null(f: f64) -> serde_json::Value {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn convert_to_numeric_truncates_toward_zero_and_saturates() {
+        let d = ArchiverValue::ScalarDouble(-1.9);
+        assert_eq!(
+            d.convert_to(ArchDbType::ScalarInt).unwrap(),
+            ArchiverValue::ScalarInt(-1)
+        );
+        assert_eq!(
+            ArchiverValue::ScalarDouble(70000.0)
+                .convert_to(ArchDbType::ScalarShort)
+                .unwrap(),
+            ArchiverValue::ScalarShort(i16::MAX as i32)
+        );
+        assert_eq!(
+            ArchiverValue::ScalarInt(300)
+                .convert_to(ArchDbType::ScalarByte)
+                .unwrap(),
+            ArchiverValue::ScalarByte(vec![i8::MAX as u8])
+        );
+        assert_eq!(
+            ArchiverValue::ScalarByte(vec![0xFF])
+                .convert_to(ArchDbType::ScalarInt)
+                .unwrap(),
+            ArchiverValue::ScalarInt(-1),
+            "bytes are signed DBR_CHAR"
+        );
+        assert_eq!(
+            ArchiverValue::ScalarDouble(1.5)
+                .convert_to(ArchDbType::ScalarFloat)
+                .unwrap(),
+            ArchiverValue::ScalarFloat(1.5)
+        );
+    }
+
+    #[test]
+    fn convert_to_string_formats_and_parses() {
+        assert_eq!(
+            ArchiverValue::ScalarDouble(2.5)
+                .convert_to(ArchDbType::ScalarString)
+                .unwrap(),
+            ArchiverValue::ScalarString("2.5".into())
+        );
+        assert_eq!(
+            ArchiverValue::ScalarString(" 42 ".into())
+                .convert_to(ArchDbType::ScalarInt)
+                .unwrap(),
+            ArchiverValue::ScalarInt(42)
+        );
+        let err = ArchiverValue::ScalarString("abc".into())
+            .convert_to(ArchDbType::ScalarDouble)
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot convert string"));
+    }
+
+    #[test]
+    fn convert_to_changes_shape_like_java_thru_number() {
+        assert_eq!(
+            ArchiverValue::ScalarInt(7)
+                .convert_to(ArchDbType::WaveformDouble)
+                .unwrap(),
+            ArchiverValue::VectorDouble(vec![7.0])
+        );
+        assert_eq!(
+            ArchiverValue::VectorDouble(vec![3.7, 9.9])
+                .convert_to(ArchDbType::ScalarInt)
+                .unwrap(),
+            ArchiverValue::ScalarInt(3),
+            "waveform → scalar takes the first element"
+        );
+        let err = ArchiverValue::VectorDouble(vec![])
+            .convert_to(ArchDbType::ScalarDouble)
+            .unwrap_err();
+        assert!(err.to_string().contains("empty waveform"));
+        assert_eq!(
+            ArchiverValue::VectorInt(vec![1, 2])
+                .convert_to(ArchDbType::WaveformString)
+                .unwrap(),
+            ArchiverValue::VectorString(vec!["1".into(), "2".into()])
+        );
+    }
+
+    #[test]
+    fn convert_to_same_type_and_opaque_bytes() {
+        let v = ArchiverValue::VectorFloat(vec![1.0, 2.0]);
+        assert_eq!(v.convert_to(ArchDbType::WaveformFloat).unwrap(), v);
+        assert!(
+            ArchiverValue::V4GenericBytes(vec![1])
+                .convert_to(ArchDbType::ScalarDouble)
+                .is_err()
+        );
+        assert!(
+            ArchiverValue::ScalarDouble(1.0)
+                .convert_to(ArchDbType::V4GenericBytes)
+                .is_err()
+        );
+    }
 
     #[test]
     fn decompose_timestamp_round_trips_through_epoch_parts() {

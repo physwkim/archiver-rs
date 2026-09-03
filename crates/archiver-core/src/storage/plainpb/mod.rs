@@ -2005,6 +2005,64 @@ fn list_pv_pb_files(root: &Path, pv: &str) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Rewrite one partition to `new_type` (see `convert_pv_type`). The
+/// converted stream goes to a `.pb.convert_tmp` sibling that replaces
+/// the original with one rename, so a crash mid-rewrite leaves the
+/// original intact and at most a stray temp file (not a `.pb`, so no
+/// listing sees it; the next attempt truncates it). Returns `false`
+/// when the partition already holds `new_type`.
+fn convert_partition_file(
+    path: &Path,
+    pv: &str,
+    new_type: ArchDbType,
+    fsync: bool,
+) -> anyhow::Result<bool> {
+    let mut reader = PbFileReader::open(path)?;
+    let desc = reader.description().clone();
+    if desc.db_type == new_type {
+        return Ok(false);
+    }
+    // The header's element count describes the shape; it only changes
+    // when the conversion crosses scalar ↔ waveform.
+    let element_count = if new_type.is_waveform() == desc.db_type.is_waveform() {
+        desc.element_count
+    } else {
+        Some(1)
+    };
+    let tmp = path.with_extension("pb.convert_tmp");
+    let mut write = || -> anyhow::Result<()> {
+        let mut out = BufWriter::with_capacity(64 * 1024, std::fs::File::create(&tmp)?);
+        let header =
+            writer::build_payload_info(pv, new_type, desc.year, element_count, &desc.headers);
+        let mut frame = codec::escape(&header.encode_to_vec());
+        frame.push(codec::NEWLINE);
+        out.write_all(&frame)?;
+        while let Some(sample) = reader.next_event()? {
+            let converted = ArchiverSample {
+                value: sample.value.convert_to(new_type)?,
+                ..sample
+            };
+            let mut frame = codec::escape(&writer::encode_sample(new_type, &converted)?);
+            frame.push(codec::NEWLINE);
+            out.write_all(&frame)?;
+        }
+        let file = out.into_inner().map_err(|e| e.into_error())?;
+        if fsync {
+            file.sync_all()?;
+        }
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.context(format!("converting {path:?} to {new_type:?}")));
+    }
+    std::fs::rename(&tmp, path)?;
+    if fsync && let Some(parent) = path.parent() {
+        PlainPbStoragePlugin::sync_dir(parent)?;
+    }
+    Ok(true)
+}
+
 #[async_trait]
 impl StoragePlugin for PlainPbStoragePlugin {
     fn name(&self) -> &str {
@@ -2311,6 +2369,41 @@ impl StoragePlugin for PlainPbStoragePlugin {
             total_size_bytes: Some(total_size),
             total_files: Some(total_files),
         }])
+    }
+
+    async fn convert_pv_type(&self, pv: &str, new_type: ArchDbType) -> anyhow::Result<u64> {
+        // Same three-phase slot handling as delete_pv_data / rename_pv:
+        // tombstone so a concurrent append bails while partitions are
+        // being replaced, and drop the cached writer — its fd would
+        // otherwise keep pointing at the replaced inode. The RAII guard
+        // un-tombstones on every return path.
+        let _cleanup = TombstoneCleanupGuard {
+            plugin: self,
+            pv: pv.to_string(),
+        };
+        let slot_arc = self.slot_for(pv);
+        {
+            let mut slot = slot_arc.lock().unwrap_or_else(|e| e.into_inner());
+            slot.dead = true;
+            if let Some(cached) = slot.writer.take() {
+                let _ = self.drop_dirty_writer(pv, cached);
+            }
+        }
+
+        let files = list_pv_pb_files(&self.root_folder, pv)?;
+        let mut converted = 0u64;
+        for path in files {
+            let pv = pv.to_string();
+            let fsync = self.fsync_on_flush;
+            let rewritten = tokio::task::spawn_blocking(move || {
+                convert_partition_file(&path, &pv, new_type, fsync)
+            })
+            .await??;
+            if rewritten {
+                converted += 1;
+            }
+        }
+        Ok(converted)
     }
 
     async fn rename_pv(&self, from: &str, to: &str) -> anyhow::Result<u64> {

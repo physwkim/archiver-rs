@@ -275,6 +275,13 @@ impl StoragePlugin for TieredStorage {
         let l = self.lts.rename_pv(from, to).await?;
         Ok(s + m + l)
     }
+
+    async fn convert_pv_type(&self, pv: &str, new_type: ArchDbType) -> anyhow::Result<u64> {
+        let s = self.sts.convert_pv_type(pv, new_type).await?;
+        let m = self.mts.convert_pv_type(pv, new_type).await?;
+        let l = self.lts.convert_pv_type(pv, new_type).await?;
+        Ok(s + m + l)
+    }
 }
 
 #[cfg(test)]

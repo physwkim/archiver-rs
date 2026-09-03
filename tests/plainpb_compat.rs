@@ -795,6 +795,119 @@ async fn ghost_file_path_records_loss() {
     );
 }
 
+/// changeTypeForPV parity: `convert_pv_type` rewrites every partition
+/// of the PV to the new type (thru-number), atomically per file, keeps
+/// timestamps/severity/status, is idempotent on re-run, and leaves the
+/// PV writable under the new type.
+#[tokio::test]
+async fn convert_pv_type_rewrites_partitions_thru_number() {
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let pv = "TEST:Retype";
+    let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap().into();
+    let ts2 = ts1 + std::time::Duration::from_secs(2 * 3600);
+    let mut s1 = ArchiverSample::new(ts1, ArchiverValue::ScalarDouble(1.9));
+    s1.severity = 2;
+    s1.status = 3;
+    let s2 = ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(-2.9));
+    for s in [&s1, &s2] {
+        plugin
+            .append_event(pv, ArchDbType::ScalarDouble, s)
+            .await
+            .unwrap();
+    }
+    plugin.flush_writes().await.unwrap();
+
+    let n = plugin
+        .convert_pv_type(pv, ArchDbType::ScalarInt)
+        .await
+        .unwrap();
+    assert_eq!(n, 2, "both hour partitions rewritten");
+
+    for (ts, expect, sev) in [
+        (ts1, ArchiverValue::ScalarInt(1), 2),
+        (ts2, ArchiverValue::ScalarInt(-2), 0),
+    ] {
+        let path = plugin.file_path_for(pv, ts);
+        assert!(
+            !path.with_extension("pb.convert_tmp").exists(),
+            "temp file must be renamed away"
+        );
+        let mut rdr = PbFileReader::open(&path).unwrap();
+        assert_eq!(rdr.description().db_type, ArchDbType::ScalarInt);
+        assert_eq!(rdr.description().pv_name, pv);
+        let s = rdr.next_event().unwrap().unwrap();
+        assert_eq!(s.value, expect);
+        assert_eq!(s.timestamp, ts);
+        assert_eq!(s.severity, sev);
+        assert!(rdr.next_event().unwrap().is_none());
+    }
+
+    // Idempotent: nothing left to convert.
+    assert_eq!(
+        plugin
+            .convert_pv_type(pv, ArchDbType::ScalarInt)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // The PV stays writable under the new type (slot un-tombstoned,
+    // header matches).
+    let s3 = ArchiverSample::new(
+        ts2 + std::time::Duration::from_secs(60),
+        ArchiverValue::ScalarInt(5),
+    );
+    plugin
+        .append_event(pv, ArchDbType::ScalarInt, &s3)
+        .await
+        .expect("append under the new type");
+    plugin.flush_writes().await.unwrap();
+    let mut rdr = PbFileReader::open(&plugin.file_path_for(pv, ts2)).unwrap();
+    let mut vals = Vec::new();
+    while let Some(s) = rdr.next_event().unwrap() {
+        vals.push(s.value);
+    }
+    assert_eq!(
+        vals,
+        vec![ArchiverValue::ScalarInt(-2), ArchiverValue::ScalarInt(5)]
+    );
+}
+
+/// A conversion that cannot be represented (opaque V4 bytes) must
+/// fail without touching the partition.
+#[tokio::test]
+async fn convert_pv_type_failure_leaves_partition_intact() {
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let pv = "TEST:RetypeFail";
+    let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap().into();
+    let s1 = ArchiverSample::new(ts1, ArchiverValue::ScalarString("abc".into()));
+    plugin
+        .append_event(pv, ArchDbType::ScalarString, &s1)
+        .await
+        .unwrap();
+    plugin.flush_writes().await.unwrap();
+    let path = plugin.file_path_for(pv, ts1);
+    let len_before = std::fs::metadata(&path).unwrap().len();
+
+    let err = plugin
+        .convert_pv_type(pv, ArchDbType::ScalarDouble)
+        .await
+        .expect_err("'abc' cannot become a number");
+    assert!(err.to_string().contains("converting"), "{err:#}");
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), len_before);
+    assert!(!path.with_extension("pb.convert_tmp").exists());
+    let mut rdr = PbFileReader::open(&path).unwrap();
+    assert_eq!(rdr.description().db_type, ArchDbType::ScalarString);
+    assert_eq!(
+        rdr.next_event().unwrap().unwrap().value,
+        ArchiverValue::ScalarString("abc".into())
+    );
+}
+
 /// A timestamp outside chrono's calendar must fail the append with an
 /// error, not panic the shard's spawn_blocking task.
 #[tokio::test]
