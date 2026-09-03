@@ -602,7 +602,12 @@ impl ChannelManager {
         self.start_archiving_internal(&record).await?;
 
         metrics::gauge!("archiver_pvs_active").increment(1.0);
-        info!(pv = pv_name, ?dbr_type, element_count, "Started archiving");
+        info!(
+            pv = pv_name,
+            dbr_type = ?record.dbr_type,
+            element_count,
+            "Started archiving"
+        );
         Ok(())
     }
 
@@ -3028,6 +3033,9 @@ fn pv_field_extract_timestamp(field: &PvField) -> SystemTime {
 }
 
 /// Convert epics-base-rs DbFieldType to archiver ArchDbType.
+/// Scalar form only. Arrays (`element_count > 1`) are promoted to the
+/// waveform form by the registry (`ArchDbType::with_element_count`)
+/// when the PV is registered.
 fn dbr_field_to_arch_type(field_type: DbFieldType) -> ArchDbType {
     match field_type {
         DbFieldType::String => ArchDbType::ScalarString,

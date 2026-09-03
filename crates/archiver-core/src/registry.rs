@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::types::ArchDbType;
 
@@ -322,6 +322,39 @@ impl PvRegistry {
             "CREATE INDEX IF NOT EXISTS idx_pv_alias \
              ON pv_info(alias_for) WHERE alias_for IS NOT NULL;",
         )?;
+        // Step 4: rows registered before the element-count rule lived
+        // here hold a scalar dbr_type with element_count > 1 (CA
+        // arrays). Every sample of such a PV is refused as a type
+        // change, so promote them once. No partition needs converting:
+        // the encoder refused every array sample before a file with
+        // the scalar header could be created.
+        let legacy: Vec<(String, i32, i32)> = {
+            let mut stmt = conn.prepare(
+                "SELECT pv_name, dbr_type, element_count FROM pv_info WHERE element_count > 1",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let now = Utc::now().to_rfc3339();
+        for (pv_name, stored, element_count) in legacy {
+            let Some(current) = ArchDbType::from_i32(stored) else {
+                continue;
+            };
+            let wanted = current.with_element_count(element_count);
+            if wanted != current {
+                conn.execute(
+                    "UPDATE pv_info SET dbr_type = ?1, updated_at = ?2 WHERE pv_name = ?3",
+                    params![wanted as i32, now, pv_name],
+                )?;
+                warn!(
+                    pv = pv_name,
+                    from = ?current,
+                    to = ?wanted,
+                    element_count,
+                    "Promoted array PV to its waveform type"
+                );
+            }
+        }
         info!("PV registry schema initialized");
         Ok(())
     }
@@ -351,6 +384,10 @@ impl PvRegistry {
         if !is_valid_pv_name(pv_name) {
             anyhow::bail!("invalid PV name: {pv_name:?}");
         }
+        // Arrays archive as waveforms whatever scalar type the caller
+        // derived from the channel; this is the one place the rule
+        // is applied, so no writer can store a scalar array row.
+        let dbr_type = dbr_type.with_element_count(element_count);
         let conn = self.lock_conn()?;
         // Registering makes the name a real PV; an alias row must not
         // be turned into one silently. The UPSERT below keeps
@@ -694,6 +731,7 @@ impl PvRegistry {
         {
             anyhow::bail!("invalid alias target: {target:?}");
         }
+        let dbr_type = dbr_type.with_element_count(element_count);
         let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let (mode_str, period) = sample_mode.to_db();
@@ -1529,16 +1567,33 @@ mod tests {
             reg.get_pv("PV:Typed").unwrap().unwrap().dbr_type,
             ArchDbType::ScalarDouble
         );
-        // Same type: mode and element count may still be re-registered.
+        // Same type: the mode may still be re-registered.
         reg.register_pv(
             "PV:Typed",
             ArchDbType::ScalarDouble,
             &SampleMode::Scan { period_secs: 2.0 },
-            4,
+            1,
         )
         .unwrap();
-        let rec = reg.get_pv("PV:Typed").unwrap().unwrap();
-        assert_eq!(rec.element_count, 4);
+        // A scalar channel that comes back as an array is a type
+        // change too: its samples would be waveforms.
+        let err = reg
+            .register_pv(
+                "PV:Typed",
+                ArchDbType::ScalarDouble,
+                &SampleMode::Monitor,
+                4,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("WaveformDouble"), "{err}");
+        // An array PV may change length within the waveform form.
+        reg.register_pv("PV:Arr", ArchDbType::ScalarDouble, &SampleMode::Monitor, 4)
+            .unwrap();
+        reg.register_pv("PV:Arr", ArchDbType::ScalarDouble, &SampleMode::Monitor, 8)
+            .unwrap();
+        let rec = reg.get_pv("PV:Arr").unwrap().unwrap();
+        assert_eq!(rec.dbr_type, ArchDbType::WaveformDouble);
+        assert_eq!(rec.element_count, 8);
     }
 
     #[test]
@@ -1570,6 +1625,67 @@ mod tests {
                 .iter()
                 .all(|r| r.pv_name != "PV:Alias")
         );
+    }
+
+    #[test]
+    fn register_pv_promotes_arrays_to_the_waveform_type() {
+        let reg = PvRegistry::in_memory().unwrap();
+        reg.register_pv("PV:Wf", ArchDbType::ScalarDouble, &SampleMode::Monitor, 3)
+            .unwrap();
+        assert_eq!(
+            reg.get_pv("PV:Wf").unwrap().unwrap().dbr_type,
+            ArchDbType::WaveformDouble
+        );
+        reg.register_pv("PV:Sc", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+        assert_eq!(
+            reg.get_pv("PV:Sc").unwrap().unwrap().dbr_type,
+            ArchDbType::ScalarDouble
+        );
+        // A re-archive derives the scalar form again; that is the same
+        // type after promotion, not a refused type change.
+        reg.register_pv("PV:Wf", ArchDbType::ScalarDouble, &SampleMode::Monitor, 3)
+            .unwrap();
+        // The import writer applies the same rule.
+        reg.import_pv(
+            "PV:Imp",
+            ArchDbType::ScalarInt,
+            &SampleMode::Monitor,
+            5,
+            PvStatus::Active,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reg.get_pv("PV:Imp").unwrap().unwrap().dbr_type,
+            ArchDbType::WaveformInt
+        );
+    }
+
+    #[test]
+    fn open_promotes_legacy_array_rows_to_the_waveform_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.db");
+        {
+            let reg = PvRegistry::open(&path).unwrap();
+            let conn = reg.lock_conn().unwrap();
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO pv_info (pv_name, dbr_type, element_count, created_at, updated_at) \
+                 VALUES ('PV:Legacy', ?1, 3, ?2, ?2)",
+                params![ArchDbType::ScalarDouble as i32, now],
+            )
+            .unwrap();
+        }
+        let reg = PvRegistry::open(&path).unwrap();
+        let rec = reg.get_pv("PV:Legacy").unwrap().unwrap();
+        assert_eq!(rec.dbr_type, ArchDbType::WaveformDouble);
+        assert_eq!(rec.element_count, 3);
     }
 
     #[test]

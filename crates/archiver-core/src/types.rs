@@ -63,6 +63,27 @@ impl ArchDbType {
                 | Self::WaveformDouble
         )
     }
+
+    /// The type a PV of this type archives as when its channel carries
+    /// `element_count` elements: arrays take the waveform form of a
+    /// scalar type; scalars, waveforms and the V4 types are unchanged.
+    /// The one element-count rule — the registry applies it to every
+    /// row it writes, so callers derive only the native scalar type.
+    pub fn with_element_count(self, element_count: i32) -> Self {
+        if element_count <= 1 {
+            return self;
+        }
+        match self {
+            Self::ScalarString => Self::WaveformString,
+            Self::ScalarShort => Self::WaveformShort,
+            Self::ScalarFloat => Self::WaveformFloat,
+            Self::ScalarEnum => Self::WaveformEnum,
+            Self::ScalarByte => Self::WaveformByte,
+            Self::ScalarInt => Self::WaveformInt,
+            Self::ScalarDouble => Self::WaveformDouble,
+            other => other,
+        }
+    }
 }
 
 /// The unified value type for all archived data.
@@ -529,5 +550,34 @@ mod tests {
         assert_eq!(dt.timestamp(), -2);
         assert_eq!(dt.timestamp_subsec_nanos(), 500_000_000);
         assert_eq!(dt.year(), 1969);
+    }
+}
+
+#[cfg(test)]
+mod element_count_tests {
+    use super::ArchDbType;
+
+    #[test]
+    fn with_element_count_promotes_only_scalars_and_only_for_arrays() {
+        assert_eq!(
+            ArchDbType::ScalarDouble.with_element_count(1),
+            ArchDbType::ScalarDouble
+        );
+        assert_eq!(
+            ArchDbType::ScalarDouble.with_element_count(2),
+            ArchDbType::WaveformDouble
+        );
+        assert_eq!(
+            ArchDbType::ScalarByte.with_element_count(0),
+            ArchDbType::ScalarByte
+        );
+        assert_eq!(
+            ArchDbType::WaveformDouble.with_element_count(1),
+            ArchDbType::WaveformDouble
+        );
+        assert_eq!(
+            ArchDbType::V4GenericBytes.with_element_count(8),
+            ArchDbType::V4GenericBytes
+        );
     }
 }
