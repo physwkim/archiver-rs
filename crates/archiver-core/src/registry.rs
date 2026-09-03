@@ -352,6 +352,21 @@ impl PvRegistry {
             anyhow::bail!("invalid PV name: {pv_name:?}");
         }
         let conn = self.lock_conn()?;
+        // Registering makes the name a real PV; an alias row must not
+        // be turned into one silently. The UPSERT below keeps
+        // alias_for, so such a row would archive in-process yet be
+        // filtered out of every restore query (`alias_for IS NULL`)
+        // and vanish at the next restart.
+        let alias_target: Option<Option<String>> = conn
+            .query_row(
+                "SELECT alias_for FROM pv_info WHERE pv_name = ?1",
+                params![pv_name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(Some(target)) = alias_target {
+            anyhow::bail!("'{pv_name}' is an alias for '{target}'; archive the target PV instead");
+        }
         let now = Utc::now().to_rfc3339();
         let (mode_str, period) = sample_mode.to_db();
 
@@ -1480,6 +1495,37 @@ mod tests {
         // remove_alias does NOT delete real PVs.
         assert!(!reg.remove_alias("PV:A").unwrap());
         assert!(reg.get_pv("PV:A").unwrap().is_some());
+    }
+
+    #[test]
+    fn register_pv_refuses_an_alias_name() {
+        let reg = PvRegistry::in_memory().unwrap();
+        reg.register_pv("PV:Real", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+        reg.add_alias("PV:Alias", "PV:Real").unwrap();
+
+        let err = reg
+            .register_pv(
+                "PV:Alias",
+                ArchDbType::ScalarDouble,
+                &SampleMode::Monitor,
+                1,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("alias for 'PV:Real'"), "{err}");
+
+        // The alias row is untouched: still routed, still absent from
+        // the restore query.
+        assert_eq!(
+            reg.resolve_alias("PV:Alias").unwrap().as_deref(),
+            Some("PV:Real")
+        );
+        assert!(
+            reg.pvs_by_status(PvStatus::Active)
+                .unwrap()
+                .iter()
+                .all(|r| r.pv_name != "PV:Alias")
+        );
     }
 
     #[test]
