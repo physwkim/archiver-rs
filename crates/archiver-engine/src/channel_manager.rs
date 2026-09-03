@@ -919,6 +919,9 @@ impl ChannelManager {
                 let pv_name_loop = pv_name.clone();
                 let archive_fields_loop = record.archive_fields.clone();
                 let extras_for_loop = extras.clone();
+                let slot = OverflowSlot::new();
+                self.tasks
+                    .spawn(drain_overflow_slot(slot.clone(), tx.clone(), token.clone()));
                 self.tasks.spawn(async move {
                     monitor_loop_pva(
                         pv_name_loop,
@@ -926,6 +929,7 @@ impl ChannelManager {
                         element_count,
                         pva_client,
                         tx,
+                        slot,
                         token,
                         ci,
                         counters_for_loop,
@@ -1440,6 +1444,7 @@ fn pva_handle_event(
     pv_name: &str,
     dbr_type: ArchDbType,
     tx: &mpsc::Sender<PvSample>,
+    slot: &OverflowSlot,
     conn_info: &Mutex<ConnectionInfo>,
     counters: &Arc<PvCounters>,
     extras: &ExtraFieldsCache,
@@ -1501,20 +1506,22 @@ fn pva_handle_event(
         element_count: Some(elem_count),
         counters: Some(counters.clone()),
     };
-    // Non-blocking by design (this runs on the epics-rs reactor task),
-    // so a full channel drops the sample: count it AND say so. A
-    // closed channel means the write pool is gone (shutdown); the
-    // sample is dropped either way, and a silent drop of both cases
-    // was indistinguishable from a healthy PV in the logs.
-    match tx.try_send(pv_sample) {
-        Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+    // This runs on the epics-rs reactor task and cannot wait for
+    // queue space. A sample the queue will not take is parked for
+    // `drain_overflow_slot`; only the parked sample it replaces is
+    // lost. A closed channel means the write pool is gone (shutdown).
+    match slot.offer(tx, pv_sample) {
+        Offered::Kept => {}
+        Offered::Replaced => {
             counters
                 .buffer_overflow_drops
                 .fetch_add(1, Ordering::Relaxed);
-            debug!(pv = pv_name, "write channel full; PVA sample dropped");
+            debug!(
+                pv = pv_name,
+                "write channel full; older parked PVA sample dropped"
+            );
         }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+        Offered::Closed => {
             debug!(pv = pv_name, "write channel closed; PVA sample dropped");
         }
     }
@@ -1522,8 +1529,9 @@ fn pva_handle_event(
 
 /// PVA monitor loop: subscribes once and parks until cancellation.
 /// Each fan-in event is decoded inline, packaged as a [`PvSample`],
-/// and non-blocking-pushed into the storage write_loop's channel —
-/// blocking would stall the pvAccess reactor thread.
+/// and pushed into the storage write_loop's channel without waiting
+/// (waiting would stall the pvAccess reactor task); what the channel
+/// will not take is parked in `slot` for [`drain_overflow_slot`].
 ///
 /// When `archive_fields` is non-empty, the subscription requests an
 /// explicit pvRequest with the mapped sub-field paths so the IOC
@@ -1536,6 +1544,7 @@ async fn monitor_loop_pva(
     element_count: i32,
     pva_client: PvaClient,
     tx: mpsc::Sender<PvSample>,
+    slot: Arc<OverflowSlot>,
     cancel_token: CancellationToken,
     conn_info: Arc<Mutex<ConnectionInfo>>,
     counters: Arc<PvCounters>,
@@ -1604,6 +1613,7 @@ async fn monitor_loop_pva(
             };
             let pv_name_cb = pv_name.clone();
             let tx_cb = tx.clone();
+            let slot_cb = slot.clone();
             let conn_info_cb = conn_info.clone();
             let counters_cb = counters.clone();
             let extras_cb = extras.clone();
@@ -1616,6 +1626,7 @@ async fn monitor_loop_pva(
                     &pv_name_cb,
                     dbr_type,
                     &tx_cb,
+                    &slot_cb,
                     &conn_info_cb,
                     &counters_cb,
                     &extras_cb,
@@ -1656,6 +1667,7 @@ async fn monitor_loop_pva(
             // shapes that `PvField::descriptor()` would degrade.
             let pv_name_cb = pv_name.clone();
             let tx_cb = tx.clone();
+            let slot_cb = slot.clone();
             let conn_info_cb = conn_info.clone();
             let counters_cb = counters.clone();
             let extras_cb = extras.clone();
@@ -1667,6 +1679,7 @@ async fn monitor_loop_pva(
                     &pv_name_cb,
                     dbr_type,
                     &tx_cb,
+                    &slot_cb,
                     &conn_info_cb,
                     &counters_cb,
                     &extras_cb,
@@ -2327,6 +2340,243 @@ async fn send_with_backpressure(
             tx.send(pv_sample).await.map_err(|e| e.0)
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(pv_sample)) => Err(pv_sample),
+    }
+}
+
+/// The newest PVA sample the write queue would not take. The PVA
+/// monitor callback runs on the pvAccess reactor task and cannot wait
+/// for queue space the way the CA producer does, so it parks the
+/// sample here and [`drain_overflow_slot`] delivers it once the queue
+/// drains; a newer sample replaces the parked one, and the replaced
+/// sample is the one lost to overflow. This is the CA client's own
+/// overflow rule (`CoalesceSlot`, after `dbEvent.c`'s replace-last):
+/// a PV that changes once during a write stall still has its new
+/// value archived, instead of the change being lost until the next
+/// one.
+struct OverflowSlot {
+    parked: std::sync::Mutex<Option<PvSample>>,
+    ready: tokio::sync::Notify,
+}
+
+/// What [`OverflowSlot::offer`] did with a sample.
+enum Offered {
+    /// Queued, or parked with nothing lost.
+    Kept,
+    /// Parked in place of an older parked sample, which is lost.
+    Replaced,
+    /// The write pool is gone; the sample is dropped.
+    Closed,
+}
+
+impl OverflowSlot {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            parked: std::sync::Mutex::new(None),
+            ready: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Queue `sample`, or park it when the queue is full. While a
+    /// sample is parked, later samples go through the slot too, so
+    /// delivery stays in timestamp order.
+    fn offer(&self, tx: &mpsc::Sender<PvSample>, sample: PvSample) -> Offered {
+        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+        if parked.is_some() {
+            *parked = Some(sample);
+            return Offered::Replaced;
+        }
+        match tx.try_send(sample) {
+            Ok(()) => Offered::Kept,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(sample)) => {
+                *parked = Some(sample);
+                self.ready.notify_one();
+                Offered::Kept
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Offered::Closed,
+        }
+    }
+
+    fn take(&self) -> Option<PvSample> {
+        self.parked.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// Deliver parked samples with backpressure, as the CA producer does
+/// for its own. Ends when the write pool is gone or, after a final
+/// pass over the slot, on cancel.
+async fn drain_overflow_slot(
+    slot: Arc<OverflowSlot>,
+    tx: mpsc::Sender<PvSample>,
+    cancel: CancellationToken,
+) {
+    loop {
+        while let Some(sample) = slot.take() {
+            if tx.send(sample).await.is_err() {
+                return;
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                if let Some(sample) = slot.take() {
+                    let _ = tx.send(sample).await;
+                }
+                return;
+            }
+            _ = slot.ready.notified() => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod overflow_slot_tests {
+    use super::*;
+    use epics_rs::pva::pvdata::{PvStructure, ScalarValue};
+
+    fn nt_double(v: f64, secs: i64) -> PvField {
+        let mut ts = PvStructure::new("time_t");
+        ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(secs)),
+        ));
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(v))));
+        nt.fields.push(("timeStamp".into(), PvField::Structure(ts)));
+        PvField::Structure(nt)
+    }
+
+    struct Producer {
+        tx: mpsc::Sender<PvSample>,
+        slot: Arc<OverflowSlot>,
+        counters: Arc<PvCounters>,
+        conn: Mutex<ConnectionInfo>,
+        extras: ExtraFieldsCache,
+        now: i64,
+    }
+
+    impl Producer {
+        fn new(tx: mpsc::Sender<PvSample>) -> Self {
+            Self {
+                tx,
+                slot: OverflowSlot::new(),
+                counters: Arc::new(PvCounters::default()),
+                conn: Mutex::new(ConnectionInfo::default()),
+                extras: ExtraFieldsCache::new(),
+                now: unix_secs(SystemTime::now()),
+            }
+        }
+
+        /// One monitor event carrying `v`, `age` seconds old.
+        fn event(&self, v: f64, age: i64) {
+            let field = nt_double(v, self.now - age);
+            pva_handle_event(
+                &field,
+                &field.descriptor(),
+                "PV",
+                ArchDbType::ScalarDouble,
+                &self.tx,
+                &self.slot,
+                &self.conn,
+                &self.counters,
+                &self.extras,
+                &[],
+                1800,
+            );
+        }
+
+        fn overflow_drops(&self) -> u64 {
+            self.counters.buffer_overflow_drops.load(Ordering::Relaxed)
+        }
+    }
+
+    fn value(s: PvSample) -> ArchiverValue {
+        s.sample.value
+    }
+
+    #[tokio::test]
+    async fn full_queue_parks_the_newest_sample_and_the_drainer_delivers_it() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let p = Producer::new(tx.clone());
+        p.event(1.0, 3);
+        p.event(2.0, 2);
+        p.event(3.0, 1);
+        assert_eq!(p.overflow_drops(), 1, "only the replaced sample is lost");
+        assert_eq!(p.counters.events_received.load(Ordering::Relaxed), 3);
+
+        let cancel = CancellationToken::new();
+        let drainer = tokio::spawn(drain_overflow_slot(p.slot.clone(), tx, cancel.clone()));
+        assert_eq!(
+            value(rx.recv().await.unwrap()),
+            ArchiverValue::ScalarDouble(1.0)
+        );
+        assert_eq!(
+            value(rx.recv().await.unwrap()),
+            ArchiverValue::ScalarDouble(3.0)
+        );
+        cancel.cancel();
+        drainer.await.unwrap();
+        assert_eq!(p.overflow_drops(), 1);
+    }
+
+    /// A sample that arrives while an older one is parked must not
+    /// overtake it through the queue, even when the queue has room.
+    #[tokio::test]
+    async fn a_parked_sample_keeps_later_samples_behind_it() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let p = Producer::new(tx.clone());
+        p.event(1.0, 3);
+        p.event(2.0, 2);
+        assert_eq!(
+            value(rx.recv().await.unwrap()),
+            ArchiverValue::ScalarDouble(1.0)
+        );
+        p.event(3.0, 1);
+        assert!(rx.try_recv().is_err(), "3.0 went past the parked 2.0");
+        assert_eq!(p.overflow_drops(), 1);
+
+        let cancel = CancellationToken::new();
+        let drainer = tokio::spawn(drain_overflow_slot(p.slot.clone(), tx, cancel.clone()));
+        assert_eq!(
+            value(rx.recv().await.unwrap()),
+            ArchiverValue::ScalarDouble(3.0)
+        );
+        cancel.cancel();
+        drainer.await.unwrap();
+    }
+
+    /// Cancel with a sample parked after the drainer's last pass: the
+    /// final pass still delivers it.
+    #[tokio::test]
+    async fn cancel_delivers_the_sample_parked_last() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let p = Producer::new(tx.clone());
+        let cancel = CancellationToken::new();
+        let drainer = tokio::spawn(drain_overflow_slot(p.slot.clone(), tx, cancel.clone()));
+        tokio::task::yield_now().await;
+        p.event(1.0, 2);
+        p.event(2.0, 1);
+        cancel.cancel();
+        // The final pass waits for queue space like any delivery, so
+        // the consumer must drain before the drainer can end.
+        assert_eq!(
+            value(rx.recv().await.unwrap()),
+            ArchiverValue::ScalarDouble(1.0)
+        );
+        assert_eq!(
+            value(rx.recv().await.unwrap()),
+            ArchiverValue::ScalarDouble(2.0)
+        );
+        drainer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_queue_drops_without_an_overflow_count() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let p = Producer::new(tx);
+        p.event(1.0, 1);
+        assert_eq!(p.overflow_drops(), 0);
+        assert!(p.slot.take().is_none());
     }
 }
 
