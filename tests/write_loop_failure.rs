@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use archiver_core::registry::{PvRegistry, SampleMode};
 use archiver_core::storage::partition::PartitionGranularity;
@@ -73,6 +73,9 @@ struct InjectingStorage {
     /// regression test assert the owner drains markers ONLY on the
     /// observed-success path (never on a flush timeout/panic).
     take_loss_calls: AtomicUsize,
+    /// What `get_last_known_event` reports per PV: the store's tail
+    /// the shard seeds its ordering gate from.
+    tail: Mutex<HashMap<String, ArchiverSample>>,
 }
 
 impl InjectingStorage {
@@ -90,7 +93,12 @@ impl InjectingStorage {
             flush_ingest_calls: AtomicUsize::new(0),
             loss_queue: Mutex::new(Vec::new()),
             take_loss_calls: AtomicUsize::new(0),
+            tail: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn set_tail(&self, pv: &str, sample: ArchiverSample) {
+        self.tail.lock().unwrap().insert(pv.to_string(), sample);
     }
 
     /// Push a dirty-write loss marker, simulating a loss recorded
@@ -227,8 +235,8 @@ impl StoragePlugin for InjectingStorage {
         Ok(Vec::new())
     }
 
-    async fn get_last_known_event(&self, _pv: &str) -> anyhow::Result<Option<ArchiverSample>> {
-        Ok(None)
+    async fn get_last_known_event(&self, pv: &str) -> anyhow::Result<Option<ArchiverSample>> {
+        Ok(self.tail.lock().unwrap().get(pv).cloned())
     }
 
     async fn flush_writes(&self) -> anyhow::Result<()> {
@@ -2055,5 +2063,144 @@ async fn equal_timestamp_sample_is_dropped_as_a_redelivery() {
         .collect();
     assert_eq!(stored, vec![t1, t2]);
 
+    shutdown(sd_tx, join).await;
+}
+
+fn nanos(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+}
+
+/// Registry seed, store tail, samples to send: returns the stored
+/// timestamps and the drop count once `expect_stored` samples landed.
+async fn seed_case(
+    registry_seed: Option<SystemTime>,
+    tail: Option<ArchiverSample>,
+    send: &[(SystemTime, f64)],
+    expect_stored: u64,
+) -> (Vec<SystemTime>, u64) {
+    let storage = InjectingStorage::new();
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry
+        .register_pv("A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let counters = Arc::new(PvCounters::default());
+    if let Some(seed) = registry_seed {
+        counters
+            .ordering_last_ts_nanos
+            .store(nanos(seed), Ordering::Relaxed);
+    }
+    if let Some(tail) = tail {
+        storage.set_tail("A", tail);
+    }
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry, fast_cfg());
+    for (t, v) in send {
+        tx.send(pv_sample("A", *t, *v, &counters)).await.unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while counters.events_stored.load(Ordering::Relaxed) < expect_stored {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "samples never stored: {counters:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stored = storage
+        .appends_snapshot()
+        .into_iter()
+        .map(|r| r.timestamp)
+        .collect();
+    let drops = counters.timestamp_drops.load(Ordering::Relaxed);
+    shutdown(sd_tx, join).await;
+    (stored, drops)
+}
+
+/// The shard seeds the ordering gate from the store's tail at the
+/// PV's first sample in the process. A registry seed behind the store
+/// (the process died between a flush and the owner's commit) must not
+/// let the connect-time redelivery of the tail be stored again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_seeds_from_a_store_tail_ahead_of_the_registry() {
+    let (stored, drops) = seed_case(
+        Some(ts(999)),
+        Some(sample_at(ts(1000), 1.0)),
+        &[(ts(1000), 1.0), (ts(1001), 2.0)],
+        1,
+    )
+    .await;
+    assert_eq!(stored, vec![ts(1001)]);
+    assert_eq!(drops, 1);
+}
+
+/// A registry seed ahead of the store (power loss with
+/// `fsync_on_flush` off): the redelivered current value is newer than
+/// anything on disk and must be stored, although the registry claims
+/// it already is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_seeds_from_a_store_tail_behind_the_registry() {
+    let (stored, drops) = seed_case(
+        Some(ts(1001)),
+        Some(sample_at(ts(1000), 1.0)),
+        &[(ts(1001), 2.0)],
+        1,
+    )
+    .await;
+    assert_eq!(stored, vec![ts(1001)]);
+    assert_eq!(drops, 0);
+}
+
+/// A store with nothing for the PV outranks a registry seed: the
+/// first sample is stored whatever the registry claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_seeds_to_zero_from_an_empty_store() {
+    let (stored, drops) = seed_case(Some(ts(1001)), None, &[(ts(1000), 1.0)], 1).await;
+    assert_eq!(stored, vec![ts(1000)]);
+    assert_eq!(drops, 0);
+}
+
+/// The store is read once per life of the counters: after the seed
+/// the gate follows the samples the shard stored, not the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_is_seeded_once() {
+    let storage = InjectingStorage::new();
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry
+        .register_pv("A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let counters = Arc::new(PvCounters::default());
+    storage.set_tail("A", sample_at(ts(1000), 1.0));
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry, fast_cfg());
+
+    tx.send(pv_sample("A", ts(1001), 2.0, &counters))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while counters.events_stored.load(Ordering::Relaxed) < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sample never stored"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A tail newer than the next sample would drop it if re-read.
+    storage.set_tail("A", sample_at(ts(1005), 5.0));
+    tx.send(pv_sample("A", ts(1002), 3.0, &counters))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while counters.events_stored.load(Ordering::Relaxed) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "second sample never stored: {counters:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stored: Vec<SystemTime> = storage
+        .appends_snapshot()
+        .into_iter()
+        .map(|r| r.timestamp)
+        .collect();
+    assert_eq!(stored, vec![ts(1001), ts(1002)]);
+    assert_eq!(counters.timestamp_drops.load(Ordering::Relaxed), 0);
     shutdown(sd_tx, join).await;
 }

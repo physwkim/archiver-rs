@@ -449,7 +449,38 @@ impl PlainPbStoragePlugin {
             let cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
             cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
+        self.flush_slots(snapshot)
+    }
 
+    /// Flush one PV's cached writer, if it has one. The read paths use
+    /// it so a reader of one PV sees that PV's buffered bytes without
+    /// paying for every other writer's flush: the write pool's
+    /// ordering-gate seed reads each PV's tail once as the PVs
+    /// connect after a restart.
+    fn flush_pv_writer(&self, pv: &str) -> FlushOutcome {
+        let slot = {
+            let cache = self.write_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.get(pv).map(|slot| (pv.to_string(), slot.clone()))
+        };
+        self.flush_slots(slot.into_iter().collect())
+    }
+
+    /// Read-side flush of one PV (`get_data` and the last-event reads):
+    /// only real I/O errors surface. A deferred writer (an `append`
+    /// holds the slot) is not a failure — its bytes reach disk on the
+    /// next cycle and the reader sees everything already flushed. Loss
+    /// markers are not drained here; see `flush_writes`.
+    fn flush_pv_for_read(&self, pv: &str) -> anyhow::Result<()> {
+        let outcome = self.flush_pv_writer(pv);
+        if !outcome.failed.is_empty() {
+            anyhow::bail!("writer flush failed for pv={pv}");
+        }
+        Ok(())
+    }
+
+    /// The flush step behind `flush_dirty_writers` and
+    /// `flush_pv_writer`; see the former for the contract.
+    fn flush_slots(&self, snapshot: Vec<(String, Arc<Mutex<PvWriterSlot>>)>) -> FlushOutcome {
         let mut failed = Vec::new();
         let mut deferred = Vec::new();
         let mut to_remove = Vec::new();
@@ -2177,8 +2208,8 @@ impl StoragePlugin for PlainPbStoragePlugin {
         start: SystemTime,
         end: SystemTime,
     ) -> anyhow::Result<Vec<Box<dyn EventStream>>> {
-        // Flush cached writes so readers see the latest data.
-        self.flush_writes().await?;
+        // Flush this PV's cached writes so the reader sees its latest data.
+        self.flush_pv_for_read(pv)?;
 
         let files = self.list_files_for_range(pv, start, end);
 
@@ -2218,8 +2249,8 @@ impl StoragePlugin for PlainPbStoragePlugin {
     }
 
     async fn get_last_known_event(&self, pv: &str) -> anyhow::Result<Option<ArchiverSample>> {
-        // Flush cached writes so readers can see the latest data.
-        self.flush_writes().await?;
+        // Flush this PV's cached writes so the reader sees its latest data.
+        self.flush_pv_for_read(pv)?;
 
         let pb_files = list_pv_pb_files(&self.root_folder, pv)?;
 
@@ -2237,7 +2268,7 @@ impl StoragePlugin for PlainPbStoragePlugin {
         pv: &str,
         target: SystemTime,
     ) -> anyhow::Result<Option<ArchiverSample>> {
-        self.flush_writes().await?;
+        self.flush_pv_for_read(pv)?;
 
         let pb_files = list_pv_pb_files(&self.root_folder, pv)?;
 

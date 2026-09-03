@@ -21,6 +21,7 @@ use archiver_engine::channel_manager::{
     run_sharded_write_pool,
 };
 use epics_rs::base::server::records::waveform::WaveformRecord;
+use epics_rs::base::server::snapshot::DbrClass;
 use epics_rs::base::types::{DbFieldType, EpicsValue};
 use epics_rs::ca::client::{CaChannel, CaClient};
 use epics_rs::ca::server::CaServer;
@@ -603,5 +604,168 @@ async fn abandoned_pause_still_completes() {
         .await
         .expect("resume is not blocked by the finished transition")
         .expect("resume_pv");
+    s.finish().await;
+}
+
+/// A second manager and write pool over `s`'s store, restored from
+/// `registry`: the restart half of the restart tests.
+async fn restart(
+    s: &Stack,
+    registry: Arc<PvRegistry>,
+) -> (
+    ChannelManager,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let (mgr2, rx2) = ChannelManager::new(registry.clone(), None).await.unwrap();
+    let (pool2_shutdown, shutdown_rx2) = tokio::sync::watch::channel(false);
+    let pool2 = tokio::spawn(run_sharded_write_pool(
+        s.storage.clone(),
+        registry,
+        rx2,
+        shutdown_rx2,
+        ShardedWritePoolConfig {
+            shards: 1,
+            per_shard_buffer: 1024,
+            write_loop: WriteLoopConfig {
+                flush_period: Duration::from_millis(300),
+                ..Default::default()
+            },
+        },
+    ));
+    assert_eq!(mgr2.restore_from_registry().await.unwrap(), 1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while counters(&mgr2, PV).events_received == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "restored monitor never delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    (mgr2, pool2, pool2_shutdown)
+}
+
+async fn stop_restarted(
+    mgr2: ChannelManager,
+    pool2: tokio::task::JoinHandle<()>,
+    pool2_shutdown: tokio::sync::watch::Sender<bool>,
+) {
+    mgr2.stop_pv(PV).await.unwrap();
+    pool2_shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), pool2)
+        .await
+        .expect("second write pool exits on shutdown")
+        .unwrap();
+}
+
+/// The record's TIME once `value` is its processed current value: two
+/// consecutive DBR_TIME gets agree on it.
+async fn record_time_of(ch: &CaChannel, value: &[f64]) -> SystemTime {
+    let want = EpicsValue::DoubleArray(value.to_vec());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut seen: Option<SystemTime> = None;
+    loop {
+        let snap = ch
+            .get_with_metadata(DbrClass::Time)
+            .await
+            .expect("caget with TIME");
+        let ts = SystemTime::from(snap.timestamp);
+        if snap.value == want && seen == Some(ts) {
+            return ts;
+        }
+        seen = (snap.value == want).then_some(ts);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "put of {value:?} never processed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The registry's committed `last_timestamp` can be behind the store
+/// (the process died between a flush and the owner's commit). The
+/// restarted task's gate is seeded from the store's tail, so the
+/// connect-time redelivery of the value on disk is dropped although
+/// the registry never heard of it; a registry without the high-water
+/// at all is the extreme of that lag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_with_a_registry_behind_the_store_does_not_re_store_the_value() {
+    let s = Stack::start().await;
+    let t0 = SystemTime::now();
+    s.archive().await;
+    let first = vec![1.0, 2.0, 3.0];
+    s.ch.put(&EpicsValue::DoubleArray(first.clone()))
+        .await
+        .expect("caput");
+    wait_on_disk(&s, t0, &first).await;
+    tokio::time::timeout(Duration::from_secs(10), s.mgr.shutdown())
+        .await
+        .expect("producers stop");
+
+    let rec = s.registry.get_pv(PV).unwrap().expect("registry row");
+    let behind = Arc::new(PvRegistry::open(&s._dir.path().join("registry2.db")).unwrap());
+    behind
+        .register_pv(PV, rec.dbr_type, &rec.sample_mode, rec.element_count)
+        .unwrap();
+    assert_eq!(behind.get_pv(PV).unwrap().unwrap().last_timestamp, None);
+
+    let (mgr2, pool2, pool2_shutdown) = restart(&s, behind).await;
+    let second = vec![4.0, 5.0, 6.0];
+    s.ch.put(&EpicsValue::DoubleArray(second.clone()))
+        .await
+        .expect("caput");
+    let got = wait_on_disk(&s, t0, &second).await;
+    let copies = got.iter().filter(|g| **g == first).count();
+    assert_eq!(
+        copies, 1,
+        "the redelivered value on disk was stored again: {got:?}"
+    );
+    let c = counters(&mgr2, PV);
+    assert_eq!(c.timestamp_drops, 1, "{c:?}");
+    assert_eq!(c.events_stored, 1, "{c:?}");
+
+    stop_restarted(mgr2, pool2, pool2_shutdown).await;
+    s.finish().await;
+}
+
+/// The registry can also be ahead of the store: with `fsync_on_flush`
+/// off, a power loss discards page-cache bytes the flush owner had
+/// already committed. The IOC redelivers its current value on connect,
+/// the one sample of the lost window still recoverable; seeded from
+/// the store's tail, the gate stores it instead of trusting the
+/// registry's claim that it is already on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_with_a_registry_ahead_of_the_store_stores_the_current_value() {
+    let s = Stack::start().await;
+    let t0 = SystemTime::now();
+    s.archive().await;
+    let first = vec![1.0, 2.0, 3.0];
+    s.ch.put(&EpicsValue::DoubleArray(first.clone()))
+        .await
+        .expect("caput");
+    wait_on_disk(&s, t0, &first).await;
+    tokio::time::timeout(Duration::from_secs(10), s.mgr.shutdown())
+        .await
+        .expect("producers stop");
+
+    // The IOC moves on while nothing archives, and the registry
+    // claims the new value is on disk, as it does after losing the
+    // bytes.
+    let lost = vec![4.0, 5.0, 6.0];
+    s.ch.put(&EpicsValue::DoubleArray(lost.clone()))
+        .await
+        .expect("caput");
+    let lost_ts = record_time_of(&s.ch, &lost).await;
+    s.registry.update_last_timestamp(PV, lost_ts).unwrap();
+
+    let (mgr2, pool2, pool2_shutdown) = restart(&s, s.registry.clone()).await;
+    let got = wait_on_disk(&s, t0, &lost).await;
+    let copies = got.iter().filter(|g| **g == lost).count();
+    assert_eq!(copies, 1, "{got:?}");
+    let c = counters(&mgr2, PV);
+    assert_eq!(c.timestamp_drops, 0, "{c:?}");
+    assert_eq!(c.events_stored, 1, "{c:?}");
+
+    stop_restarted(mgr2, pool2, pool2_shutdown).await;
     s.finish().await;
 }

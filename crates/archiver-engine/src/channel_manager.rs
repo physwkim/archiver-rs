@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -250,12 +250,17 @@ pub struct PvCounters {
     /// newer to be stored. The counters outlive the archiving task
     /// (`ChannelManager::task_counters`), so a resume continues the
     /// high-water and drops the current value the connect redelivers;
-    /// the first task in a process is seeded from the registry's
-    /// committed `last_timestamp`, and a deletePV + re-archive starts
-    /// at zero. Written only by the shard that owns the PV (the
-    /// dispatcher's consistent hash pins each PV to one shard); not
-    /// part of the reported snapshot.
+    /// the first task in a process starts from the registry's
+    /// committed `last_timestamp` until the shard replaces it with the
+    /// store's tail (`seed_ordering_gate`), and a deletePV +
+    /// re-archive starts over. Written only by the shard that owns the
+    /// PV (the dispatcher's consistent hash pins each PV to one
+    /// shard); not part of the reported snapshot.
     pub ordering_last_ts_nanos: AtomicU64,
+    /// `true` once the owning shard seeded `ordering_last_ts_nanos`
+    /// from the store (`seed_ordering_gate`): once per life of the
+    /// counters, so a resume does not read the store again.
+    gate_seeded: AtomicBool,
     /// Samples of this PV that exist anywhere between the producer and
     /// the end of their storage append: queued, parked, or being
     /// written. Maintained only by [`InFlight`], which every
@@ -288,6 +293,7 @@ impl Default for PvCounters {
             shutdown_abandoned_drops: AtomicU64::new(0),
             flush_losses: AtomicU64::new(0),
             ordering_last_ts_nanos: AtomicU64::new(0),
+            gate_seeded: AtomicBool::new(false),
             in_flight: AtomicU64::new(0),
             settled: tokio::sync::Notify::new(),
         }
@@ -600,10 +606,10 @@ impl ChannelManager {
     /// high-water, so the current value CA and PVA redeliver on
     /// connect, whose timestamp the previous task already stored, is
     /// dropped rather than stored a second time. The first task for a
-    /// PV in this process is seeded from the registry's committed
-    /// `last_timestamp`, which the flush owner advances only for bytes
-    /// on disk. The store is not consulted: that would be a partition
-    /// tail read per PV and per tier on the restore path.
+    /// PV in this process starts from the registry's committed
+    /// `last_timestamp`; the shard that owns the PV replaces it with
+    /// the store's tail at the PV's first sample (`seed_ordering_gate`),
+    /// off the restore path and one PV at a time.
     fn task_counters(&self, record: &PvRecord) -> Arc<PvCounters> {
         self.counters
             .entry(record.pv_name.clone())
@@ -4621,6 +4627,46 @@ async fn shard_append_loop(
     info!(shard = shard_idx, "Shard append loop exited");
 }
 
+/// Seed a PV's ordering gate from the store before the shard's first
+/// decision for it in this process. `task_counters` starts the gate
+/// at the registry's committed `last_timestamp`, and the registry can
+/// sit on either side of the store: behind it when the process died
+/// between a flush and the owner's commit, so the current value the
+/// IOC redelivers on connect would be stored a second time; ahead of
+/// it when power was lost with `fsync_on_flush` off, so that
+/// redelivery, the one sample of the lost window still recoverable,
+/// would be dropped. A duplicate or a gap is measured against the
+/// store, so the store has the final word. A read error keeps the
+/// registry seed; it is logged once and not retried per sample.
+async fn seed_ordering_gate(
+    shard_idx: usize,
+    storage: &Arc<dyn StoragePlugin>,
+    pv: &str,
+    c: &PvCounters,
+) {
+    if c.gate_seeded.load(Ordering::Relaxed) {
+        return;
+    }
+    match storage.get_last_known_event(pv).await {
+        Ok(last) => {
+            let nanos = last.map_or(0, |s| unix_nanos(s.timestamp));
+            c.ordering_last_ts_nanos.store(nanos, Ordering::Relaxed);
+            debug!(
+                shard = shard_idx,
+                pv,
+                last_nanos = nanos,
+                "Seeded the ordering gate from the store"
+            );
+        }
+        Err(e) => warn!(
+            shard = shard_idx,
+            pv,
+            "Could not read the last stored event; the ordering gate keeps the registry seed: {e}"
+        ),
+    }
+    c.gate_seeded.store(true, Ordering::Relaxed);
+}
+
 /// Process one sample on the shard's hot path. Extracted so the
 /// steady-state and shutdown-drain branches can share the same
 /// "drop checks → spawn_blocking append → report on success"
@@ -4637,11 +4683,12 @@ async fn shard_handle_sample(
 
     // Out-of-order timestamp drop; an equal timestamp is the same
     // event redelivered (CA and PVA resend the current value on every
-    // connect). The high-water lives in the archiving task's
-    // `PvCounters` (see `ordering_last_ts_nanos`), so it survives
-    // flush cycles but not the task: a sample without counters has no
+    // connect). The high-water lives in the PV's `PvCounters` (see
+    // `ordering_last_ts_nanos`), seeded from the store at the PV's
+    // first sample in this process; a sample without counters has no
     // task and no ordering state.
     if let Some(ref c) = pv_sample.counters {
+        seed_ordering_gate(shard_idx, storage, &pv_sample.pv_name, c).await;
         let prev = c.ordering_last_ts_nanos.load(Ordering::Relaxed);
         if prev != 0 && ts_nanos <= prev {
             c.timestamp_drops.fetch_add(1, Ordering::Relaxed);
