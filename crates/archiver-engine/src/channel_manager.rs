@@ -4651,7 +4651,10 @@ async fn shard_append_loop(
 /// it when power was lost with `fsync_on_flush` off, so that
 /// redelivery, the one sample of the lost window still recoverable,
 /// would be dropped. A duplicate or a gap is measured against the
-/// store, so the store has the final word.
+/// store, so the store has the final word. The read is the stored
+/// view, not the retrieval view a `SKIP_<TIER>_FOR_RETRIEVAL` flag
+/// routes around: a tier hidden from readers still holds the samples
+/// the gate must not store again.
 ///
 /// The read is isolated like the append: it runs on the blocking pool
 /// and the shard waits at most `read_timeout` for it, so a store that
@@ -4673,7 +4676,7 @@ async fn seed_ordering_gate(
     let pv_for_task = pv.to_string();
     let read = tokio::task::spawn_blocking(move || {
         tokio::runtime::Handle::current()
-            .block_on(storage_for_task.get_last_known_event(&pv_for_task))
+            .block_on(storage_for_task.get_last_stored_event(&pv_for_task))
     });
     match tokio::time::timeout(read_timeout, read).await {
         Ok(Ok(Ok(last))) => {

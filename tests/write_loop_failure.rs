@@ -73,12 +73,16 @@ struct InjectingStorage {
     /// regression test assert the owner drains markers ONLY on the
     /// observed-success path (never on a flush timeout/panic).
     take_loss_calls: AtomicUsize,
-    /// What `get_last_known_event` reports per PV: the store's tail
-    /// the shard seeds its ordering gate from.
+    /// What the tail reads report per PV: the store's tail the shard
+    /// seeds its ordering gate from.
     tail: Mutex<HashMap<String, ArchiverSample>>,
-    /// When set, `get_last_known_event` blocks its thread for this
-    /// long first, the way a stalled file read would.
+    /// When set, a tail read blocks its thread for this long first,
+    /// the way a stalled file read would.
     tail_hang_for: Mutex<Option<Duration>>,
+    /// When set, `get_last_known_event` reports nothing, the way a
+    /// tier under `SKIP_<TIER>_FOR_RETRIEVAL` is hidden from readers;
+    /// `get_last_stored_event` still reports the tail.
+    tail_hidden_from_retrieval: AtomicBool,
 }
 
 impl InjectingStorage {
@@ -98,6 +102,7 @@ impl InjectingStorage {
             take_loss_calls: AtomicUsize::new(0),
             tail: Mutex::new(HashMap::new()),
             tail_hang_for: Mutex::new(None),
+            tail_hidden_from_retrieval: AtomicBool::new(false),
         })
     }
 
@@ -107,6 +112,11 @@ impl InjectingStorage {
 
     fn set_tail(&self, pv: &str, sample: ArchiverSample) {
         self.tail.lock().unwrap().insert(pv.to_string(), sample);
+    }
+
+    fn hide_tail_from_retrieval(&self) {
+        self.tail_hidden_from_retrieval
+            .store(true, Ordering::SeqCst);
     }
 
     /// Push a dirty-write loss marker, simulating a loss recorded
@@ -244,6 +254,13 @@ impl StoragePlugin for InjectingStorage {
     }
 
     async fn get_last_known_event(&self, pv: &str) -> anyhow::Result<Option<ArchiverSample>> {
+        if self.tail_hidden_from_retrieval.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        self.get_last_stored_event(pv).await
+    }
+
+    async fn get_last_stored_event(&self, pv: &str) -> anyhow::Result<Option<ArchiverSample>> {
         let hang = *self.tail_hang_for.lock().unwrap();
         if let Some(hang) = hang {
             std::thread::sleep(hang);
@@ -2090,7 +2107,23 @@ async fn seed_case(
     send: &[(SystemTime, f64)],
     expect_stored: u64,
 ) -> (Vec<SystemTime>, u64) {
-    let storage = InjectingStorage::new();
+    seed_case_with(
+        InjectingStorage::new(),
+        registry_seed,
+        tail,
+        send,
+        expect_stored,
+    )
+    .await
+}
+
+async fn seed_case_with(
+    storage: Arc<InjectingStorage>,
+    registry_seed: Option<SystemTime>,
+    tail: Option<ArchiverSample>,
+    send: &[(SystemTime, f64)],
+    expect_stored: u64,
+) -> (Vec<SystemTime>, u64) {
     let registry = Arc::new(PvRegistry::in_memory().unwrap());
     registry
         .register_pv("A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
@@ -2135,6 +2168,25 @@ async fn seed_case(
 async fn gate_seeds_from_a_store_tail_ahead_of_the_registry() {
     let (stored, drops) = seed_case(
         Some(ts(999)),
+        Some(sample_at(ts(1000), 1.0)),
+        &[(ts(1000), 1.0), (ts(1001), 2.0)],
+        1,
+    )
+    .await;
+    assert_eq!(stored, vec![ts(1001)]);
+    assert_eq!(drops, 1);
+}
+
+/// A tier under `SKIP_<TIER>_FOR_RETRIEVAL` is hidden from readers,
+/// not from the gate: the seed reads the stored view, so the
+/// connect-time redelivery of the hidden tail is still dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_seeds_from_a_tail_hidden_from_retrieval() {
+    let storage = InjectingStorage::new();
+    storage.hide_tail_from_retrieval();
+    let (stored, drops) = seed_case_with(
+        storage,
+        None,
         Some(sample_at(ts(1000), 1.0)),
         &[(ts(1000), 1.0), (ts(1001), 2.0)],
         1,

@@ -179,6 +179,16 @@ impl StoragePlugin for TieredStorage {
         self.lts.get_last_known_event(pv).await
     }
 
+    async fn get_last_stored_event(&self, pv: &str) -> anyhow::Result<Option<ArchiverSample>> {
+        // The write path's view: newest tier first, no retrieval flags.
+        for tier in [&self.sts, &self.mts, &self.lts] {
+            if let Some(sample) = tier.get_last_known_event(pv).await? {
+                return Ok(Some(sample));
+            }
+        }
+        Ok(None)
+    }
+
     async fn get_last_event_before(
         &self,
         pv: &str,
@@ -319,5 +329,50 @@ mod tests {
         assert!(tiered.take_loss_markers().is_empty());
         assert!(tiered.mts.take_loss_markers().is_empty());
         assert!(tiered.lts.take_loss_markers().is_empty());
+    }
+
+    /// `SKIP_<TIER>_FOR_RETRIEVAL` hides a tier from readers only: the
+    /// stored view the write path seeds its ordering gate from still
+    /// reports the hidden tier's tail.
+    #[tokio::test]
+    async fn last_stored_event_ignores_the_retrieval_skip_flag() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        use crate::types::ArchiverValue;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tier = |name: &str| {
+            Arc::new(PlainPbStoragePlugin::new(
+                name,
+                dir.path().join(name),
+                PartitionGranularity::Year,
+            ))
+        };
+        let tiered = TieredStorage {
+            sts: tier("STS"),
+            mts: tier("MTS"),
+            lts: tier("LTS"),
+        };
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(1_700_000_000 + secs);
+        let older = ArchiverSample::new(at(0), ArchiverValue::ScalarDouble(1.0));
+        let newer = ArchiverSample::new(at(100), ArchiverValue::ScalarDouble(2.0));
+        tiered
+            .mts
+            .append_event("TIER:PV", ArchDbType::ScalarDouble, &older)
+            .await
+            .unwrap();
+        tiered
+            .sts
+            .append_event("TIER:PV", ArchDbType::ScalarDouble, &newer)
+            .await
+            .unwrap();
+
+        crate::flags::set("SKIP_STS_FOR_RETRIEVAL", true);
+        let read = tiered.get_last_known_event("TIER:PV").await;
+        let stored = tiered.get_last_stored_event("TIER:PV").await;
+        crate::flags::set("SKIP_STS_FOR_RETRIEVAL", false);
+
+        assert_eq!(read.unwrap().unwrap().timestamp, older.timestamp);
+        assert_eq!(stored.unwrap().unwrap().timestamp, newer.timestamp);
     }
 }

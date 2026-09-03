@@ -109,6 +109,15 @@ pub trait StoragePlugin: Send + Sync {
     /// Get the most recent known event for a PV.
     async fn get_last_known_event(&self, pv: &str) -> anyhow::Result<Option<ArchiverSample>>;
 
+    /// The newest event on disk for `pv`, ignoring retrieval routing.
+    /// [`Self::get_last_known_event`] is the retrieval view and may hide
+    /// tiers (`SKIP_<TIER>_FOR_RETRIEVAL`); the write path seeds its
+    /// ordering gate from this, so a tier hidden from readers still
+    /// counts as stored. Defaults to the retrieval view.
+    async fn get_last_stored_event(&self, pv: &str) -> anyhow::Result<Option<ArchiverSample>> {
+        self.get_last_known_event(pv).await
+    }
+
     /// Get the last sample whose timestamp is strictly before `target`.
     /// Used by retrieval to prepend a continuity sample when the user's
     /// query window starts in a gap between samples (Java's
