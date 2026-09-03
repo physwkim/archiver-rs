@@ -1723,7 +1723,11 @@ async fn monitor_loop_pva(
             // archiver invariant is that every V4 sample on disk
             // carries the channel-INIT descriptor, so degrading to
             // value-recovery is not allowed.
-            let canonical = match pva_client.pvinfo(&pv_name).await {
+            let info = tokio::select! {
+                _ = cancel_token.cancelled() => return,
+                r = pva_client.pvinfo(&pv_name) => r,
+            };
+            let canonical = match info {
                 Ok(d) => Arc::new(d),
                 Err(e) => {
                     counters
@@ -1864,6 +1868,9 @@ async fn monitor_loop_pva(
                     }
                 }
             };
+            // Not raced against cancellation: dropping this future
+            // mid-subscribe could leave the server-side monitor running
+            // with no handle to stop it. The client timeout bounds it.
             let handle = match pva_client.pvmonitor_handle(&pv_name, cb, on_conn).await {
                 Ok(h) => h,
                 Err(e) => {
@@ -1954,7 +1961,10 @@ async fn scan_loop_pva(
         // the value, so V4GenericBytes encoding can preserve Union /
         // UnionArray / Variant schemas that `PvField::descriptor()`
         // would otherwise degrade.
-        let res = tokio::time::timeout(pvget_timeout, pva_client.pvget_full(&pv_name)).await;
+        let res = tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            r = tokio::time::timeout(pvget_timeout, pva_client.pvget_full(&pv_name)) => r,
+        };
         let (field, canonical) = match res {
             Ok(Ok(r)) => (r.value, r.introspection),
             Ok(Err(e)) => {
@@ -2082,7 +2092,10 @@ async fn pva_metadata_refresh_loop(
             _ = tick.tick() => {}
         }
 
-        let res = tokio::time::timeout(FETCH_TIMEOUT, pva_client.pvget(&pv_name)).await;
+        let res = tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            r = tokio::time::timeout(FETCH_TIMEOUT, pva_client.pvget(&pv_name)) => r,
+        };
         let field = match res {
             Ok(Ok(f)) => f,
             _ => {
@@ -2735,7 +2748,11 @@ async fn scan_loop(
             _ = interval.tick() => {}
         }
 
-        if channel.wait_connected(CA_RETRY_DELAY).await.is_err() {
+        let connected = tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            r = channel.wait_connected(CA_RETRY_DELAY) => r,
+        };
+        if connected.is_err() {
             let was_connected = {
                 let mut ci = conn_info.lock().unwrap_or_else(|e| e.into_inner());
                 let prev = ci.is_connected;
@@ -2779,7 +2796,11 @@ async fn scan_loop(
             metadata_done = true;
         }
 
-        match channel.get().await {
+        let got = tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            r = channel.get() => r,
+        };
+        match got {
             Ok((_dbr_type, epics_val)) => {
                 let now = SystemTime::now();
                 let first_after_connect = {
@@ -2955,7 +2976,11 @@ async fn extra_field_monitor_body(
 ) {
     // Initial connect attempt — failure here is non-fatal (the field may
     // not exist on every IOC; we just leave the cache empty).
-    if channel.wait_connected(CA_CONNECT_TIMEOUT).await.is_err() {
+    let connected = tokio::select! {
+        _ = parent_token.cancelled() => return,
+        r = channel.wait_connected(CA_CONNECT_TIMEOUT) => r,
+    };
+    if connected.is_err() {
         debug!(
             pv = pv_owned,
             field = field_owned,

@@ -27,6 +27,8 @@ use epics_rs::ca::server::CaServer;
 
 const PV: &str = "SMOKE:CA:WF";
 const OTHER_PV: &str = "SMOKE:CA:OTHER";
+/// Not served by the in-process server: its channels never connect.
+const MISSING_PV: &str = "SMOKE:CA:MISSING";
 const NELM: i32 = 3;
 
 fn counters(mgr: &ChannelManager, pv: &str) -> PvCountersSnapshot {
@@ -499,6 +501,41 @@ async fn pause_waits_for_the_queued_sample_to_land() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    s.finish().await;
+}
+
+/// A PV that never connects keeps its scan loop and its extra-field
+/// monitor inside connect waits. Those waits observe cancellation, so
+/// `pause_pv` returns at once instead of after the wait's bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_returns_promptly_while_producers_wait_to_connect() {
+    let s = Stack::start().await;
+    s.registry
+        .register_pv(
+            MISSING_PV,
+            ArchDbType::ScalarDouble,
+            &SampleMode::Scan { period_secs: 1.0 },
+            1,
+        )
+        .unwrap();
+    s.registry
+        .update_archive_fields(MISSING_PV, &["HIHI".to_string()])
+        .unwrap();
+    assert_eq!(s.mgr.restore_from_registry().await.unwrap(), 1);
+    // Let both tasks reach their connect waits.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = tokio::time::Instant::now();
+    s.mgr.pause_pv(MISSING_PV).await.expect("pause_pv");
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(2), "pause took {took:?}");
+    let rec = s
+        .registry
+        .get_pv(MISSING_PV)
+        .unwrap()
+        .expect("registry row");
+    assert_eq!(rec.status, PvStatus::Paused);
 
     s.finish().await;
 }
