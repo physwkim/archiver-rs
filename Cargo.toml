@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -87,20 +87,20 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 # Internal crates
-archiver-proto = { path = "crates/archiver-proto", version = "0.4.1" }
-archiver-core = { path = "crates/archiver-core", version = "0.4.1" }
-archiver-engine = { path = "crates/archiver-engine", version = "0.4.1" }
-archiver-api = { path = "crates/archiver-api", version = "0.4.1" }
+archiver-proto = { path = "crates/archiver-proto", version = "0.4.2" }
+archiver-core = { path = "crates/archiver-core", version = "0.4.2" }
+archiver-engine = { path = "crates/archiver-engine", version = "0.4.2" }
+archiver-api = { path = "crates/archiver-api", version = "0.4.2" }
 
 [package]
 name = "epics-archiver"
 # Decoupled from workspace.package.version so the binary can ship
 # bug-fix releases (e.g. CLI ergonomics) without churning the four
-# library crates whose code is unchanged. v0.4.1 keeps binary and
-# the four library crates aligned (the epics-rs 0.16.2 → 0.20.3 bump
+# library crates whose code is unchanged. v0.4.2 keeps binary and
+# the four library crates aligned (the epics-rs 0.20.4 → 0.28.1 bump
 # touches every crate); future binary-only patch releases may diverge
 # again.
-version = "0.4.1"
+version = "0.4.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

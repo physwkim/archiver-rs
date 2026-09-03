@@ -1,5 +1,110 @@
 # Changelog
 
+## v0.4.2 — 2026-09-03
+
+Write-path integrity release. Nine review rounds over the data-saving
+path (ingest producers → sharded write pool → PlainPB → registry), each
+finding fixed at its cause in its own commit. The result: a sample the
+archiver is handed is stored once and only once across restarts,
+resumes, retypes and shutdown, and every loss the engine cannot avoid
+is counted per PV instead of logged or silent. Also bumps `epics-rs`
+0.20.4 → 0.28.1.
+
+### Added
+
+- **Per-PV `storageWriteErrors` and `flushLosses` counters.** A failed
+  or panicked append and a flush-time loss (failed
+  `flush_ingest_writes`, dirty-writer eviction) are attributed to the
+  PV on `getPVStatus` and in Prometheus
+  (`archiver_storage_flush_losses_total`); before, a PV losing every
+  sample to ENOSPC looked healthy.
+- **Per-PV quiesce for pause / stop / delete.** `PvSample` carries an
+  in-flight guard, so `pausePV`, `stopArchivingPV`, `deletePV`,
+  `renamePV`, `changeTypeForPV` and `reassignAppliance` act only once
+  the PV's tail is out of the write pool. The stop transition runs in
+  a task that owns the PV's op lock and commits the registry status
+  when the queue drains; the caller's wait and the op-lock wait are
+  both bounded by 60 s with an error, never a hang, and a caller
+  dropped mid-wait no longer leaves the registry `Active` for a PV
+  that stopped archiving.
+- **PVA overflow slot.** A PVA sample the full write queue refuses is
+  parked and delivered with backpressure instead of dropped; only a
+  parked sample replaced by a newer one counts as an overflow drop.
+- **`changeTypeForPV` converts the stored partitions**
+  (`StoragePlugin::convert_pv_type`, Java's ThruNumberConversion
+  rules) before the registry flips, so appends are not refused until
+  the partition rolls; the ETL move gates are held across the
+  conversion. A scalar target for an array PV is refused.
+- **Write pool is a critical task.** Its exit or panic requests
+  shutdown and fails `main`, instead of every producer stopping
+  silently while the API reports the PVs `Active`.
+
+### Fixed
+
+- **Connect-time redelivery stored twice, or dropped.** The shard's
+  ordering gate is seeded from the store's tail (read once per PV, on
+  the blocking pool, bounded by `append_timeout`, ignoring
+  `SKIP_<TIER>_FOR_RETRIEVAL`) and an equal timestamp is dropped as
+  the same event; the registry's `last_timestamp` survives
+  `archivePV` re-imports, `putPVTypeInfo`, `changeTypeForPV`,
+  `renamePV` and `receivePVMigration`, and can only move forward.
+- **Shard state outliving the archiving task.** The type-change gate
+  is stateless (compares the value's own type), and the ordering
+  high-water lives in the PV's counters, so `deletePV` + re-archive
+  and `changeTypeForPV` + resume no longer drop every sample until
+  restart.
+- **Shutdown loss.** The flush owner's final flush runs after the
+  shard drain (with its own in-flight window), the dispatcher flips
+  each shard's drain only after moving the main queue's tail into it,
+  and the producers are cancelled and awaited before the pool's
+  shutdown flag flips.
+- **CA arrays.** Array PVs register as the waveform type
+  (`ArchDbType::with_element_count`, legacy rows promoted once), and a
+  count-1 CA event on a waveform PV is stored as a one-element
+  waveform; before, every CA array sample was refused by the type
+  gate.
+- **PVA.** The monitor re-subscribes when the subscription task ends
+  (server-side close, fatal error); an unrepresentable `timeStamp`
+  falls back to now instead of panicking the reactor task; untyped
+  (empty) string arrays are typed from the introspection; dropped
+  samples are logged; every producer wait is raced with the cancel
+  token so a pause is not delayed by a disconnected PV.
+- **Drift window.** Only the past side is waived for the first sample
+  after connect; a far-future first stamp no longer poisons the
+  ordering gate until restart.
+- **PlainPB.** A partition is truncated only on an undecodable header
+  (a transient EMFILE/EIO on the probe no longer wipes it); a cached
+  writer's buffer is discarded only when its file is positively
+  absent; a removed partition directory is recreated on the next
+  append; a failed write keeps the writer (deferred, retried next
+  cycle) instead of counting up to 64 KiB per PV as lost; the header
+  probe runs after the fd reservation with the same evict-and-retry;
+  appends whose type differs from the partition header are refused on
+  both the open and cached-writer paths; `rename_pv` refuses an
+  existing destination partition; timestamps outside chrono's range
+  fail instead of panicking.
+- **Registry.** `register_pv_with_protocol` upserts (no more
+  `INSERT OR REPLACE` nulling `last_timestamp`, `prec`, `egu`,
+  aliases and policy), refuses alias rows and native-type changes;
+  `/` is rejected in PV names so the path encoding is injective;
+  paused PVs stay in the counters reports.
+- **ETL.** `move_file` routes by the path-derived PV name, so a
+  renamed PV's partitions migrate under the new name.
+
+### Changed
+
+- **Bumped `epics-rs` 0.20.4 → 0.28.1.** PVA array-of-composite
+  elements carry per-element nullability; `pvmonitor_handle` reports
+  connection state through `on_conn`; the 0.28.1 CA server no longer
+  emits a subscription's initial event with a racing put's value
+  under the pre-put timestamp.
+- **`per_shard_buffer` default** is the main channel capacity split
+  across `write_shards`; unset no longer means 4096 per shard.
+- **Library API.** `ChannelManager::new` / `new_with_drift` drop the
+  storage parameter; `StoragePlugin` gains `convert_pv_type` and
+  `get_last_stored_event`; `epics_value_to_archiver` takes the
+  registered `ArchDbType`.
+
 ## v0.4.1 — 2026-07-02
 
 Data-integrity release. The headline is a from-scratch redesign of the
