@@ -1702,3 +1702,93 @@ async fn clean_flush_persists_all_timestamps() {
 
     shutdown(sd_tx, join).await;
 }
+
+/// `PvSample.dbr_type` is the registry type captured once per
+/// archiving task, so a differing type can only arrive from a NEW
+/// task: changeTypeForPV + resume, or deletePV + re-archive with a
+/// new native type. The shard's first-seen map treated exactly that
+/// as a type change and dropped every later sample for the rest of
+/// the process while the PV stayed Active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn type_gate_accepts_new_registry_type_from_a_new_task() {
+    let storage = InjectingStorage::new();
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry
+        .register_pv("A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry.clone(), fast_cfg());
+
+    let gen1 = Arc::new(PvCounters::default());
+    tx.send(pv_sample("A", ts(100), 1.0, &gen1)).await.unwrap();
+
+    // changeTypeForPV flipped the registry to Int; the resumed task
+    // carries the new type and matching values.
+    let gen2 = Arc::new(PvCounters::default());
+    tx.send(PvSample {
+        pv_name: "A".to_string(),
+        dbr_type: ArchDbType::ScalarInt,
+        sample: ArchiverSample::new(ts(200), ArchiverValue::ScalarInt(2)),
+        element_count: Some(1),
+        counters: Some(gen2.clone()),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let a: Vec<_> = storage
+        .appends_snapshot()
+        .into_iter()
+        .filter(|r| r.pv == "A")
+        .collect();
+    assert_eq!(a.len(), 2, "both generations must reach storage: {a:?}");
+    assert_eq!(
+        gen2.type_change_drops.load(Ordering::Relaxed),
+        0,
+        "a new task's registry type is not a type change"
+    );
+    shutdown(sd_tx, join).await;
+}
+
+/// The real type-change signal is the value the IOC now sends
+/// disagreeing with the archived type — the exact pair the PB codec
+/// refuses. That must be dropped at the shard with the observed type
+/// recorded, not surface as a storage write error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn type_gate_drops_value_that_disagrees_with_registry_type() {
+    let storage = InjectingStorage::new();
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry
+        .register_pv("A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry.clone(), fast_cfg());
+
+    let counters = Arc::new(PvCounters::default());
+    tx.send(pv_sample("A", ts(100), 1.0, &counters))
+        .await
+        .unwrap();
+    tx.send(PvSample {
+        pv_name: "A".to_string(),
+        dbr_type: ArchDbType::ScalarDouble,
+        sample: ArchiverSample::new(ts(200), ArchiverValue::ScalarInt(7)),
+        element_count: Some(1),
+        counters: Some(counters.clone()),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let a: Vec<_> = storage
+        .appends_snapshot()
+        .into_iter()
+        .filter(|r| r.pv == "A")
+        .collect();
+    assert_eq!(a.len(), 1, "mismatched value must not reach storage: {a:?}");
+    assert_eq!(counters.type_change_drops.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        counters.latest_observed_dbr.load(Ordering::Relaxed),
+        ArchDbType::ScalarInt as i32,
+        "latest_observed_dbr must name the type the IOC now sends"
+    );
+    assert_eq!(counters.storage_write_errors.load(Ordering::Relaxed), 0);
+    shutdown(sd_tx, join).await;
+}

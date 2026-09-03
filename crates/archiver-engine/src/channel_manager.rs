@@ -3341,11 +3341,11 @@ fn record_closed_drop(shard: usize, s: &PvSample, phase: &'static str) {
 /// the worker panicked; restart it and retry once rather than
 /// dropping this shard's ~1/N of all PVs forever.
 ///
-/// The respawned shard starts with empty in-shard ordering maps
-/// (`last_ts` / `last_dbr_type`). That is safe: the PB reader
-/// tolerates non-monotonic timestamps (clock backsteps, late
-/// backfills), and the per-PV writer-slot Mutex inside the storage
-/// layer — not the shard's maps — is the real append-ordering owner.
+/// The respawned shard starts with an empty in-shard ordering map
+/// (`last_ts`). That is safe: the PB reader tolerates non-monotonic
+/// timestamps (clock backsteps, late backfills), and the per-PV
+/// writer-slot Mutex inside the storage layer — not the shard's map —
+/// is the real append-ordering owner.
 /// How long a spent respawn budget takes to refill.
 const RESPAWN_WINDOW: Duration = Duration::from_secs(60);
 /// Max respawns allowed per shard within [`RESPAWN_WINDOW`].
@@ -3915,10 +3915,10 @@ pub async fn write_loop_with_config(
 /// the next flush cycle.
 ///
 /// The shard worker holds NO ts_updates / flush state of its own.
-/// It tracks `last_ts` and `last_dbr_type` only for the
-/// per-PV ordering / type-change drop checks; those are local
-/// to the shard because the dispatcher's consistent hash pins each
-/// PV to one shard.
+/// It tracks `last_ts` only for the per-PV ordering drop check;
+/// that map is local to the shard because the dispatcher's
+/// consistent hash pins each PV to one shard. The type-change
+/// check is stateless (see `shard_handle_sample`).
 async fn shard_append_loop(
     shard_idx: usize,
     storage: Arc<dyn StoragePlugin>,
@@ -3929,12 +3929,10 @@ async fn shard_append_loop(
 ) {
     let append_timeout = cfg.append_timeout;
     info!(shard = shard_idx, "Shard append loop started");
-    // Per-PV state for the in-shard sanity drops. The dispatcher's
-    // consistent hash keeps each PV in one shard, so these maps
-    // never see cross-shard PVs.
+    // Per-PV state for the in-shard ordering drop. The dispatcher's
+    // consistent hash keeps each PV in one shard, so this map
+    // never sees cross-shard PVs.
     let mut last_ts: std::collections::HashMap<String, SystemTime> =
-        std::collections::HashMap::new();
-    let mut last_dbr_type: std::collections::HashMap<String, ArchDbType> =
         std::collections::HashMap::new();
 
     loop {
@@ -3946,7 +3944,6 @@ async fn shard_append_loop(
                     &pending,
                     pv_sample,
                     &mut last_ts,
-                    &mut last_dbr_type,
                     append_timeout,
                 )
                 .await;
@@ -3958,7 +3955,6 @@ async fn shard_append_loop(
                     &pending,
                     &mut sample_rx,
                     &mut last_ts,
-                    &mut last_dbr_type,
                     &cfg,
                 )
                 .await;
@@ -3979,7 +3975,6 @@ async fn shard_handle_sample(
     pending: &Arc<PendingReports>,
     pv_sample: PvSample,
     last_ts: &mut std::collections::HashMap<String, SystemTime>,
-    last_dbr_type: &mut std::collections::HashMap<String, ArchDbType>,
     append_timeout: Duration,
 ) {
     let ts = pv_sample.sample.timestamp;
@@ -4005,31 +4000,33 @@ async fn shard_handle_sample(
         return;
     }
 
-    // Type-change drop. The first sample defines the PV's wire
-    // type; later samples with a different DBR get dropped
-    // (operator must changeTypeForPV first).
-    let prev_type = last_dbr_type.insert(pv_sample.pv_name.clone(), pv_sample.dbr_type);
-    if let Some(prev) = prev_type
-        && prev != pv_sample.dbr_type
-    {
+    // Type-change drop, stateless. `pv_sample.dbr_type` is the
+    // registry type captured once per archiving task, so it cannot
+    // change within a task; a remembered first-seen type therefore
+    // only ever differed for a NEW task started with a different
+    // registry type (changeTypeForPV + resume, deletePV + re-archive)
+    // and then dropped every sample for the rest of the process.
+    // The real signal is the value the IOC now sends disagreeing
+    // with the archived type — the exact pair `writer::encode_sample`
+    // refuses — so compare the value's own type. The operator must
+    // changeTypeForPV to accept the new type.
+    let observed = pv_sample.sample.value.db_type();
+    if observed != pv_sample.dbr_type {
         if let Some(ref c) = pv_sample.counters {
             c.type_change_drops.fetch_add(1, Ordering::Relaxed);
             // Java parity (9f2234f): record the latest observed
             // DBR so the dropped-events report can show what the
             // IOC is now sending vs the archived type.
             c.latest_observed_dbr
-                .store(pv_sample.dbr_type as i32, Ordering::Relaxed);
+                .store(observed as i32, Ordering::Relaxed);
         }
         debug!(
             shard = shard_idx,
             pv = pv_sample.pv_name,
-            ?prev,
-            new = ?pv_sample.dbr_type,
+            archived = ?pv_sample.dbr_type,
+            ?observed,
             "Dropping type-changed sample"
         );
-        // Restore prev_type so a single mismatched sample doesn't
-        // permanently flip our recorded type.
-        last_dbr_type.insert(pv_sample.pv_name.clone(), prev);
         return;
     }
 
@@ -4158,7 +4155,6 @@ async fn shard_drain_on_shutdown(
     pending: &Arc<PendingReports>,
     sample_rx: &mut mpsc::Receiver<PvSample>,
     last_ts: &mut std::collections::HashMap<String, SystemTime>,
-    last_dbr_type: &mut std::collections::HashMap<String, ArchDbType>,
     cfg: &WriteLoopConfig,
 ) {
     let drain_per_sample_timeout = cfg.drain_per_sample_timeout;
@@ -4186,7 +4182,6 @@ async fn shard_drain_on_shutdown(
             pending,
             pv_sample,
             last_ts,
-            last_dbr_type,
             drain_per_sample_timeout,
         )
         .await;
