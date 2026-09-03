@@ -4296,13 +4296,17 @@ async fn flush_owner_loop(
     //      short-circuit, and skip every entry in `pending` —
     //      data on disk but no registry commit.
     //
-    // All windows fit inside the operator-configured
-    // `drain_total_budget`. If a drain or flush is genuinely wedged
-    // past the budget, we proceed to final flush; that call will
-    // see `in_flight` still set and short-circuit, but at least we
-    // didn't pin the process forever. Future samples on restart
-    // will re-populate `pending` and the registry catches up.
-    let phase2_deadline = std::time::Instant::now() + drain_total_budget;
+    // Windows 0 and 1 fit inside the operator-configured
+    // `drain_total_budget`; window 2 gets its own
+    // `shutdown_flush_timeout`, because a drain that spends the whole
+    // budget must not also spend the in-flight wait — the final flush
+    // would then be skipped for a flush that was about to finish. If
+    // a drain or flush is genuinely wedged past its window we proceed
+    // to the final flush; that call sees `in_flight` still set and
+    // short-circuits, but at least the process isn't pinned forever.
+    // Future samples on restart re-populate `pending` and the
+    // registry catches up. `main` sizes the supervisor budget as
+    // drain_total_budget + 2 × shutdown_flush_timeout (+ margin).
     if tokio::time::timeout(drain_total_budget, shards_done)
         .await
         .is_err()
@@ -4317,7 +4321,8 @@ async fn flush_owner_loop(
     if !min_grace.is_zero() {
         tokio::time::sleep(min_grace).await;
     }
-    while flush_in_flight.load(Ordering::Acquire) && std::time::Instant::now() < phase2_deadline {
+    let inflight_deadline = std::time::Instant::now() + shutdown_flush_timeout;
+    while flush_in_flight.load(Ordering::Acquire) && std::time::Instant::now() < inflight_deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     if flush_in_flight.load(Ordering::Acquire) {

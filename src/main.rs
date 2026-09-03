@@ -180,12 +180,14 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
     };
-    // The write pool's worst-case shutdown is the shard drain budget
-    // followed by the final flush + registry commit. The supervisor
-    // must outlast both: aborting the pool mid-final-flush leaves the
-    // drained tail on disk with its timestamps never committed.
+    // The write pool's worst-case shutdown is the shard drain budget,
+    // then a wait of up to shutdown_flush_timeout for a ticker flush
+    // still in flight, then the final flush + registry commit under
+    // the same timeout. The supervisor must outlast all three:
+    // aborting the pool mid-final-flush leaves the drained tail on
+    // disk with its timestamps never committed.
     let write_pool_shutdown_budget = pool_cfg.write_loop.drain_total_budget
-        + pool_cfg.write_loop.shutdown_flush_timeout
+        + 2 * pool_cfg.write_loop.shutdown_flush_timeout
         + Duration::from_secs(5);
     info!(
         shards = pool_cfg.shards,

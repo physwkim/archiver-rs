@@ -1833,3 +1833,48 @@ async fn ordering_state_dies_with_the_archiving_task() {
     assert_eq!(gen2.timestamp_drops.load(Ordering::Relaxed), 0);
     shutdown(sd_tx, join).await;
 }
+
+/// A ticker flush still in flight when shutdown arrives gets its own
+/// wait window (`shutdown_flush_timeout`), not whatever the shard
+/// drain left of `drain_total_budget`. With the drain budget spent
+/// the final flush was skipped and the tail never committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_waits_for_in_flight_flush_beyond_drain_budget() {
+    let cfg = WriteLoopConfig {
+        flush_period: Duration::from_millis(100),
+        append_timeout: Duration::from_millis(300),
+        flush_timeout: Duration::from_millis(200),
+        drain_per_sample_timeout: Duration::from_millis(300),
+        drain_total_budget: Duration::from_millis(250),
+        shutdown_flush_timeout: Duration::from_secs(3),
+    };
+    let storage = InjectingStorage::new();
+    // Every flush outlives flush_timeout, so the ticker flush started
+    // by the first sample is still in flight when shutdown arrives.
+    storage.set_flush_hang(Duration::from_millis(900));
+
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry
+        .register_pv("A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let counters = Arc::new(PvCounters::default());
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry.clone(), cfg);
+
+    tx.send(pv_sample("A", ts(100), 1.0, &counters))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    tx.send(pv_sample("A", ts(200), 2.0, &counters))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    shutdown(sd_tx, join).await;
+
+    let rec = registry.get_pv("A").unwrap().unwrap();
+    assert_eq!(
+        rec.last_timestamp,
+        Some(ts(200)),
+        "final flush must run once the in-flight flush finishes"
+    );
+}
