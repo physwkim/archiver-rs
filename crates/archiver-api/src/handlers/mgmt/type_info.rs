@@ -529,6 +529,14 @@ pub async fn rename_pv(
     ) {
         return ApiError::internal(e).into_response();
     }
+    // The moved partitions end where the source's committed
+    // last_timestamp says; the new row starts there so a resume drops
+    // the connect-time redelivery instead of storing it again.
+    if let Some(ts) = source.last_timestamp
+        && let Err(e) = state.pv_cmd.update_last_timestamp(&q.newname, ts)
+    {
+        return ApiError::internal(e).into_response();
+    }
 
     if let Err(e) = state.pv_cmd.set_status(&q.pv, PvStatus::Paused) {
         return ApiError::internal(e).into_response();

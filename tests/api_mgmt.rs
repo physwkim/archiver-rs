@@ -1099,6 +1099,10 @@ async fn test_rename_pv_after_pause_creates_destination() {
         StatusCode::OK
     );
 
+    // The source's committed high-water moves with its data.
+    let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    registry.update_last_timestamp("SIM:Cosine", ts).unwrap();
+
     let req = get_request("/mgmt/bpl/renamePV?pv=SIM:Cosine&newname=SIM:CosineRenamed");
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1112,6 +1116,7 @@ async fn test_rename_pv_after_pause_creates_destination() {
     let dst = registry.get_pv("SIM:CosineRenamed").unwrap().unwrap();
     assert_eq!(dst.status, archiver_core::registry::PvStatus::Paused);
     assert_eq!(dst.dbr_type, src.dbr_type);
+    assert_eq!(dst.last_timestamp, Some(ts));
 }
 
 #[tokio::test]
@@ -2109,4 +2114,10 @@ async fn test_receive_pv_migration_imports_with_proxied_header() {
     let r = registry.get_pv("MIGRATED:PV").unwrap().unwrap();
     assert_eq!(r.archive_fields, vec!["HIHI".to_string()]);
     assert_eq!(r.status, archiver_core::registry::PvStatus::Paused);
+    // The migrated tail is committed, so a resume here does not store
+    // the connect-time redelivery of the newest sample again.
+    assert_eq!(
+        r.last_timestamp,
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_010))
+    );
 }

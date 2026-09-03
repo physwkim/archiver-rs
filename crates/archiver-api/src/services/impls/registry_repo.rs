@@ -93,6 +93,14 @@ impl PvCommandRepository for RegistryRepository {
         self.inner.set_status(pv, status)
     }
 
+    fn update_last_timestamp(
+        &self,
+        pv: &str,
+        timestamp: std::time::SystemTime,
+    ) -> anyhow::Result<()> {
+        self.inner.update_last_timestamp(pv, timestamp)
+    }
+
     fn update_sample_mode(&self, pv: &str, mode: &SampleMode) -> anyhow::Result<bool> {
         self.inner.update_sample_mode(pv, mode)
     }

@@ -567,6 +567,7 @@ pub async fn receive_pv_migration(
     }
 
     let mut written = 0usize;
+    let mut newest: Option<std::time::SystemTime> = None;
     for s in samples {
         let secs_i = s["secs"].as_i64().unwrap_or(0);
         if secs_i < 0 {
@@ -604,9 +605,20 @@ pub async fn receive_pv_migration(
             return ApiError::internal(e).into_response();
         }
         written += 1;
+        newest = Some(newest.map_or(ts, |n| n.max(ts)));
     }
-    if let Err(e) = state.storage.flush_writes().await {
-        tracing::warn!(pv = pv_name, "flush after migration failed: {e}");
+    match state.storage.flush_writes().await {
+        Ok(()) => {
+            // The migrated tail is on disk; commit it so a resume here
+            // drops the connect-time redelivery instead of storing it
+            // again.
+            if let Some(ts) = newest
+                && let Err(e) = state.pv_cmd.update_last_timestamp(&pv_name, ts)
+            {
+                return ApiError::internal(e).into_response();
+            }
+        }
+        Err(e) => tracing::warn!(pv = pv_name, "flush after migration failed: {e}"),
     }
 
     axum::Json(serde_json::json!({

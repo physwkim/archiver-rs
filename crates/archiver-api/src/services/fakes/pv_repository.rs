@@ -241,6 +241,19 @@ impl PvCommandRepository for InMemoryPvRepository {
         }
     }
 
+    fn update_last_timestamp(
+        &self,
+        pv: &str,
+        timestamp: std::time::SystemTime,
+    ) -> anyhow::Result<()> {
+        if let Some(record) = self.pvs.lock().unwrap().get_mut(pv)
+            && record.last_timestamp.is_none_or(|cur| timestamp > cur)
+        {
+            record.last_timestamp = Some(timestamp);
+        }
+        Ok(())
+    }
+
     fn update_sample_mode(&self, pv: &str, mode: &SampleMode) -> anyhow::Result<bool> {
         if let Some(record) = self.pvs.lock().unwrap().get_mut(pv) {
             record.sample_mode = mode.clone();

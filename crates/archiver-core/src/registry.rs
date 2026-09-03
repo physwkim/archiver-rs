@@ -742,11 +742,30 @@ impl PvRegistry {
             Some(serde_json::to_string(archive_fields)?)
         };
 
+        // UPSERT, not INSERT OR REPLACE (see `register_pv`): REPLACE
+        // re-inserted the row without last_timestamp, so putPVTypeInfo
+        // and changeTypeForPV on an archived PV dropped its committed
+        // high-water and the next restart stored the connect-time
+        // redelivery again. An import owns every column but that one.
         conn.execute(
-            "INSERT OR REPLACE INTO pv_info
+            "INSERT INTO pv_info
              (pv_name, dbr_type, sample_mode, sample_period, status, element_count,
               created_at, updated_at, prec, egu, alias_for, archive_fields, policy_name, protocol)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(pv_name) DO UPDATE SET
+                 dbr_type = excluded.dbr_type,
+                 sample_mode = excluded.sample_mode,
+                 sample_period = excluded.sample_period,
+                 status = excluded.status,
+                 element_count = excluded.element_count,
+                 created_at = excluded.created_at,
+                 updated_at = excluded.updated_at,
+                 prec = excluded.prec,
+                 egu = excluded.egu,
+                 alias_for = excluded.alias_for,
+                 archive_fields = excluded.archive_fields,
+                 policy_name = excluded.policy_name,
+                 protocol = excluded.protocol",
             params![
                 pv_name,
                 dbr_type as i32,
@@ -1421,6 +1440,44 @@ mod tests {
         assert_eq!(r.policy_name.as_deref(), Some("ring"));
         assert_eq!(r.prec.as_deref(), Some("3"));
         assert_eq!(r.egu.as_deref(), Some("mA"));
+    }
+
+    /// An import owns the metadata columns only: the committed
+    /// last_timestamp of an archived PV survives putPVTypeInfo and
+    /// changeTypeForPV, which both go through `import_pv`.
+    #[test]
+    fn import_pv_keeps_the_committed_last_timestamp() {
+        let reg = PvRegistry::in_memory().unwrap();
+        reg.register_pv(
+            "PV:Imported",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
+        let ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        reg.update_last_timestamp("PV:Imported", ts).unwrap();
+
+        reg.import_pv(
+            "PV:Imported",
+            ArchDbType::ScalarInt,
+            &SampleMode::Monitor,
+            1,
+            PvStatus::Paused,
+            None,
+            Some("0"),
+            None,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let r = reg.get_pv("PV:Imported").unwrap().unwrap();
+        assert_eq!(r.last_timestamp, Some(ts));
+        assert_eq!(r.dbr_type, ArchDbType::ScalarInt);
+        assert_eq!(r.status, PvStatus::Paused);
+        assert_eq!(r.prec.as_deref(), Some("0"));
     }
 
     #[test]

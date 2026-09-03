@@ -41,6 +41,13 @@ pub trait PvCommandRepository: Send + Sync {
     ) -> anyhow::Result<()>;
     fn remove_pv(&self, pv: &str) -> anyhow::Result<bool>;
     fn set_status(&self, pv: &str, status: PvStatus) -> anyhow::Result<bool>;
+    /// Advance the committed `last_timestamp`; never regresses it (the
+    /// registry owns that rule).
+    fn update_last_timestamp(
+        &self,
+        pv: &str,
+        timestamp: std::time::SystemTime,
+    ) -> anyhow::Result<()>;
     fn update_sample_mode(&self, pv: &str, mode: &SampleMode) -> anyhow::Result<bool>;
     fn update_metadata(
         &self,
