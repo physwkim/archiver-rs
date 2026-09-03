@@ -357,15 +357,29 @@ impl PvRegistry {
         // alias_for, so such a row would archive in-process yet be
         // filtered out of every restore query (`alias_for IS NULL`)
         // and vanish at the next restart.
-        let alias_target: Option<Option<String>> = conn
+        let existing: Option<(i32, Option<String>)> = conn
             .query_row(
-                "SELECT alias_for FROM pv_info WHERE pv_name = ?1",
+                "SELECT dbr_type, alias_for FROM pv_info WHERE pv_name = ?1",
                 params![pv_name],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some(Some(target)) = alias_target {
+        if let Some((_, Some(target))) = &existing {
             anyhow::bail!("'{pv_name}' is an alias for '{target}'; archive the target PV instead");
+        }
+        // Only changeTypeForPV (import_pv, after converting the stored
+        // partitions) may change a PV's type. A re-archive that finds
+        // another native type at the IOC would flip the registry while
+        // the current partition keeps its header type, and every append
+        // would be refused until that partition rolls.
+        if let Some((existing_type, None)) = existing
+            && existing_type != dbr_type as i32
+        {
+            anyhow::bail!(
+                "'{pv_name}' is registered as {:?}; re-archiving cannot change it to \
+                 {dbr_type:?} — use changeTypeForPV",
+                ArchDbType::from_i32(existing_type)
+            );
         }
         let now = Utc::now().to_rfc3339();
         let (mode_str, period) = sample_mode.to_db();
@@ -1495,6 +1509,36 @@ mod tests {
         // remove_alias does NOT delete real PVs.
         assert!(!reg.remove_alias("PV:A").unwrap());
         assert!(reg.get_pv("PV:A").unwrap().is_some());
+    }
+
+    #[test]
+    fn register_pv_refuses_a_type_change() {
+        let reg = PvRegistry::in_memory().unwrap();
+        reg.register_pv(
+            "PV:Typed",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Monitor,
+            1,
+        )
+        .unwrap();
+        let err = reg
+            .register_pv("PV:Typed", ArchDbType::ScalarInt, &SampleMode::Monitor, 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("changeTypeForPV"), "{err}");
+        assert_eq!(
+            reg.get_pv("PV:Typed").unwrap().unwrap().dbr_type,
+            ArchDbType::ScalarDouble
+        );
+        // Same type: mode and element count may still be re-registered.
+        reg.register_pv(
+            "PV:Typed",
+            ArchDbType::ScalarDouble,
+            &SampleMode::Scan { period_secs: 2.0 },
+            4,
+        )
+        .unwrap();
+        let rec = reg.get_pv("PV:Typed").unwrap().unwrap();
+        assert_eq!(rec.element_count, 4);
     }
 
     #[test]
