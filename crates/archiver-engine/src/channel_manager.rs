@@ -1174,7 +1174,10 @@ impl ChannelManager {
         pv_name: &str,
         timeout: Duration,
     ) -> Option<anyhow::Result<ArchiverValue>> {
-        let channel_opt = self.channels.get(pv_name)?.channel.clone();
+        let (channel_opt, dbr_type) = {
+            let handle = self.channels.get(pv_name)?;
+            (handle.channel.clone(), handle.dbr_type)
+        };
         let Some(channel) = channel_opt else {
             // PVA-acquired PV — live_value via pvget_full so we get
             // the canonical channel descriptor alongside the value;
@@ -1199,7 +1202,7 @@ impl ChannelManager {
             )));
         }
         match tokio::time::timeout(timeout, channel.get()).await {
-            Ok(Ok((_dbr_type, val))) => Some(Ok(epics_value_to_archiver(&val))),
+            Ok(Ok((_dbr_type, val))) => Some(Ok(epics_value_to_archiver(dbr_type, &val))),
             Ok(Err(e)) => Some(Err(anyhow::anyhow!("CA get failed: {e}"))),
             Err(_) => Some(Err(anyhow::anyhow!("CA get timed out after {timeout:?}"))),
         }
@@ -2159,7 +2162,8 @@ async fn monitor_loop(
                                 Ordering::Relaxed,
                                 Ordering::Relaxed,
                             );
-                            let archiver_val = epics_value_to_archiver(&snapshot.value);
+                            let archiver_val =
+                                epics_value_to_archiver(dbr_type, &snapshot.value);
                             let mut sample =
                                 ArchiverSample::new(snapshot.timestamp.into(), archiver_val);
                             attach_extras(&extras, &mut sample);
@@ -2347,7 +2351,7 @@ async fn scan_loop(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 );
-                let archiver_val = epics_value_to_archiver(&epics_val);
+                let archiver_val = epics_value_to_archiver(dbr_type, &epics_val);
                 let mut sample = ArchiverSample::new(now, archiver_val);
                 attach_extras(&extras, &mut sample);
                 if first_after_connect {
@@ -3059,9 +3063,17 @@ fn dbr_field_to_arch_type(field_type: DbFieldType) -> ArchDbType {
     }
 }
 
-/// Convert epics-base-rs EpicsValue to archiver ArchiverValue.
-fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
-    match val {
+/// Convert an epics-base-rs `EpicsValue` into the `ArchiverValue` of a
+/// PV registered as `dbr_type`.
+///
+/// CA delivers a waveform whose current element count (NORD) is 1 as
+/// the scalar variant — autosize subscriptions and gets carry count 1,
+/// which decodes as a scalar — so a scalar arriving for a waveform PV
+/// is promoted to its one-element vector here. The shard type gate
+/// then compares the registered type against itself. An array arriving
+/// for a scalar PV is left alone: that is a real type change.
+fn epics_value_to_archiver(dbr_type: ArchDbType, val: &EpicsValue) -> ArchiverValue {
+    let value = match val {
         EpicsValue::String(s) => ArchiverValue::ScalarString(s.to_string()),
         EpicsValue::Short(v) => ArchiverValue::ScalarShort(*v as i32),
         EpicsValue::Float(v) => ArchiverValue::ScalarFloat(*v),
@@ -3104,6 +3116,54 @@ fn epics_value_to_archiver(val: &EpicsValue) -> ArchiverValue {
         EpicsValue::StringArray(v) => {
             ArchiverValue::VectorString(v.iter().map(|s| s.to_string()).collect())
         }
+    };
+    if dbr_type.is_waveform() {
+        value.into_vector()
+    } else {
+        value
+    }
+}
+
+#[cfg(test)]
+mod ca_value_tests {
+    use super::*;
+
+    /// A count-1 CA event on a waveform PV decodes as a scalar; the
+    /// converter stores it as the PV's one-element waveform.
+    #[test]
+    fn scalar_event_on_a_waveform_pv_is_a_one_element_vector() {
+        assert_eq!(
+            epics_value_to_archiver(ArchDbType::WaveformDouble, &EpicsValue::Double(5.0)),
+            ArchiverValue::VectorDouble(vec![5.0])
+        );
+        assert_eq!(
+            epics_value_to_archiver(ArchDbType::WaveformInt, &EpicsValue::Long(7)),
+            ArchiverValue::VectorInt(vec![7])
+        );
+    }
+
+    #[test]
+    fn scalar_pvs_and_array_events_are_unchanged() {
+        assert_eq!(
+            epics_value_to_archiver(ArchDbType::ScalarDouble, &EpicsValue::Double(5.0)),
+            ArchiverValue::ScalarDouble(5.0)
+        );
+        assert_eq!(
+            epics_value_to_archiver(
+                ArchDbType::WaveformDouble,
+                &EpicsValue::DoubleArray(vec![1.0, 2.0])
+            ),
+            ArchiverValue::VectorDouble(vec![1.0, 2.0])
+        );
+        // An array on a scalar PV stays a type change for the gate.
+        assert_eq!(
+            epics_value_to_archiver(
+                ArchDbType::ScalarDouble,
+                &EpicsValue::DoubleArray(vec![1.0])
+            )
+            .db_type(),
+            ArchDbType::WaveformDouble
+        );
     }
 }
 

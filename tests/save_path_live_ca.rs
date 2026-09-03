@@ -38,6 +38,8 @@ fn counters(mgr: &ChannelManager) -> PvCountersSnapshot {
 
 /// A CA array channel registers as the waveform type and its array
 /// samples reach the disk as `VectorDouble`, with no type-change drops.
+/// The one-element put sets NORD to 1, which CA delivers as a scalar
+/// event; it must still be stored as a one-element waveform.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ca_waveform_samples_land_as_waveform_double() {
     // Quiet unless RUST_LOG is set (e.g. archiver_engine=debug).
@@ -115,9 +117,9 @@ async fn ca_waveform_samples_land_as_waveform_double() {
 
     // Each put processes the record and stamps the value; the
     // archiver's monitor sees it as a DoubleArray event.
-    let arrays: [[f64; 3]; 3] = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]];
+    let arrays: Vec<Vec<f64>> = vec![vec![1.0, 2.0, 3.0], vec![5.0], vec![7.0, 8.0, 9.0]];
     for a in &arrays {
-        ch.put(&EpicsValue::DoubleArray(a.to_vec()))
+        ch.put(&EpicsValue::DoubleArray(a.clone()))
             .await
             .expect("caput");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -149,12 +151,8 @@ async fn ca_waveform_samples_land_as_waveform_double() {
     };
     // Stream order is timestamp order; the connect-time value may
     // precede the posted arrays.
-    let posted: Vec<Vec<f64>> = stored
-        .into_iter()
-        .filter(|g| arrays.iter().any(|a| a == g.as_slice()))
-        .collect();
-    let want: Vec<Vec<f64>> = arrays.iter().map(|a| a.to_vec()).collect();
-    assert_eq!(posted, want, "on-disk sample order/content");
+    let posted: Vec<Vec<f64>> = stored.into_iter().filter(|g| arrays.contains(g)).collect();
+    assert_eq!(posted, arrays, "on-disk sample order/content");
 
     let c = counters(&mgr);
     assert_eq!(c.type_change_drops, 0, "{c:?}");

@@ -127,6 +127,23 @@ impl ArchiverValue {
         }
     }
 
+    /// The one-element waveform form of a scalar; waveforms and
+    /// `V4GenericBytes` are returned unchanged. The scalar → vector
+    /// pairing is the one [`ArchDbType::with_element_count`] uses, so a
+    /// promoted value always matches the registered waveform type.
+    pub fn into_vector(self) -> Self {
+        match self {
+            Self::ScalarString(s) => Self::VectorString(vec![s]),
+            Self::ScalarByte(b) => Self::VectorChar(b),
+            Self::ScalarShort(v) => Self::VectorShort(vec![v]),
+            Self::ScalarInt(v) => Self::VectorInt(vec![v]),
+            Self::ScalarEnum(v) => Self::VectorEnum(vec![v]),
+            Self::ScalarFloat(v) => Self::VectorFloat(vec![v]),
+            Self::ScalarDouble(v) => Self::VectorDouble(vec![v]),
+            other => other,
+        }
+    }
+
     /// Convert to another archived type "through a number" — the rule
     /// `changeTypeForPV` applies to a PV's existing partitions (Java
     /// parity: `ThruNumberConversion`). Numeric families convert via
@@ -579,5 +596,61 @@ mod element_count_tests {
             ArchDbType::V4GenericBytes.with_element_count(8),
             ArchDbType::V4GenericBytes
         );
+    }
+}
+
+#[cfg(test)]
+mod into_vector_tests {
+    use super::*;
+
+    /// Every scalar promotes to the vector variant whose `db_type` is
+    /// the registry's waveform promotion of the scalar's type.
+    #[test]
+    fn scalars_become_one_element_waveforms_of_the_matching_type() {
+        let cases = [
+            (
+                ArchiverValue::ScalarString("a".into()),
+                ArchiverValue::VectorString(vec!["a".into()]),
+            ),
+            (
+                ArchiverValue::ScalarByte(vec![7]),
+                ArchiverValue::VectorChar(vec![7]),
+            ),
+            (
+                ArchiverValue::ScalarShort(1),
+                ArchiverValue::VectorShort(vec![1]),
+            ),
+            (
+                ArchiverValue::ScalarInt(2),
+                ArchiverValue::VectorInt(vec![2]),
+            ),
+            (
+                ArchiverValue::ScalarEnum(3),
+                ArchiverValue::VectorEnum(vec![3]),
+            ),
+            (
+                ArchiverValue::ScalarFloat(1.5),
+                ArchiverValue::VectorFloat(vec![1.5]),
+            ),
+            (
+                ArchiverValue::ScalarDouble(2.5),
+                ArchiverValue::VectorDouble(vec![2.5]),
+            ),
+        ];
+        for (scalar, vector) in cases {
+            assert_eq!(scalar.db_type().with_element_count(2), vector.db_type());
+            assert_eq!(scalar.into_vector(), vector);
+        }
+    }
+
+    #[test]
+    fn waveforms_and_v4_are_unchanged() {
+        for v in [
+            ArchiverValue::VectorDouble(vec![]),
+            ArchiverValue::VectorString(vec!["x".into()]),
+            ArchiverValue::V4GenericBytes(vec![1, 2]),
+        ] {
+            assert_eq!(v.clone().into_vector(), v);
+        }
     }
 }
