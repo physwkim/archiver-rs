@@ -569,9 +569,9 @@ impl ChannelManager {
         Ok((mgr, rx))
     }
 
-    /// Get-or-insert the per-PV operation mutex. The returned `Arc<Mutex>`
-    /// is what callers should `.lock().await` on; holding the entry guard
-    /// (via `entry().or_insert_with`) across the await would deadlock the
+    /// Get-or-insert the per-PV operation mutex, taken through
+    /// [`Self::lock_op`]; holding the entry guard (via
+    /// `entry().or_insert_with`) across the await would deadlock the
     /// DashMap shard.
     fn op_lock(&self, pv_name: &str) -> Arc<tokio::sync::Mutex<()>> {
         if let Some(existing) = self.op_locks.get(pv_name) {
@@ -581,6 +581,21 @@ impl ChannelManager {
             .entry(pv_name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Take the PV's op lock, waiting at most [`QUIESCE_TIMEOUT`]. A stop
+    /// transition draining a stalled store holds the lock for the whole
+    /// stall (see [`Self::stop_and_finalize`]); a start, resume or
+    /// further transition queued behind it gets an error after the
+    /// bound instead of waiting the stall out.
+    async fn lock_op(&self, pv_name: &str) -> anyhow::Result<tokio::sync::OwnedMutexGuard<()>> {
+        match tokio::time::timeout(QUIESCE_TIMEOUT, self.op_lock(pv_name).lock_owned()).await {
+            Ok(guard) => Ok(guard),
+            Err(_) => anyhow::bail!(
+                "{pv_name}: another operation on this PV is still in progress \
+                 after {QUIESCE_TIMEOUT:?}"
+            ),
+        }
     }
 
     /// Stop every sample producer and wait for them to exit. The binary
@@ -684,8 +699,7 @@ impl ChannelManager {
         protocol: Protocol,
     ) -> anyhow::Result<()> {
         // Serialise with pause/resume/stop/destroy on the same PV.
-        let lock = self.op_lock(pv_name);
-        let _g = lock.lock().await;
+        let _g = self.lock_op(pv_name).await?;
 
         if self.channels.contains_key(pv_name) {
             anyhow::bail!("PV {pv_name} is already being archived");
@@ -1206,7 +1220,7 @@ impl ChannelManager {
         pv_name: &str,
         finalize: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
     ) -> anyhow::Result<()> {
-        let guard = self.op_lock(pv_name).lock_owned().await;
+        let guard = self.lock_op(pv_name).await?;
         // Nothing below awaits before the task owns the transition.
         let handle = self.channels.remove(pv_name).map(|(_key, handle)| handle);
         if let Some(handle) = &handle {
@@ -1258,8 +1272,7 @@ impl ChannelManager {
     /// Resume a paused PV. Only paused or error PVs can be resumed;
     /// calling resume on an already-active PV is a no-op (returns Ok).
     pub async fn resume_pv(&self, pv_name: &str) -> anyhow::Result<()> {
-        let lock = self.op_lock(pv_name);
-        let _g = lock.lock().await;
+        let _g = self.lock_op(pv_name).await?;
 
         let record = self
             .registry
