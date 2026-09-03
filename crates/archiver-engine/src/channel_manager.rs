@@ -29,6 +29,12 @@ const CA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CA_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay before retrying a failed CA subscription.
 const CA_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Longest `ChannelManager::stop_tasks` waits for a PV's tasks to exit
+/// and its queued samples to reach the store. Every producer wait is
+/// shorter (a CA `get` is bounded at 30 s, the PVA client at 5 s) and
+/// so is `WriteLoopConfig::append_timeout`, so only a storage append
+/// that hangs past that can exhaust it.
+const QUIESCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Hard floor on accepted timestamps. Mirrors Java's `PAST_CUTOFF_TIMESTAMP`
 /// of 1991-01-01 — earlier than that, the timestamp is almost certainly a
@@ -247,6 +253,15 @@ pub struct PvCounters {
     /// dispatcher's consistent hash pins each PV to one shard); not
     /// part of the reported snapshot.
     pub ordering_last_ts_nanos: AtomicU64,
+    /// Samples of this PV that exist anywhere between the producer and
+    /// the end of their storage append: queued, parked, or being
+    /// written. Maintained only by [`InFlight`], which every
+    /// [`PvSample`] carries, so the count is exact on every exit path.
+    /// Zero after the PV's tasks have exited means nothing of the PV
+    /// can still land in the store.
+    in_flight: AtomicU64,
+    /// Woken when `in_flight` reaches zero; see [`Self::wait_in_flight`].
+    settled: tokio::sync::Notify,
 }
 
 impl Default for PvCounters {
@@ -270,6 +285,24 @@ impl Default for PvCounters {
             shutdown_abandoned_drops: AtomicU64::new(0),
             flush_losses: AtomicU64::new(0),
             ordering_last_ts_nanos: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
+            settled: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl PvCounters {
+    /// Resolves once no sample of this PV is in flight. The `Notified`
+    /// is registered before the count is read, and the count is
+    /// `SeqCst` on both sides, so a release between the read and the
+    /// await still wakes this future.
+    async fn wait_in_flight(&self) {
+        loop {
+            let settled = self.settled.notified();
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            settled.await;
         }
     }
 }
@@ -357,6 +390,11 @@ struct PvHandle {
     /// connection reports. Lock-free reads; updates from the producer
     /// (monitor/scan) and the writer happen on different threads.
     counters: Arc<PvCounters>,
+    /// Every task of this PV generation: the producer loop, the PVA
+    /// overflow drainer and refreshers, and the extra-field monitors.
+    /// `stop_tasks` waits on it so a stopped PV has no task left that
+    /// could still queue a sample.
+    tasks: TaskTracker,
 }
 
 /// Thread-safe cache of latest extra-field values for one PV.
@@ -423,7 +461,8 @@ pub struct ChannelManager {
     counters: DashMap<String, Arc<PvCounters>>,
 }
 
-/// A sample ready to be written to storage.
+/// A sample ready to be written to storage. Built only through
+/// [`PvSample::new`], which registers it in its PV's in-flight count.
 pub struct PvSample {
     pub pv_name: String,
     pub dbr_type: ArchDbType,
@@ -433,6 +472,56 @@ pub struct PvSample {
     /// type-change drops. None on samples produced before counter
     /// support was wired up — write_loop tolerates the absence.
     pub counters: Option<Arc<PvCounters>>,
+    /// Released when the sample is dropped, on whichever path.
+    _in_flight: InFlight,
+}
+
+impl PvSample {
+    pub fn new(
+        pv_name: String,
+        dbr_type: ArchDbType,
+        sample: ArchiverSample,
+        element_count: Option<i32>,
+        counters: Option<Arc<PvCounters>>,
+    ) -> Self {
+        let _in_flight = InFlight::new(counters.clone());
+        Self {
+            pv_name,
+            dbr_type,
+            sample,
+            element_count,
+            counters,
+            _in_flight,
+        }
+    }
+}
+
+/// One unit of `PvCounters::in_flight`, held by a [`PvSample`] from
+/// construction until the sample is dropped: after its append
+/// returned, when a shard gate refuses it, when the dispatcher or a
+/// dead shard drops it, when a newer sample replaces it in an
+/// [`OverflowSlot`], or when the queue is abandoned at shutdown.
+/// Accounting by ownership instead of at each of those sites is what
+/// keeps the count exact.
+struct InFlight(Option<Arc<PvCounters>>);
+
+impl InFlight {
+    fn new(counters: Option<Arc<PvCounters>>) -> Self {
+        if let Some(c) = &counters {
+            c.in_flight.fetch_add(1, Ordering::SeqCst);
+        }
+        Self(counters)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(c) = &self.0
+            && c.in_flight.fetch_sub(1, Ordering::SeqCst) == 1
+        {
+            c.settled.notify_waiters();
+        }
+    }
 }
 
 impl ChannelManager {
@@ -530,6 +619,17 @@ impl ChannelManager {
                 Arc::new(counters)
             })
             .clone()
+    }
+
+    /// Spawn a task of one PV generation: tracked by `pv_tasks` so
+    /// [`Self::stop_tasks`] can wait for it, and by `self.tasks` for
+    /// [`Self::shutdown`].
+    fn spawn_pv_task(
+        &self,
+        pv_tasks: &TaskTracker,
+        fut: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        self.tasks.spawn(pv_tasks.track_future(fut));
     }
 
     /// Restore all active PVs from the registry (called on startup).
@@ -783,6 +883,7 @@ impl ChannelManager {
         let field_tokens: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
         let update_lock = Arc::new(tokio::sync::Mutex::new(()));
         let counters = self.task_counters(record);
+        let pv_tasks = TaskTracker::new();
 
         // Hold update_lock around the whole insert+spawn block so a
         // concurrent update_archive_fields can't observe the empty
@@ -802,6 +903,7 @@ impl ChannelManager {
                 field_tokens: field_tokens.clone(),
                 update_lock: update_lock.clone(),
                 counters: counters.clone(),
+                tasks: pv_tasks.clone(),
             },
         );
 
@@ -810,8 +912,8 @@ impl ChannelManager {
         for field in &record.archive_fields {
             let child = cancel_token.child_token();
             field_tokens.insert(field.clone(), child.clone());
-            spawn_extra_field_monitor(
-                &self.ca_client,
+            self.spawn_extra_field_monitor(
+                &pv_tasks,
                 &pv_name,
                 field,
                 extras.clone(),
@@ -832,7 +934,7 @@ impl ChannelManager {
         let drift = self.server_ioc_drift_secs;
         match &record.sample_mode {
             SampleMode::Monitor => {
-                self.tasks.spawn(async move {
+                self.spawn_pv_task(&pv_tasks, async move {
                     monitor_loop(
                         pv_name,
                         dbr_type,
@@ -851,7 +953,7 @@ impl ChannelManager {
             }
             SampleMode::Scan { period_secs } => {
                 let period = *period_secs;
-                self.tasks.spawn(async move {
+                self.spawn_pv_task(&pv_tasks, async move {
                     scan_loop(
                         pv_name,
                         dbr_type,
@@ -892,6 +994,7 @@ impl ChannelManager {
         let field_tokens: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
         let update_lock = Arc::new(tokio::sync::Mutex::new(()));
         let counters = self.task_counters(record);
+        let pv_tasks = TaskTracker::new();
 
         self.channels.insert(
             pv_name.clone(),
@@ -904,6 +1007,7 @@ impl ChannelManager {
                 field_tokens: field_tokens.clone(),
                 update_lock,
                 counters: counters.clone(),
+                tasks: pv_tasks.clone(),
             },
         );
 
@@ -920,9 +1024,11 @@ impl ChannelManager {
                 let archive_fields_loop = record.archive_fields.clone();
                 let extras_for_loop = extras.clone();
                 let slot = OverflowSlot::new();
-                self.tasks
-                    .spawn(drain_overflow_slot(slot.clone(), tx.clone(), token.clone()));
-                self.tasks.spawn(async move {
+                self.spawn_pv_task(
+                    &pv_tasks,
+                    drain_overflow_slot(slot.clone(), tx.clone(), token.clone()),
+                );
+                self.spawn_pv_task(&pv_tasks, async move {
                     monitor_loop_pva(
                         pv_name_loop,
                         dbr_type,
@@ -945,7 +1051,7 @@ impl ChannelManager {
                 let pv_name_loop = pv_name.clone();
                 let archive_fields_loop = record.archive_fields.clone();
                 let extras_for_loop = extras.clone();
-                self.tasks.spawn(async move {
+                self.spawn_pv_task(&pv_tasks, async move {
                     scan_loop_pva(
                         pv_name_loop,
                         dbr_type,
@@ -974,7 +1080,7 @@ impl ChannelManager {
             let registry = self.registry.clone();
             let cancel = cancel_token.clone();
             let counters_for_refresh = counters.clone();
-            self.tasks.spawn(async move {
+            self.spawn_pv_task(&pv_tasks, async move {
                 pva_metadata_refresh_loop(
                     pv_name,
                     pva_client,
@@ -991,7 +1097,7 @@ impl ChannelManager {
             let counters_for_watch = counters.clone();
             let cancel = cancel_token.clone();
             let sample_mode = record.sample_mode.clone();
-            self.tasks.spawn(async move {
+            self.spawn_pv_task(&pv_tasks, async move {
                 pva_state_watchdog(pv_name, conn_info, counters_for_watch, cancel, sample_mode)
                     .await;
             });
@@ -1016,7 +1122,7 @@ impl ChannelManager {
 
         // If the PV isn't currently active there's nothing more to do —
         // start_archiving_internal will pick up the new fields on resume.
-        let (parent_token, extras, field_tokens, update_lock, counters) = {
+        let (parent_token, extras, field_tokens, update_lock, counters, pv_tasks) = {
             let Some(handle) = self.channels.get(pv_name) else {
                 return Ok(());
             };
@@ -1026,6 +1132,7 @@ impl ChannelManager {
                 handle.field_tokens.clone(),
                 handle.update_lock.clone(),
                 handle.counters.clone(),
+                handle.tasks.clone(),
             )
         };
 
@@ -1058,8 +1165,8 @@ impl ChannelManager {
             if !field_tokens.contains_key(f) {
                 let child = parent_token.child_token();
                 field_tokens.insert(f.clone(), child.clone());
-                spawn_extra_field_monitor(
-                    &self.ca_client,
+                self.spawn_extra_field_monitor(
+                    &pv_tasks,
                     pv_name,
                     f,
                     extras.clone(),
@@ -1076,10 +1183,16 @@ impl ChannelManager {
         Ok(())
     }
 
-    /// Pause archiving for a PV.
-    pub async fn pause_pv(&self, pv_name: &str) -> anyhow::Result<()> {
-        let lock = self.op_lock(pv_name);
-        let _g = lock.lock().await;
+    /// Stop the PV's tasks and wait until nothing of it is in flight:
+    /// the tasks have exited and every sample they queued has been
+    /// appended or dropped. On return the store holds all the samples
+    /// this task generation will ever produce, so the caller may set
+    /// the registry status and a later rename, type change, reassign
+    /// or delete acts on the whole data set. Fails, with the status
+    /// untouched, if the wait exceeds [`QUIESCE_TIMEOUT`]; the tasks
+    /// stay cancelled and a retry waits again.
+    async fn stop_tasks(&self, pv_name: &str) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + QUIESCE_TIMEOUT;
         if let Some((_key, handle)) = self.channels.remove(pv_name) {
             let extra_count = handle.field_tokens.len() as f64;
             handle.cancel_token.cancel();
@@ -1087,7 +1200,36 @@ impl ChannelManager {
             if extra_count > 0.0 {
                 metrics::gauge!("archiver_extra_field_tasks").decrement(extra_count);
             }
+            handle.tasks.close();
+            if tokio::time::timeout_at(deadline, handle.tasks.wait())
+                .await
+                .is_err()
+            {
+                anyhow::bail!("{pv_name}: archiving tasks did not stop within {QUIESCE_TIMEOUT:?}");
+            }
         }
+        let Some(counters) = self.counters.get(pv_name).map(|c| c.value().clone()) else {
+            return Ok(());
+        };
+        if tokio::time::timeout_at(deadline, counters.wait_in_flight())
+            .await
+            .is_err()
+        {
+            anyhow::bail!(
+                "{pv_name}: {} samples still in flight after {QUIESCE_TIMEOUT:?}",
+                counters.in_flight.load(Ordering::SeqCst)
+            );
+        }
+        Ok(())
+    }
+
+    /// Pause archiving for a PV. Returns once the PV has nothing in
+    /// flight (see [`Self::stop_tasks`]), so a `Paused` registry status
+    /// means the store holds every sample the PV produced.
+    pub async fn pause_pv(&self, pv_name: &str) -> anyhow::Result<()> {
+        let lock = self.op_lock(pv_name);
+        let _g = lock.lock().await;
+        self.stop_tasks(pv_name).await?;
         self.registry.set_status(pv_name, PvStatus::Paused)?;
         info!(pv = pv_name, "Paused archiving");
         Ok(())
@@ -1135,14 +1277,7 @@ impl ChannelManager {
     pub async fn stop_pv(&self, pv_name: &str) -> anyhow::Result<()> {
         let lock = self.op_lock(pv_name);
         let _g = lock.lock().await;
-        if let Some((_key, handle)) = self.channels.remove(pv_name) {
-            let extra_count = handle.field_tokens.len() as f64;
-            handle.cancel_token.cancel();
-            metrics::gauge!("archiver_pvs_active").decrement(1.0);
-            if extra_count > 0.0 {
-                metrics::gauge!("archiver_extra_field_tasks").decrement(extra_count);
-            }
-        }
+        self.stop_tasks(pv_name).await?;
         self.registry.set_status(pv_name, PvStatus::Inactive)?;
         info!(pv = pv_name, "Stopped archiving (inactive)");
         Ok(())
@@ -1152,14 +1287,7 @@ impl ChannelManager {
     pub async fn destroy_pv(&self, pv_name: &str) -> anyhow::Result<()> {
         let lock = self.op_lock(pv_name);
         let _g = lock.lock().await;
-        if let Some((_key, handle)) = self.channels.remove(pv_name) {
-            let extra_count = handle.field_tokens.len() as f64;
-            handle.cancel_token.cancel();
-            metrics::gauge!("archiver_pvs_active").decrement(1.0);
-            if extra_count > 0.0 {
-                metrics::gauge!("archiver_extra_field_tasks").decrement(extra_count);
-            }
-        }
+        self.stop_tasks(pv_name).await?;
         // The next task under this name is a new PV: its high-water
         // and statistics must not carry over.
         self.counters.remove(pv_name);
@@ -1499,13 +1627,13 @@ fn pva_handle_event(
     }
     let mut sample = ArchiverSample::new(ts, value);
     attach_extras(extras, &mut sample);
-    let pv_sample = PvSample {
-        pv_name: pv_name.to_string(),
+    let pv_sample = PvSample::new(
+        pv_name.to_string(),
         dbr_type,
         sample,
-        element_count: Some(elem_count),
-        counters: Some(counters.clone()),
-    };
+        Some(elem_count),
+        Some(counters.clone()),
+    );
     // This runs on the epics-rs reactor task and cannot wait for
     // queue space. A sample the queue will not take is parked for
     // `drain_overflow_slot`; only the parked sample it replaces is
@@ -1910,13 +2038,13 @@ async fn scan_loop_pva(
         }
         let mut sample = ArchiverSample::new(now, value);
         attach_extras(&extras, &mut sample);
-        let pv_sample = PvSample {
-            pv_name: pv_name.clone(),
+        let pv_sample = PvSample::new(
+            pv_name.clone(),
             dbr_type,
             sample,
-            element_count: Some(elem_count),
-            counters: Some(counters.clone()),
-        };
+            Some(elem_count),
+            Some(counters.clone()),
+        );
         if let Err(rejected) = send_with_backpressure(&tx, pv_sample).await {
             // Channel closed (write_loop down). Cooperative shutdown.
             let _ = rejected;
@@ -2258,13 +2386,13 @@ async fn monitor_loop(
                                     .load(Ordering::Relaxed);
                                 attach_cnx_lost_headers(&mut sample, lost_secs, now_secs);
                             }
-                            let pv_sample = PvSample {
-                                pv_name: pv_name.clone(),
+                            let pv_sample = PvSample::new(
+                                pv_name.clone(),
                                 dbr_type,
                                 sample,
-                                element_count: Some(element_count),
-                                counters: Some(counters.clone()),
-                            };
+                                Some(element_count),
+                                Some(counters.clone()),
+                            );
                             if let Err(pv_sample) = send_with_backpressure(&tx, pv_sample).await {
                                 let _ = pv_sample;
                                 return; // Write loop shut down
@@ -2680,13 +2808,13 @@ async fn scan_loop(
                     let lost_secs = counters.last_disconnect_unix_secs.load(Ordering::Relaxed);
                     attach_cnx_lost_headers(&mut sample, lost_secs, now_secs);
                 }
-                let pv_sample = PvSample {
-                    pv_name: pv_name.clone(),
+                let pv_sample = PvSample::new(
+                    pv_name.clone(),
                     dbr_type,
                     sample,
-                    element_count: Some(element_count),
-                    counters: Some(counters.clone()),
-                };
+                    Some(element_count),
+                    Some(counters.clone()),
+                );
                 if send_with_backpressure(&tx, pv_sample).await.is_err() {
                     return;
                 }
@@ -2768,47 +2896,51 @@ fn epics_value_to_field_string(val: &EpicsValue) -> String {
     }
 }
 
-/// Spawn a long-running task that subscribes to `<pv>.<field>` and updates
-/// `extras` with each event. Owned by `parent_token` so pause/destroy cleans
-/// it up alongside the main PV.
-fn spawn_extra_field_monitor(
-    ca_client: &CaClient,
-    pv_name: &str,
-    field: &str,
-    extras: Arc<ExtraFieldsCache>,
-    parent_token: CancellationToken,
-    counters: Arc<PvCounters>,
-) {
-    let full_name = format!("{pv_name}.{field}");
-    let channel = ca_client.create_channel(&full_name);
-    let field_owned = field.to_string();
-    let pv_owned = pv_name.to_string();
+impl ChannelManager {
+    /// Spawn a long-running task that subscribes to `<pv>.<field>` and updates
+    /// `extras` with each event. Owned by `parent_token` so pause/destroy cleans
+    /// it up alongside the main PV, and tracked by `pv_tasks` so `stop_tasks`
+    /// waits for it.
+    fn spawn_extra_field_monitor(
+        &self,
+        pv_tasks: &TaskTracker,
+        pv_name: &str,
+        field: &str,
+        extras: Arc<ExtraFieldsCache>,
+        parent_token: CancellationToken,
+        counters: Arc<PvCounters>,
+    ) {
+        let full_name = format!("{pv_name}.{field}");
+        let channel = self.ca_client.create_channel(&full_name);
+        let field_owned = field.to_string();
+        let pv_owned = pv_name.to_string();
 
-    // Catch-unwind boundary: a panic from the CA client (e.g. malformed
-    // wire frame, allocation failure inside epics_rs) would propagate to
-    // the runtime and abort sibling tasks of this worker thread. Trap it
-    // here, log with PV+field context, and return normally so the runtime
-    // remains healthy.
-    let panic_pv = pv_owned.clone();
-    let panic_field = field_owned.clone();
-    tokio::spawn(async move {
-        let body = std::panic::AssertUnwindSafe(extra_field_monitor_body(
-            channel,
-            pv_owned,
-            field_owned,
-            extras,
-            parent_token,
-            counters,
-        ));
-        if let Err(payload) = futures::FutureExt::catch_unwind(body).await {
-            let msg = panic_payload_msg(&payload);
-            error!(
-                pv = panic_pv,
-                field = panic_field,
-                "Extra-field monitor panicked: {msg}"
-            );
-        }
-    });
+        // Catch-unwind boundary: a panic from the CA client (e.g. malformed
+        // wire frame, allocation failure inside epics_rs) would propagate to
+        // the runtime and abort sibling tasks of this worker thread. Trap it
+        // here, log with PV+field context, and return normally so the runtime
+        // remains healthy.
+        let panic_pv = pv_owned.clone();
+        let panic_field = field_owned.clone();
+        self.tasks.spawn(pv_tasks.track_future(async move {
+            let body = std::panic::AssertUnwindSafe(extra_field_monitor_body(
+                channel,
+                pv_owned,
+                field_owned,
+                extras,
+                parent_token,
+                counters,
+            ));
+            if let Err(payload) = futures::FutureExt::catch_unwind(body).await {
+                let msg = panic_payload_msg(&payload);
+                error!(
+                    pv = panic_pv,
+                    field = panic_field,
+                    "Extra-field monitor panicked: {msg}"
+                );
+            }
+        }));
+    }
 }
 
 /// Body of the spawned extra-field monitor. Split out so the spawn site
@@ -5408,16 +5540,7 @@ mod shard_lifecycle_tests {
         );
 
         let counters = Arc::new(PvCounters::default());
-        let sample = PvSample {
-            pv_name: "pv:respawn".to_string(),
-            dbr_type: ArchDbType::ScalarDouble,
-            sample: ArchiverSample::new(
-                SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                ArchiverValue::ScalarDouble(1.0),
-            ),
-            element_count: Some(1),
-            counters: Some(counters.clone()),
-        };
+        let sample = sample_for("pv:respawn", &counters);
 
         let mut governor = RespawnGovernor::new(1);
         route_sample(sample, &mut shards, &mut governor, &ctx);
@@ -5480,16 +5603,7 @@ mod shard_lifecycle_tests {
     #[test]
     fn record_closed_drop_increments_per_pv_closed_counter_only() {
         let counters = Arc::new(PvCounters::default());
-        let sample = PvSample {
-            pv_name: "pv:closed".to_string(),
-            dbr_type: ArchDbType::ScalarDouble,
-            sample: ArchiverSample::new(
-                SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                ArchiverValue::ScalarDouble(1.0),
-            ),
-            element_count: Some(1),
-            counters: Some(counters.clone()),
-        };
+        let sample = sample_for("pv:closed", &counters);
 
         // Every closed-drop phase routes through record_closed_drop and
         // bumps the same per-PV counter.
@@ -5500,5 +5614,94 @@ mod shard_lifecycle_tests {
         // No dual meaning: distinct drop causes stay at zero.
         assert_eq!(counters.buffer_overflow_drops.load(Ordering::Relaxed), 0);
         assert_eq!(counters.shutdown_abandoned_drops.load(Ordering::Relaxed), 0);
+    }
+
+    fn sample_for(pv: &str, counters: &Arc<PvCounters>) -> PvSample {
+        PvSample::new(
+            pv.to_string(),
+            ArchDbType::ScalarDouble,
+            ArchiverSample::new(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                ArchiverValue::ScalarDouble(1.0),
+            ),
+            Some(1),
+            Some(counters.clone()),
+        )
+    }
+
+    /// Boundary: a sample the dispatcher drops on a full shard leaves
+    /// the in-flight count, and a sample sitting in the shard queue
+    /// leaves it only when the queue lets go of it.
+    #[tokio::test]
+    async fn in_flight_settles_when_the_dispatcher_drops_on_a_full_shard() {
+        let ctx = ShardSpawnCtx {
+            storage: Arc::new(OkStorage),
+            pending: Arc::new(PendingReports::new()),
+            per_shard_buffer: 1,
+            write_loop: WriteLoopConfig::default(),
+        };
+        // A live shard channel nobody reads: one queued sample fills it.
+        let (full_tx, full_rx) = mpsc::channel::<PvSample>(1);
+        let (drain_tx, _drain_rx) = tokio::sync::watch::channel(false);
+        let mut shards = vec![ShardSlot {
+            tx: full_tx,
+            handle: tokio::spawn(async {}),
+            drain_tx,
+        }];
+        let counters = Arc::new(PvCounters::default());
+        shards[0]
+            .tx
+            .try_send(sample_for("pv:full", &counters))
+            .expect("first sample fills the shard queue");
+        assert_eq!(counters.in_flight.load(Ordering::SeqCst), 1);
+
+        let mut governor = RespawnGovernor::new(1);
+        route_sample(
+            sample_for("pv:full", &counters),
+            &mut shards,
+            &mut governor,
+            &ctx,
+        );
+        assert_eq!(counters.buffer_overflow_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters.in_flight.load(Ordering::SeqCst),
+            1,
+            "the dropped sample settled; the queued one is still in flight"
+        );
+
+        drop(shards);
+        drop(full_rx);
+        assert_eq!(
+            counters.in_flight.load(Ordering::SeqCst),
+            0,
+            "a sample the queue lets go of settles"
+        );
+    }
+
+    /// Boundary: zero in flight resolves at once; one in flight holds
+    /// the waiter until that sample is dropped.
+    #[tokio::test]
+    async fn wait_in_flight_wakes_when_the_last_sample_is_dropped() {
+        let counters = Arc::new(PvCounters::default());
+        tokio::time::timeout(Duration::from_secs(1), counters.wait_in_flight())
+            .await
+            .expect("nothing in flight resolves immediately");
+
+        let sample = sample_for("pv:wait", &counters);
+        let waiter = {
+            let counters = counters.clone();
+            tokio::spawn(async move { counters.wait_in_flight().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "one sample in flight keeps the waiter pending"
+        );
+
+        drop(sample);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("dropping the last sample wakes the waiter")
+            .unwrap();
     }
 }

@@ -267,13 +267,13 @@ fn sample_at(ts: SystemTime, value: f64) -> ArchiverSample {
 }
 
 fn pv_sample(pv: &str, ts: SystemTime, value: f64, counters: &Arc<PvCounters>) -> PvSample {
-    PvSample {
-        pv_name: pv.to_string(),
-        dbr_type: ArchDbType::ScalarDouble,
-        sample: sample_at(ts, value),
-        element_count: Some(1),
-        counters: Some(counters.clone()),
-    }
+    PvSample::new(
+        pv.to_string(),
+        ArchDbType::ScalarDouble,
+        sample_at(ts, value),
+        Some(1),
+        Some(counters.clone()),
+    )
 }
 
 fn ts(secs_since_2020: u64) -> SystemTime {
@@ -1728,13 +1728,13 @@ async fn type_gate_accepts_new_registry_type_from_a_new_task() {
     // changeTypeForPV flipped the registry to Int; the resumed task
     // carries the new type and matching values.
     let gen2 = Arc::new(PvCounters::default());
-    tx.send(PvSample {
-        pv_name: "A".to_string(),
-        dbr_type: ArchDbType::ScalarInt,
-        sample: ArchiverSample::new(ts(200), ArchiverValue::ScalarInt(2)),
-        element_count: Some(1),
-        counters: Some(gen2.clone()),
-    })
+    tx.send(PvSample::new(
+        "A".to_string(),
+        ArchDbType::ScalarInt,
+        ArchiverSample::new(ts(200), ArchiverValue::ScalarInt(2)),
+        Some(1),
+        Some(gen2.clone()),
+    ))
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1770,13 +1770,13 @@ async fn type_gate_drops_value_that_disagrees_with_registry_type() {
     tx.send(pv_sample("A", ts(100), 1.0, &counters))
         .await
         .unwrap();
-    tx.send(PvSample {
-        pv_name: "A".to_string(),
-        dbr_type: ArchDbType::ScalarDouble,
-        sample: ArchiverSample::new(ts(200), ArchiverValue::ScalarInt(7)),
-        element_count: Some(1),
-        counters: Some(counters.clone()),
-    })
+    tx.send(PvSample::new(
+        "A".to_string(),
+        ArchDbType::ScalarDouble,
+        ArchiverSample::new(ts(200), ArchiverValue::ScalarInt(7)),
+        Some(1),
+        Some(counters.clone()),
+    ))
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;

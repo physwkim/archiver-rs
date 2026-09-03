@@ -10,14 +10,14 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use archiver_core::registry::{Protocol, PvRegistry, SampleMode};
+use archiver_core::registry::{Protocol, PvRegistry, PvStatus, SampleMode};
 use archiver_core::retrieval::query::query_data;
 use archiver_core::storage::partition::PartitionGranularity;
 use archiver_core::storage::plainpb::PlainPbStoragePlugin;
 use archiver_core::storage::traits::StoragePlugin;
 use archiver_core::types::{ArchDbType, ArchiverValue};
 use archiver_engine::channel_manager::{
-    ChannelManager, PvCountersSnapshot, ShardedWritePoolConfig, WriteLoopConfig,
+    ChannelManager, PvCountersSnapshot, PvSample, ShardedWritePoolConfig, WriteLoopConfig,
     run_sharded_write_pool,
 };
 use epics_rs::base::server::records::waveform::WaveformRecord;
@@ -46,7 +46,9 @@ struct Stack {
     storage: Arc<dyn StoragePlugin>,
     registry: Arc<PvRegistry>,
     mgr: Arc<ChannelManager>,
-    pool: tokio::task::JoinHandle<()>,
+    /// The write pool's input, until `start_pool` spawns the pool.
+    pool_input: Option<tokio::sync::mpsc::Receiver<PvSample>>,
+    pool: Option<tokio::task::JoinHandle<()>>,
     pool_shutdown: tokio::sync::watch::Sender<bool>,
     server_task: tokio::task::JoinHandle<()>,
     _writer: CaClient,
@@ -55,6 +57,14 @@ struct Stack {
 
 impl Stack {
     async fn start() -> Self {
+        let mut s = Self::start_without_pool().await;
+        s.start_pool();
+        s
+    }
+
+    /// Everything but the write pool: the samples the producers queue
+    /// stay in the channel until `start_pool`.
+    async fn start_without_pool() -> Self {
         // Quiet unless RUST_LOG is set (e.g. archiver_engine=debug).
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -93,21 +103,7 @@ impl Stack {
             .await
             .unwrap();
         let mgr = Arc::new(mgr);
-        let (pool_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
-        let pool = tokio::spawn(run_sharded_write_pool(
-            storage.clone(),
-            registry.clone(),
-            rx,
-            shutdown_rx,
-            ShardedWritePoolConfig {
-                shards: 1,
-                per_shard_buffer: 1024,
-                write_loop: WriteLoopConfig {
-                    flush_period: Duration::from_millis(300),
-                    ..Default::default()
-                },
-            },
-        ));
+        let (pool_shutdown, _) = tokio::sync::watch::channel(false);
 
         let writer = CaClient::new().await.expect("writer client");
         let ch = writer.create_channel(PV);
@@ -123,12 +119,31 @@ impl Stack {
             storage,
             registry,
             mgr,
-            pool,
+            pool_input: Some(rx),
+            pool: None,
             pool_shutdown,
             server_task,
             _writer: writer,
             ch,
         }
+    }
+
+    fn start_pool(&mut self) {
+        let rx = self.pool_input.take().expect("write pool already started");
+        self.pool = Some(tokio::spawn(run_sharded_write_pool(
+            self.storage.clone(),
+            self.registry.clone(),
+            rx,
+            self.pool_shutdown.subscribe(),
+            ShardedWritePoolConfig {
+                shards: 1,
+                per_shard_buffer: 1024,
+                write_loop: WriteLoopConfig {
+                    flush_period: Duration::from_millis(300),
+                    ..Default::default()
+                },
+            },
+        )));
     }
 
     /// Start archiving `PV` and wait for the connect-time event, which
@@ -152,11 +167,13 @@ impl Stack {
     }
 
     async fn finish(self) {
-        self.pool_shutdown.send(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), self.pool)
-            .await
-            .expect("write pool exits on shutdown")
-            .unwrap();
+        if let Some(pool) = self.pool {
+            self.pool_shutdown.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), pool)
+                .await
+                .expect("write pool exits on shutdown")
+                .unwrap();
+        }
         self.server_task.abort();
     }
 }
@@ -434,6 +451,54 @@ async fn shutdown_stops_producers_and_refuses_new_starts() {
         .await
         .expect_err("start after shutdown must be refused");
     assert!(err.to_string().contains("shut down"), "{err}");
+
+    s.finish().await;
+}
+
+/// `pause_pv` returns only once every sample the PV produced has
+/// reached the store: with no write pool running, the connect-time
+/// sample sits in the queue and the pause must wait for it. A
+/// `Paused` PV therefore has nothing in flight, and the mgmt
+/// operations that require `Paused` (rename, type change, reassign,
+/// delete) act on the whole data set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_waits_for_the_queued_sample_to_land() {
+    let mut s = Stack::start_without_pool().await;
+    let t0 = SystemTime::now();
+    s.archive().await;
+
+    let mgr = s.mgr.clone();
+    let pause = tokio::spawn(async move { mgr.pause_pv(PV).await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !pause.is_finished(),
+        "pause returned while the connect-time sample was still queued"
+    );
+    assert!(stored_arrays(&s, t0).await.is_empty());
+
+    s.start_pool();
+    tokio::time::timeout(Duration::from_secs(10), pause)
+        .await
+        .expect("pause completes once the queued sample lands")
+        .unwrap()
+        .expect("pause_pv");
+    let rec = s.registry.get_pv(PV).unwrap().expect("registry row");
+    assert_eq!(rec.status, PvStatus::Paused);
+
+    // The paused PV's counters are no longer reported, so the
+    // evidence is the disk: the ticker flush lands the seed value.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = stored_arrays(&s, t0).await;
+        if got == vec![vec![0.0; NELM as usize]] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the seed value on disk; have {got:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     s.finish().await;
 }
