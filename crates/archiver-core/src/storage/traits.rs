@@ -57,9 +57,10 @@ pub struct AppendMeta {
 ///   loss queue and are drained by the owner via
 ///   [`StoragePlugin::take_loss_markers`].
 ///
-/// * **deferred** — the writer's per-PV slot was already locked by
-///   an in-flight append. The bytes are still buffered and will be
-///   flushed on the next cycle. The caller MUST skip these from
+/// * **deferred** — the bytes are still buffered: the writer's
+///   per-PV slot was locked by an in-flight append, or the `write`
+///   behind the flush errored and the BufWriter kept what it did not
+///   take. They will be flushed on the next cycle. The caller MUST skip these from
 ///   THIS cycle's commit but MUST keep them in `ts_updates` so the
 ///   timestamp commits on a later cycle. Treating deferred as a
 ///   permanent failure permanently loses the registry timestamp

@@ -190,19 +190,27 @@ impl<'a> Drop for TombstoneCleanupGuard<'a> {
 /// give the read-side and the write-side flush surfaces different
 /// semantics over the same underlying iteration.
 struct FlushOutcome {
-    /// PVs whose `flush()` syscall errored. Their cached writers
-    /// have been evicted (buffered bytes discarded via `into_parts`)
-    /// and their entries removed from the map. Surfaced to the
-    /// write_loop so it drops their `last_event` from the registry
-    /// commit batch.
+    /// PVs whose buffered bytes were discarded: fsync errored, or
+    /// the flush landed in a file that is gone. Their cached writers
+    /// have been evicted (`into_parts`) and their entries removed
+    /// from the map. Surfaced to the write_loop so it drops their
+    /// `last_event` from the registry commit batch.
     failed: Vec<String>,
-    /// PVs whose slot was already locked (an `append` or another
-    /// flush is in flight). Their dirty bytes remain buffered and
-    /// will be picked up on the next flush cycle. Surfaced to the
+    /// PVs whose dirty bytes are still buffered: the slot was locked
+    /// (an `append` or another flush is in flight), or the `write`
+    /// behind the flush errored and the BufWriter kept what it did
+    /// not take. Picked up on the next flush cycle. Surfaced to the
     /// write_loop alongside `failed` so the registry doesn't claim
     /// `last_event` for samples whose bytes are still in BufWriter
     /// memory — under-commit, never over-commit.
     deferred: Vec<String>,
+}
+
+/// Which step of [`PlainPbStoragePlugin::flush_and_maybe_sync`]
+/// failed; see there for why the two are not the same loss.
+enum FlushFailure {
+    Write(std::io::Error),
+    Sync(std::io::Error),
 }
 
 /// Wraps a `PbFileReader` and clamps emitted samples to `[start, end]`.
@@ -352,14 +360,21 @@ impl PlainPbStoragePlugin {
     }
 
     /// Flush a dirty cached writer, then `sync_all` it to disk when
-    /// `fsync_on_flush` is set. A single fallible step so callers get
-    /// one `io::Result` to classify: a flush OR fsync failure is
-    /// treated identically (the bytes may not be durable). No-op fsync
+    /// `fsync_on_flush` is set. The two steps fail differently, which
+    /// is why the error says which one did: after a failed `write`
+    /// the `BufWriter` still holds every byte the kernel did not
+    /// take, so the writer can retry; after a failed `sync_all` the
+    /// bytes sit in the page cache with their error already reported,
+    /// which the kernel then drops, so they are lost. No-op fsync
     /// (and zero syscall) when the flag is off.
-    fn flush_and_maybe_sync(&self, cached: &mut CachedWriter) -> std::io::Result<()> {
-        cached.writer.flush()?;
+    fn flush_and_maybe_sync(&self, cached: &mut CachedWriter) -> Result<(), FlushFailure> {
+        cached.writer.flush().map_err(FlushFailure::Write)?;
         if self.fsync_on_flush {
-            cached.writer.get_ref().sync_all()?;
+            cached
+                .writer
+                .get_ref()
+                .sync_all()
+                .map_err(FlushFailure::Sync)?;
         }
         Ok(())
     }
@@ -406,8 +421,11 @@ impl PlainPbStoragePlugin {
     /// stuck PV from blocking the flush of every other PV — those
     /// are reported in `deferred` and retried next cycle.
     ///
-    /// Errored flushes evict the writer (buffered bytes dropped
-    /// via `into_parts`) and are recorded BOTH in the returned
+    /// A failed `write` keeps the writer: the `BufWriter` retains
+    /// the bytes, so the PV is reported in `deferred` like a busy
+    /// slot and retried next cycle. A failed fsync, or a flush that
+    /// landed in a deleted file, evicts the writer (buffered bytes
+    /// dropped via `into_parts`) and is recorded BOTH in the returned
     /// `failed` list (for the immediate caller) AND in
     /// `evicted_with_loss` (so the next ingest-side flush_owner
     /// pass can pick them up even if the immediate caller was the
@@ -482,8 +500,26 @@ impl PlainPbStoragePlugin {
                         cached.dirty = false;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(pv, path = ?cached.path, "Failed to flush/fsync cached writer: {e}");
+                Err(FlushFailure::Write(e)) => {
+                    // Nothing is lost yet: the BufWriter holds every
+                    // byte the failed `write` did not take. Keep the
+                    // writer and its dirty bit; the pending registry
+                    // timestamps stay uncommitted until a later cycle
+                    // gets the bytes out.
+                    tracing::warn!(
+                        pv,
+                        path = ?cached.path,
+                        "Failed to write out cached writer; bytes stay buffered for retry: {e}"
+                    );
+                    metrics::counter!(
+                        "archiver_pb_flush_failures_total",
+                        "tier" => self.plugin_name.clone(),
+                    )
+                    .increment(1);
+                    deferred.push(pv);
+                }
+                Err(FlushFailure::Sync(e)) => {
+                    tracing::warn!(pv, path = ?cached.path, "Failed to fsync cached writer: {e}");
                     metrics::counter!(
                         "archiver_pb_flush_failures_total",
                         "tier" => self.plugin_name.clone(),

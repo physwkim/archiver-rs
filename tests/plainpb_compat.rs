@@ -2023,3 +2023,102 @@ async fn append_recovers_from_emfile_at_the_header_probe() {
         ]
     );
 }
+
+/// Caps this process's file size (`RLIMIT_FSIZE`) so a write past
+/// `bytes` fails with EFBIG; restores the limit on drop.
+#[cfg(unix)]
+struct FileSizeCap {
+    orig: libc::rlimit,
+}
+
+#[cfg(unix)]
+impl FileSizeCap {
+    fn new(bytes: u64) -> Self {
+        // SAFETY: SIGXFSZ's default action terminates the process;
+        // ignored, the write returns EFBIG instead.
+        unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+        let mut orig = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: plain libc calls with a valid out-pointer.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut orig) }, 0);
+        let capped = libc::rlimit {
+            rlim_cur: bytes as libc::rlim_t,
+            rlim_max: orig.rlim_max,
+        };
+        // SAFETY: lowering the soft limit of the calling process.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &capped) }, 0);
+        Self { orig }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FileSizeCap {
+    fn drop(&mut self) {
+        // SAFETY: restoring the limit read in `new`.
+        unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &self.orig) };
+    }
+}
+
+/// A `write` that fails leaves its bytes in the BufWriter. The flush
+/// must report the PV deferred and keep the writer, so that once
+/// writes succeed again every sample is on disk and nothing was
+/// counted as lost.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_write_keeps_the_buffered_samples_for_the_next_flush() {
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("sts", dir.path().to_path_buf(), PartitionGranularity::Year);
+    let pv = "TEST:FSIZE";
+    let base = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+    let sample = |secs: i64, v: f64| {
+        ArchiverSample::new(
+            SystemTime::from(base + chrono::Duration::seconds(secs)),
+            ArchiverValue::ScalarDouble(v),
+        )
+    };
+    plugin
+        .append_event(pv, ArchDbType::ScalarDouble, &sample(0, 1.0))
+        .await
+        .unwrap();
+    let clean = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        clean.failed.is_empty() && clean.deferred.is_empty(),
+        "{clean:?}"
+    );
+    let path = plugin.file_path_for(pv, sample(0, 1.0).timestamp);
+    let len = std::fs::metadata(&path).unwrap().len();
+
+    let cap = FileSizeCap::new(len);
+    plugin
+        .append_event(pv, ArchDbType::ScalarDouble, &sample(1, 2.0))
+        .await
+        .unwrap();
+    let blocked = plugin.flush_ingest_writes().await.unwrap();
+    assert_eq!(blocked.failed, Vec::<String>::new());
+    assert_eq!(blocked.deferred, vec![pv.to_string()]);
+    assert_eq!(plugin.open_writer_count(), 1, "the writer was evicted");
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+    drop(cap);
+
+    let retried = plugin.flush_ingest_writes().await.unwrap();
+    assert!(
+        retried.failed.is_empty() && retried.deferred.is_empty(),
+        "{retried:?}"
+    );
+    assert!(plugin.take_loss_markers().is_empty());
+    let mut rdr = PbFileReader::open(&path).unwrap();
+    let mut values = Vec::new();
+    while let Some(s) = rdr.next_event().unwrap() {
+        values.push(s.value);
+    }
+    assert_eq!(
+        values,
+        vec![
+            ArchiverValue::ScalarDouble(1.0),
+            ArchiverValue::ScalarDouble(2.0)
+        ]
+    );
+}
