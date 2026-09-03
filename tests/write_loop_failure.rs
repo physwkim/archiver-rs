@@ -76,6 +76,9 @@ struct InjectingStorage {
     /// What `get_last_known_event` reports per PV: the store's tail
     /// the shard seeds its ordering gate from.
     tail: Mutex<HashMap<String, ArchiverSample>>,
+    /// When set, `get_last_known_event` blocks its thread for this
+    /// long first, the way a stalled file read would.
+    tail_hang_for: Mutex<Option<Duration>>,
 }
 
 impl InjectingStorage {
@@ -94,7 +97,12 @@ impl InjectingStorage {
             loss_queue: Mutex::new(Vec::new()),
             take_loss_calls: AtomicUsize::new(0),
             tail: Mutex::new(HashMap::new()),
+            tail_hang_for: Mutex::new(None),
         })
+    }
+
+    fn set_tail_hang(&self, hang: Duration) {
+        *self.tail_hang_for.lock().unwrap() = Some(hang);
     }
 
     fn set_tail(&self, pv: &str, sample: ArchiverSample) {
@@ -236,6 +244,10 @@ impl StoragePlugin for InjectingStorage {
     }
 
     async fn get_last_known_event(&self, pv: &str) -> anyhow::Result<Option<ArchiverSample>> {
+        let hang = *self.tail_hang_for.lock().unwrap();
+        if let Some(hang) = hang {
+            std::thread::sleep(hang);
+        }
         Ok(self.tail.lock().unwrap().get(pv).cloned())
     }
 
@@ -2201,6 +2213,52 @@ async fn gate_is_seeded_once() {
         .map(|r| r.timestamp)
         .collect();
     assert_eq!(stored, vec![ts(1001), ts(1002)]);
+    assert_eq!(counters.timestamp_drops.load(Ordering::Relaxed), 0);
+    shutdown(sd_tx, join).await;
+}
+
+/// The seed read is isolated like the append: a store that stalls on
+/// the tail read holds the shard for `append_timeout`, not for the
+/// stall, and the registry seed stands. Counted as seeded, the PV's
+/// later samples do not wait on the store again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_seed_read_is_bounded_by_append_timeout() {
+    let storage = InjectingStorage::new();
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry
+        .register_pv("A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let counters = Arc::new(PvCounters::default());
+    counters
+        .ordering_last_ts_nanos
+        .store(nanos(ts(999)), Ordering::Relaxed);
+    storage.set_tail("A", sample_at(ts(1000), 1.0));
+    storage.set_tail_hang(Duration::from_secs(3));
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry, fast_cfg());
+
+    for (t, v, expect) in [(ts(1000), 1.0, 1), (ts(1001), 2.0, 2)] {
+        let started = tokio::time::Instant::now();
+        tx.send(pv_sample("A", t, v, &counters)).await.unwrap();
+        let deadline = started + Duration::from_secs(8);
+        while counters.events_stored.load(Ordering::Relaxed) < expect {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "sample {expect} never stored: {counters:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(1500),
+            "sample {expect} waited {took:?} on the stalled tail read"
+        );
+    }
+    let stored: Vec<SystemTime> = storage
+        .appends_snapshot()
+        .into_iter()
+        .map(|r| r.timestamp)
+        .collect();
+    assert_eq!(stored, vec![ts(1000), ts(1001)]);
     assert_eq!(counters.timestamp_drops.load(Ordering::Relaxed), 0);
     shutdown(sd_tx, join).await;
 }

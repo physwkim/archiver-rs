@@ -4636,19 +4636,32 @@ async fn shard_append_loop(
 /// it when power was lost with `fsync_on_flush` off, so that
 /// redelivery, the one sample of the lost window still recoverable,
 /// would be dropped. A duplicate or a gap is measured against the
-/// store, so the store has the final word. A read error keeps the
-/// registry seed; it is logged once and not retried per sample.
+/// store, so the store has the final word.
+///
+/// The read is isolated like the append: it runs on the blocking pool
+/// and the shard waits at most `read_timeout` for it, so a store that
+/// stalls parks a blocking thread, not a runtime worker. A read that
+/// fails or times out keeps the registry seed; it is logged once, and
+/// the PV counts as seeded so its later samples do not wait on the
+/// store again.
 async fn seed_ordering_gate(
     shard_idx: usize,
     storage: &Arc<dyn StoragePlugin>,
     pv: &str,
     c: &PvCounters,
+    read_timeout: Duration,
 ) {
     if c.gate_seeded.load(Ordering::Relaxed) {
         return;
     }
-    match storage.get_last_known_event(pv).await {
-        Ok(last) => {
+    let storage_for_task = storage.clone();
+    let pv_for_task = pv.to_string();
+    let read = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current()
+            .block_on(storage_for_task.get_last_known_event(&pv_for_task))
+    });
+    match tokio::time::timeout(read_timeout, read).await {
+        Ok(Ok(Ok(last))) => {
             let nanos = last.map_or(0, |s| unix_nanos(s.timestamp));
             c.ordering_last_ts_nanos.store(nanos, Ordering::Relaxed);
             debug!(
@@ -4658,10 +4671,20 @@ async fn seed_ordering_gate(
                 "Seeded the ordering gate from the store"
             );
         }
-        Err(e) => warn!(
+        Ok(Ok(Err(e))) => warn!(
             shard = shard_idx,
             pv,
             "Could not read the last stored event; the ordering gate keeps the registry seed: {e}"
+        ),
+        Ok(Err(e)) => warn!(
+            shard = shard_idx,
+            pv, "The last stored event read failed; the ordering gate keeps the registry seed: {e}"
+        ),
+        Err(_) => warn!(
+            shard = shard_idx,
+            pv,
+            ?read_timeout,
+            "The last stored event read did not return in time; the ordering gate keeps the registry seed"
         ),
     }
     c.gate_seeded.store(true, Ordering::Relaxed);
@@ -4688,7 +4711,7 @@ async fn shard_handle_sample(
     // first sample in this process; a sample without counters has no
     // task and no ordering state.
     if let Some(ref c) = pv_sample.counters {
-        seed_ordering_gate(shard_idx, storage, &pv_sample.pv_name, c).await;
+        seed_ordering_gate(shard_idx, storage, &pv_sample.pv_name, c, append_timeout).await;
         let prev = c.ordering_last_ts_nanos.load(Ordering::Relaxed);
         if prev != 0 && ts_nanos <= prev {
             c.timestamp_drops.fetch_add(1, Ordering::Relaxed);
