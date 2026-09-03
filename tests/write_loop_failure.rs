@@ -2017,3 +2017,43 @@ async fn shutdown_drain_delivers_the_main_queue_tail_to_every_shard() {
     );
     assert_eq!(storage.appends_snapshot().len(), TOTAL);
 }
+
+/// The ordering gate requires a strictly newer timestamp: a sample
+/// carrying the last accepted timestamp is the same event redelivered
+/// (CA and PVA resend the current value on every connect).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn equal_timestamp_sample_is_dropped_as_a_redelivery() {
+    let cfg = fast_cfg();
+    let storage = InjectingStorage::new();
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+    registry
+        .register_pv("A", ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+        .unwrap();
+    let counters = Arc::new(PvCounters::default());
+    let (tx, sd_tx, join) = spawn_loop(storage.clone(), registry.clone(), cfg);
+
+    let t1 = ts(1000);
+    let t2 = ts(1001);
+    for (t, v) in [(t1, 1.0), (t1, 2.0), (t2, 3.0)] {
+        tx.send(pv_sample("A", t, v, &counters)).await.unwrap();
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while counters.events_stored.load(Ordering::Relaxed) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "samples never stored"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(counters.timestamp_drops.load(Ordering::Relaxed), 1);
+    let stored: Vec<SystemTime> = storage
+        .appends_snapshot()
+        .into_iter()
+        .map(|r| r.timestamp)
+        .collect();
+    assert_eq!(stored, vec![t1, t2]);
+
+    shutdown(sd_tx, join).await;
+}

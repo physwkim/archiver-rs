@@ -131,6 +131,26 @@ impl Stack {
         }
     }
 
+    /// Start archiving `PV` and wait for the connect-time event, which
+    /// proves the monitor subscription is active. A put that lands
+    /// while the subscription is still being set up can be reported by
+    /// the in-process server as the new value under the previous
+    /// timestamp, followed by the properly stamped event.
+    async fn archive(&self) {
+        self.mgr
+            .archive_pv(PV, &SampleMode::Monitor, Protocol::Ca)
+            .await
+            .expect("archive_pv over CA");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while counters(&self.mgr, PV).events_received == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "connect-time event never delivered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     async fn finish(self) {
         self.pool_shutdown.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(10), self.pool)
@@ -150,10 +170,7 @@ async fn ca_waveform_samples_land_as_waveform_double() {
     let s = Stack::start().await;
 
     let t0 = SystemTime::now();
-    s.mgr
-        .archive_pv(PV, &SampleMode::Monitor, Protocol::Ca)
-        .await
-        .expect("archive_pv over CA");
+    s.archive().await;
     let rec = s.registry.get_pv(PV).unwrap().expect("registry row");
     assert_eq!(rec.dbr_type, ArchDbType::WaveformDouble, "{rec:?}");
     assert_eq!(rec.element_count, NELM, "{rec:?}");
@@ -208,6 +225,86 @@ async fn ca_waveform_samples_land_as_waveform_double() {
     s.finish().await;
 }
 
+/// Every `VectorDouble` sample on disk for `PV`, in stream order.
+async fn stored_arrays(s: &Stack, t0: SystemTime) -> Vec<Vec<f64>> {
+    let from = t0 - Duration::from_secs(3600);
+    let to = t0 + Duration::from_secs(3600);
+    let mut stream = query_data(&*s.storage, PV, from, to, None)
+        .await
+        .expect("query_data");
+    let mut got = Vec::new();
+    while let Some(e) = stream.next_event().expect("next_event") {
+        match e.value {
+            ArchiverValue::VectorDouble(v) => got.push(v),
+            other => panic!("stored value is not a waveform: {other:?}"),
+        }
+    }
+    got
+}
+
+/// Poll the disk until `want` is present; panic with the counters
+/// after the deadline.
+async fn wait_on_disk(s: &Stack, t0: SystemTime, want: &[f64]) -> Vec<Vec<f64>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = stored_arrays(s, t0).await;
+        if got.iter().any(|g| g == want) {
+            return got;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {want:?} on disk; have {got:?}; counters {:?}",
+            counters(&s.mgr, PV)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Pause and resume start a new archiving task, and the connect-time
+/// event redelivers the current value with the timestamp already on
+/// disk. The new task's ordering gate is seeded from the store, so the
+/// redelivery is dropped instead of stored a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_does_not_re_store_the_current_value() {
+    let s = Stack::start().await;
+    let t0 = SystemTime::now();
+    s.archive().await;
+    let first = vec![1.0, 2.0, 3.0];
+    s.ch.put(&EpicsValue::DoubleArray(first.clone()))
+        .await
+        .expect("caput");
+    wait_on_disk(&s, t0, &first).await;
+
+    s.mgr.pause_pv(PV).await.unwrap();
+    s.mgr.resume_pv(PV).await.unwrap();
+    // The resumed task receives the connect-time redelivery of `first`.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while counters(&s.mgr, PV).events_received == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resumed monitor never delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let second = vec![4.0, 5.0, 6.0];
+    s.ch.put(&EpicsValue::DoubleArray(second.clone()))
+        .await
+        .expect("caput");
+    let got = wait_on_disk(&s, t0, &second).await;
+    let copies = got.iter().filter(|g| **g == first).count();
+    assert_eq!(
+        copies, 1,
+        "the redelivered current value was stored again: {got:?}"
+    );
+    let c = counters(&s.mgr, PV);
+    assert_eq!(c.timestamp_drops, 1, "{c:?}");
+    assert_eq!(c.storage_write_errors, 0, "{c:?}");
+
+    s.mgr.stop_pv(PV).await.unwrap();
+    s.finish().await;
+}
+
 /// `ChannelManager::shutdown` stops every producer and refuses new
 /// starts, so the write pool's drain that follows sees a fixed queue
 /// tail. The channel keeps posting; nothing may be received after
@@ -215,18 +312,15 @@ async fn ca_waveform_samples_land_as_waveform_double() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_stops_producers_and_refuses_new_starts() {
     let s = Stack::start().await;
-    s.mgr
-        .archive_pv(PV, &SampleMode::Monitor, Protocol::Ca)
-        .await
-        .expect("archive_pv over CA");
+    s.archive().await;
     s.ch.put(&EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
         .await
         .expect("caput");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while counters(&s.mgr, PV).events_received == 0 {
+    while counters(&s.mgr, PV).events_received < 2 {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "monitor never delivered"
+            "monitor never delivered the put"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
