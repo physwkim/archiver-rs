@@ -11,7 +11,7 @@ use epics_rs::pva::client_native::PvaClient;
 use epics_rs::pva::client_native::ops_v2::MonitorConnEvent;
 use epics_rs::pva::proto::ByteOrder;
 use epics_rs::pva::pvdata::encode::{encode_pv_field, encode_type_desc};
-use epics_rs::pva::pvdata::{PvField, ScalarType, ScalarValue, TypedScalarArray};
+use epics_rs::pva::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue, TypedScalarArray};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -654,7 +654,7 @@ impl ChannelManager {
             .map_err(|_| anyhow::anyhow!("PVA pvget for {pv_name} timed out"))?
             .map_err(|e| anyhow::anyhow!("Failed to pvget {pv_name}: {e}"))?;
         let (dbr_type, element_count) =
-            pv_field_to_arch_db_type(&initial.value).ok_or_else(|| {
+            pv_field_to_arch_db_type(&initial.value, &initial.introspection).ok_or_else(|| {
                 anyhow::anyhow!("PV {pv_name}: empty PVA scalar-array; cannot infer element type")
             })?;
 
@@ -2606,6 +2606,28 @@ fn pv_value_field(field: &PvField) -> &PvField {
     }
 }
 
+/// Descriptor-side twin of [`pv_value_field`]: the `value` member of a
+/// structure descriptor, or the descriptor itself.
+fn pv_value_desc(desc: &FieldDesc) -> &FieldDesc {
+    match desc {
+        FieldDesc::Structure { fields, .. } => fields
+            .iter()
+            .find(|(name, _)| name == "value")
+            .map_or(desc, |(_, d)| d),
+        _ => desc,
+    }
+}
+
+/// Element type of an untyped scalar array: the channel introspection
+/// names it even when the array is empty; the first element is only
+/// the fallback when the descriptor does not describe a scalar array.
+fn untyped_array_element_type(items: &[ScalarValue], desc: &FieldDesc) -> Option<ScalarType> {
+    match pv_value_desc(desc) {
+        FieldDesc::ScalarArray(st) => Some(*st),
+        _ => items.first().map(ScalarValue::scalar_type),
+    }
+}
+
 /// Map a PVA `ScalarValue` to an archiver `ArchiverValue`.
 fn scalar_value_to_archiver(s: &ScalarValue) -> ArchiverValue {
     match s {
@@ -2652,10 +2674,10 @@ fn pv_field_scalar_to_archiver(
         PvField::Scalar(s) => Some(scalar_value_to_archiver(s)),
         PvField::ScalarArrayTyped(arr) => Some(typed_scalar_array_to_archiver(arr)),
         PvField::ScalarArray(items) => {
-            // Legacy untyped scalar-array path (rare with pvxs 0.14+,
-            // which decodes into `ScalarArrayTyped`). Promote to the
-            // typed form so a single converter covers both.
-            let st = items.first()?.scalar_type();
+            // Untyped scalar-array path: the decoder leaves string
+            // arrays untyped. Promote to the typed form so a single
+            // converter covers both; an empty array is a valid sample.
+            let st = untyped_array_element_type(items, canonical_desc)?;
             let typed = TypedScalarArray::from_scalar_values(items, st)?;
             Some(typed_scalar_array_to_archiver(&typed))
         }
@@ -2678,7 +2700,7 @@ fn pv_field_scalar_to_archiver(
 ///   archived as [`ArchDbType::V4GenericBytes`] with element_count = 1
 ///   (the structure as a whole is one sample; inner cardinality is
 ///   carried inside the wire-encoded bytes).
-fn pv_field_to_arch_db_type(field: &PvField) -> Option<(ArchDbType, i32)> {
+fn pv_field_to_arch_db_type(field: &PvField, desc: &FieldDesc) -> Option<(ArchDbType, i32)> {
     // NTEnum: register as ScalarEnum (the index is the archived
     // value); choices live in extras_cache rather than the dbr_type.
     if nt_enum_parts(field).is_some() {
@@ -2688,11 +2710,8 @@ fn pv_field_to_arch_db_type(field: &PvField) -> Option<(ArchDbType, i32)> {
     Some(match value {
         PvField::Scalar(s) => (scalar_value_to_arch_db_type(s), 1),
         PvField::ScalarArray(arr) => {
-            let elem = arr.first()?;
-            (
-                scalar_type_to_waveform(elem.scalar_type()),
-                arr.len() as i32,
-            )
+            let st = untyped_array_element_type(arr, desc)?;
+            (scalar_type_to_waveform(st), arr.len() as i32)
         }
         PvField::ScalarArrayTyped(arr) => {
             (scalar_type_to_waveform(arr.scalar_type()), arr.len() as i32)
@@ -4477,6 +4496,38 @@ mod pva_mapping_tests {
     use epics_rs::pva::pvdata::encode::{decode_pv_field, decode_type_desc};
     use std::io::Cursor;
 
+    /// String arrays arrive untyped from the decoder; an empty one has
+    /// no first element to infer from, so the element type must come
+    /// from the channel introspection, at registration and per sample.
+    #[test]
+    fn empty_untyped_string_array_is_typed_by_the_introspection() {
+        let canonical = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalarArray:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::String))],
+        };
+        let wrap = |items: Vec<ScalarValue>| {
+            let mut root = PvStructure::new("epics:nt/NTScalarArray:1.0");
+            root.fields
+                .push(("value".into(), PvField::ScalarArray(items)));
+            PvField::Structure(root)
+        };
+
+        let empty = wrap(vec![]);
+        let (db, ec) = pv_field_to_arch_db_type(&empty, &canonical).expect("classified");
+        assert_eq!(db, ArchDbType::WaveformString);
+        assert_eq!(ec, 0);
+        assert_eq!(
+            pv_field_scalar_to_archiver(&empty, &canonical).expect("converted"),
+            ArchiverValue::VectorString(vec![])
+        );
+
+        let one = wrap(vec![ScalarValue::String("a".into())]);
+        assert_eq!(
+            pv_field_scalar_to_archiver(&one, &canonical).expect("converted"),
+            ArchiverValue::VectorString(vec!["a".into()])
+        );
+    }
+
     /// Build a synthetic NTTable with two double columns. Mirrors what
     /// a live IOC publishes for a typical waveform-table channel.
     fn make_nttable() -> PvField {
@@ -4581,7 +4632,7 @@ mod pva_mapping_tests {
     #[test]
     fn nttable_classifies_as_v4_generic_bytes() {
         let pv = make_nttable();
-        let (db, ec) = pv_field_to_arch_db_type(&pv).expect("classified");
+        let (db, ec) = pv_field_to_arch_db_type(&pv, &pv.descriptor()).expect("classified");
         assert_eq!(db, ArchDbType::V4GenericBytes);
         assert_eq!(ec, 1);
     }
@@ -4642,7 +4693,7 @@ mod pva_mapping_tests {
         ));
         let pv = PvField::Structure(wrapper);
 
-        let (db, ec) = pv_field_to_arch_db_type(&pv).expect("classified");
+        let (db, ec) = pv_field_to_arch_db_type(&pv, &pv.descriptor()).expect("classified");
         assert_eq!(db, ArchDbType::WaveformDouble);
         assert_eq!(ec, 3);
         let av = pv_field_scalar_to_archiver(&pv, &pv.descriptor()).expect("converted");
@@ -4658,7 +4709,7 @@ mod pva_mapping_tests {
     #[test]
     fn nt_enum_classifies_as_scalar_enum() {
         let pv = make_nt_enum(2, &["Zero", "One", "Two"]);
-        let (db, ec) = pv_field_to_arch_db_type(&pv).expect("classified");
+        let (db, ec) = pv_field_to_arch_db_type(&pv, &pv.descriptor()).expect("classified");
         assert_eq!(db, ArchDbType::ScalarEnum);
         assert_eq!(ec, 1);
     }
@@ -4907,7 +4958,7 @@ mod pva_mapping_tests {
         root.fields
             .push(("value".into(), PvField::Structure(inner)));
         let pv = PvField::Structure(root);
-        let (db, _) = pv_field_to_arch_db_type(&pv).expect("classified");
+        let (db, _) = pv_field_to_arch_db_type(&pv, &pv.descriptor()).expect("classified");
         assert_eq!(db, ArchDbType::V4GenericBytes);
     }
 
@@ -4936,7 +4987,7 @@ mod pva_mapping_tests {
             .fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(42.5))));
         let pv = PvField::Structure(wrapper);
-        let (db, ec) = pv_field_to_arch_db_type(&pv).expect("classified");
+        let (db, ec) = pv_field_to_arch_db_type(&pv, &pv.descriptor()).expect("classified");
         assert_eq!(db, ArchDbType::ScalarDouble);
         assert_eq!(ec, 1);
         match pv_field_scalar_to_archiver(&pv, &pv.descriptor()).expect("converted") {
