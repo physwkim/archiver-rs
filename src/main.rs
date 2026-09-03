@@ -396,12 +396,25 @@ async fn main() -> anyhow::Result<()> {
     // Graceful-shutdown trigger for the HTTP server: the OS signal, or
     // the supervisor flipping the watch because a critical task died.
     let supervisor_shutdown = supervisor.shutdown_requested();
+    let producers = channel_mgr.clone();
+    let producer_stop_timeout = Duration::from_secs(10);
     let shutdown_signal = async move {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => info!("Shutdown signal received"),
             _ = supervisor_shutdown => {
                 tracing::warn!("Shutdown requested by the supervisor");
             }
+        }
+        // Stop the sample producers before the write pool is told to
+        // drain, so the queue tail it moves to disk is the whole tail.
+        if tokio::time::timeout(producer_stop_timeout, producers.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                timeout = ?producer_stop_timeout,
+                "PV tasks did not stop in time; draining the write pool anyway"
+            );
         }
         let _ = shutdown_tx.send(true);
     };

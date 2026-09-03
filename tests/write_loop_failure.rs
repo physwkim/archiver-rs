@@ -1951,3 +1951,69 @@ async fn dirty_eviction_loss_marker_charges_flush_losses() {
     );
     shutdown(sd_tx, join).await;
 }
+
+/// Samples still in the main queue when shutdown flips are moved into
+/// the shard channels by the dispatcher, and every shard must drain
+/// them. Shards used to drain on the global shutdown flag, racing that
+/// move: a shard that emptied its channel first exited, and the rest
+/// of the tail landed in a closed (or dropped) channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_drain_delivers_the_main_queue_tail_to_every_shard() {
+    let storage = InjectingStorage::new();
+    let registry = Arc::new(PvRegistry::in_memory().unwrap());
+
+    const N_PVS: usize = 64;
+    const SAMPLES_PER_PV: usize = 50;
+    const TOTAL: usize = N_PVS * SAMPLES_PER_PV;
+    let pv_names: Vec<String> = (0..N_PVS).map(|i| format!("pv{i}")).collect();
+    for name in &pv_names {
+        registry
+            .register_pv(name, ArchDbType::ScalarDouble, &SampleMode::Monitor, 1)
+            .unwrap();
+    }
+    let counters: Vec<Arc<PvCounters>> = (0..N_PVS)
+        .map(|_| Arc::new(PvCounters::default()))
+        .collect();
+
+    // The whole load sits in the main queue, and shutdown is already
+    // requested, before the pool starts: its first poll is the drain.
+    let (tx, rx) = mpsc::channel::<PvSample>(TOTAL);
+    for s in 0..SAMPLES_PER_PV {
+        for (i, name) in pv_names.iter().enumerate() {
+            let t = ts(10_000 + (i as u64) * 100 + s as u64);
+            tx.try_send(pv_sample(name, t, s as f64, &counters[i]))
+                .unwrap();
+        }
+    }
+    let (sd_tx, sd_rx) = watch::channel(false);
+    sd_tx.send(true).unwrap();
+
+    let cfg = ShardedWritePoolConfig {
+        shards: 4,
+        per_shard_buffer: TOTAL,
+        write_loop: fast_cfg(),
+    };
+    let pool = tokio::spawn(run_sharded_write_pool(
+        storage.clone(),
+        registry.clone(),
+        rx,
+        sd_rx,
+        cfg,
+    ));
+    tokio::time::timeout(Duration::from_secs(20), pool)
+        .await
+        .expect("pool exits on shutdown")
+        .unwrap();
+
+    let sum = |f: &dyn Fn(&PvCounters) -> u64| counters.iter().map(|c| f(c)).sum::<u64>();
+    let stored = sum(&|c| c.events_stored.load(Ordering::Relaxed));
+    let closed = sum(&|c| c.shard_closed_drops.load(Ordering::Relaxed));
+    let overflow = sum(&|c| c.buffer_overflow_drops.load(Ordering::Relaxed));
+    let abandoned = sum(&|c| c.shutdown_abandoned_drops.load(Ordering::Relaxed));
+    assert_eq!(
+        (stored, closed, overflow, abandoned),
+        (TOTAL as u64, 0, 0, 0),
+        "every queued sample must reach a shard drain"
+    );
+    assert_eq!(storage.appends_snapshot().len(), TOTAL);
+}

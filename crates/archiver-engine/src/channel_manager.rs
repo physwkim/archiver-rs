@@ -14,6 +14,7 @@ use epics_rs::pva::pvdata::encode::{encode_pv_field, encode_type_desc};
 use epics_rs::pva::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue, TypedScalarArray};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 use archiver_core::registry::{Protocol, PvRecord, PvRegistry, PvStatus, SampleMode};
@@ -406,6 +407,14 @@ pub struct ChannelManager {
     policy: Option<PolicyConfig>,
     /// Per-site IOC drift bound (Java parity 6538631).
     server_ioc_drift_secs: u64,
+    /// Every sample producer (monitor/scan loops, PVA refresh and
+    /// watchdog tasks) is spawned through this tracker so
+    /// [`Self::shutdown`] can wait for all of them to exit.
+    tasks: TaskTracker,
+    /// `true` once [`Self::shutdown`] ran. A start holds the read side
+    /// while it spawns; shutdown takes the write side to flip it, so no
+    /// producer can be spawned after the sweep that cancels them.
+    lifecycle: tokio::sync::RwLock<bool>,
 }
 
 /// A sample ready to be written to storage.
@@ -453,6 +462,8 @@ impl ChannelManager {
             sample_tx: tx,
             policy,
             server_ioc_drift_secs,
+            tasks: TaskTracker::new(),
+            lifecycle: tokio::sync::RwLock::new(false),
         };
 
         Ok((mgr, rx))
@@ -470,6 +481,24 @@ impl ChannelManager {
             .entry(pv_name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Stop every sample producer and wait for them to exit. The binary
+    /// calls this before the write pool is told to drain, so the queue
+    /// tail the pool moves to disk is the whole tail: a producer still
+    /// sending during the drain lost those samples, uncounted, once the
+    /// pool's receiver went away. Starts requested after this point are
+    /// refused; the PV handles (and their counters) stay visible.
+    pub async fn shutdown(&self) {
+        {
+            let mut closed = self.lifecycle.write().await;
+            *closed = true;
+            for entry in self.channels.iter() {
+                entry.value().cancel_token.cancel();
+            }
+        }
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 
     /// Restore all active PVs from the registry (called on startup).
@@ -701,6 +730,15 @@ impl ChannelManager {
     /// `record.protocol`; the CA branch keeps the historical behaviour,
     /// the PVA branch goes through `start_archiving_internal_pva`.
     async fn start_archiving_internal(&self, record: &PvRecord) -> anyhow::Result<()> {
+        // Held until the producer is spawned: `shutdown` cannot sweep
+        // between the check and the spawn.
+        let lifecycle = self.lifecycle.read().await;
+        if *lifecycle {
+            anyhow::bail!(
+                "channel manager is shut down; refusing to start {}",
+                record.pv_name
+            );
+        }
         if record.protocol == Protocol::Pva {
             return self.start_archiving_internal_pva(record).await;
         }
@@ -763,7 +801,7 @@ impl ChannelManager {
         let drift = self.server_ioc_drift_secs;
         match &record.sample_mode {
             SampleMode::Monitor => {
-                tokio::spawn(async move {
+                self.tasks.spawn(async move {
                     monitor_loop(
                         pv_name,
                         dbr_type,
@@ -782,7 +820,7 @@ impl ChannelManager {
             }
             SampleMode::Scan { period_secs } => {
                 let period = *period_secs;
-                tokio::spawn(async move {
+                self.tasks.spawn(async move {
                     scan_loop(
                         pv_name,
                         dbr_type,
@@ -850,7 +888,7 @@ impl ChannelManager {
                 let pv_name_loop = pv_name.clone();
                 let archive_fields_loop = record.archive_fields.clone();
                 let extras_for_loop = extras.clone();
-                tokio::spawn(async move {
+                self.tasks.spawn(async move {
                     monitor_loop_pva(
                         pv_name_loop,
                         dbr_type,
@@ -872,7 +910,7 @@ impl ChannelManager {
                 let pv_name_loop = pv_name.clone();
                 let archive_fields_loop = record.archive_fields.clone();
                 let extras_for_loop = extras.clone();
-                tokio::spawn(async move {
+                self.tasks.spawn(async move {
                     scan_loop_pva(
                         pv_name_loop,
                         dbr_type,
@@ -901,7 +939,7 @@ impl ChannelManager {
             let registry = self.registry.clone();
             let cancel = cancel_token.clone();
             let counters_for_refresh = counters.clone();
-            tokio::spawn(async move {
+            self.tasks.spawn(async move {
                 pva_metadata_refresh_loop(
                     pv_name,
                     pva_client,
@@ -918,7 +956,7 @@ impl ChannelManager {
             let counters_for_watch = counters.clone();
             let cancel = cancel_token.clone();
             let sample_mode = record.sample_mode.clone();
-            tokio::spawn(async move {
+            self.tasks.spawn(async move {
                 pva_state_watchdog(pv_name, conn_info, counters_for_watch, cancel, sample_mode)
                     .await;
             });
@@ -3385,10 +3423,10 @@ pub async fn run_sharded_write_pool(
             ShardSpawnCtx {
                 storage: storage.clone(),
                 pending: pending.clone(),
-                shutdown: shutdown.clone(),
                 per_shard_buffer: cfg.per_shard_buffer,
                 write_loop: cfg.write_loop.clone(),
             },
+            shutdown.clone(),
         )
         .await;
     }
@@ -3405,26 +3443,39 @@ pub async fn run_sharded_write_pool(
 struct ShardSpawnCtx {
     storage: Arc<dyn StoragePlugin>,
     pending: Arc<PendingReports>,
-    shutdown: tokio::sync::watch::Receiver<bool>,
     per_shard_buffer: usize,
     write_loop: WriteLoopConfig,
 }
 
-/// Spawn one shard worker; return its input channel and join handle.
-fn spawn_shard(
-    shard_idx: usize,
-    ctx: &ShardSpawnCtx,
-) -> (mpsc::Sender<PvSample>, tokio::task::JoinHandle<()>) {
+/// One shard worker as the dispatcher sees it: its input channel, its
+/// task, and the drain signal the dispatcher flips once it has moved
+/// the main queue's tail into `tx`. The shard drains on that signal,
+/// not on the global shutdown flag: sharing the flag let a shard empty
+/// its channel and exit while the dispatcher was still filling it, so
+/// the tail landed in a closed (or dropped) channel.
+struct ShardSlot {
+    tx: mpsc::Sender<PvSample>,
+    handle: tokio::task::JoinHandle<()>,
+    drain_tx: tokio::sync::watch::Sender<bool>,
+}
+
+/// Spawn one shard worker; the dispatcher owns the returned slot.
+fn spawn_shard(shard_idx: usize, ctx: &ShardSpawnCtx) -> ShardSlot {
     let (tx, rx) = mpsc::channel::<PvSample>(ctx.per_shard_buffer);
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
     let handle = tokio::spawn(shard_append_loop(
         shard_idx,
         ctx.storage.clone(),
         rx,
         ctx.pending.clone(),
-        ctx.shutdown.clone(),
+        drain_rx,
         ctx.write_loop.clone(),
     ));
-    (tx, handle)
+    ShardSlot {
+        tx,
+        handle,
+        drain_tx,
+    }
 }
 
 /// Account a sample dropped because its shard channel was full (the
@@ -3535,13 +3586,12 @@ impl RespawnGovernor {
 
 fn route_sample(
     sample: PvSample,
-    shard_txs: &mut [mpsc::Sender<PvSample>],
-    shard_handles: &mut [tokio::task::JoinHandle<()>],
+    shards: &mut [ShardSlot],
     governor: &mut RespawnGovernor,
     ctx: &ShardSpawnCtx,
 ) {
-    let idx = shard_for_pv(&sample.pv_name, shard_txs.len());
-    match shard_txs[idx].try_send(sample) {
+    let idx = shard_for_pv(&sample.pv_name, shards.len());
+    match shards[idx].tx.try_send(sample) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(s)) => record_overflow_drop(idx, &s, "steady"),
         Err(mpsc::error::TrySendError::Closed(s)) => {
@@ -3567,13 +3617,11 @@ fn route_sample(
                 "shard" => idx.to_string(),
             )
             .increment(1);
-            let (tx, handle) = spawn_shard(idx, ctx);
             // The old task is finished (its receiver was dropped,
-            // which is why we saw Closed); overwriting the handle
-            // detaches it.
-            shard_txs[idx] = tx;
-            shard_handles[idx] = handle;
-            match shard_txs[idx].try_send(s) {
+            // which is why we saw Closed); overwriting the slot
+            // detaches its handle.
+            shards[idx] = spawn_shard(idx, ctx);
+            match shards[idx].tx.try_send(s) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(s2)) => {
                     record_overflow_drop(idx, &s2, "respawn_retry")
@@ -3598,18 +3646,16 @@ fn route_sample(
 /// `send().await` would block the dispatcher on the slow shard,
 /// back-pressuring the upstream main channel and starving every other
 /// shard's PVs — the exact failure mode the sharded layout prevents.
-async fn dispatch_loop(mut rx: mpsc::Receiver<PvSample>, n: usize, ctx: ShardSpawnCtx) {
-    let mut shutdown = ctx.shutdown.clone();
+async fn dispatch_loop(
+    mut rx: mpsc::Receiver<PvSample>,
+    n: usize,
+    ctx: ShardSpawnCtx,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     // The dispatcher owns its shard workers so it can respawn a dead
-    // one. A shard task only exits normally on shutdown, so a closed
-    // channel before then is a panic — see [`route_sample`].
-    let mut shard_txs: Vec<mpsc::Sender<PvSample>> = Vec::with_capacity(n);
-    let mut shard_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(n);
-    for shard_idx in 0..n {
-        let (tx, handle) = spawn_shard(shard_idx, &ctx);
-        shard_txs.push(tx);
-        shard_handles.push(handle);
-    }
+    // one. A shard task only exits normally on its drain signal, so a
+    // closed channel before then is a panic — see [`route_sample`].
+    let mut shards: Vec<ShardSlot> = (0..n).map(|idx| spawn_shard(idx, &ctx)).collect();
     // Bounds respawns per shard so a deterministically-dying shard
     // can't storm (see [`RespawnGovernor`]).
     let mut governor = RespawnGovernor::new(n);
@@ -3623,15 +3669,15 @@ async fn dispatch_loop(mut rx: mpsc::Receiver<PvSample>, n: usize, ctx: ShardSpa
             // even under a sustained sample storm.
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    // Drain remaining samples (try_send for the same
-                    // reason as the steady-state branch). No respawn
-                    // during shutdown — a closed shard has already
-                    // exited its loop on the same signal. Count BOTH
-                    // Full and Closed drops so shutdown-time loss is
-                    // visible to operators rather than silent.
+                    // Move the main queue's tail into the shard
+                    // channels (try_send for the same reason as the
+                    // steady-state branch). No respawn during
+                    // shutdown. Count BOTH Full and Closed drops so
+                    // shutdown-time loss is visible to operators
+                    // rather than silent.
                     while let Ok(sample) = rx.try_recv() {
                         let idx = shard_for_pv(&sample.pv_name, n);
-                        match shard_txs[idx].try_send(sample) {
+                        match shards[idx].tx.try_send(sample) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(s)) => {
                                 record_overflow_drop(idx, &s, "shutdown_drain")
@@ -3647,13 +3693,7 @@ async fn dispatch_loop(mut rx: mpsc::Receiver<PvSample>, n: usize, ctx: ShardSpa
             maybe = rx.recv() => {
                 match maybe {
                     Some(sample) => {
-                        route_sample(
-                            sample,
-                            &mut shard_txs,
-                            &mut shard_handles,
-                            &mut governor,
-                            &ctx,
-                        );
+                        route_sample(sample, &mut shards, &mut governor, &ctx);
                     }
                     None => break, // Upstream closed.
                 }
@@ -3662,11 +3702,15 @@ async fn dispatch_loop(mut rx: mpsc::Receiver<PvSample>, n: usize, ctx: ShardSpa
     }
     info!("Sharded write dispatcher exiting");
 
-    // Single owner joins the shard workers on the way out. The
-    // dispatcher exited → shard sample receivers see EOS or the
-    // shutdown signal directly via their watch::Receiver.
-    for handle in shard_handles {
-        let _ = handle.await;
+    // Both exits (shutdown flag, upstream closed) release the shards
+    // here, after the last try_send into their channels, so the drain
+    // a shard runs on its signal sees its complete input. Single owner
+    // joins the workers on the way out.
+    for slot in &shards {
+        let _ = slot.drain_tx.send(true);
+    }
+    for slot in shards {
+        let _ = slot.handle.await;
     }
 }
 
@@ -5052,11 +5096,9 @@ mod shard_lifecycle_tests {
     /// PVs permanently after a single shard panic.
     #[tokio::test]
     async fn route_sample_respawns_dead_shard_and_delivers() {
-        let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
         let ctx = ShardSpawnCtx {
             storage: Arc::new(OkStorage),
             pending: Arc::new(PendingReports::new()),
-            shutdown: sd_rx,
             per_shard_buffer: 16,
             write_loop: WriteLoopConfig {
                 append_timeout: Duration::from_secs(2),
@@ -5068,10 +5110,14 @@ mod shard_lifecycle_tests {
         // receiver was dropped reports Closed on try_send.
         let (dead_tx, dead_rx) = mpsc::channel::<PvSample>(1);
         drop(dead_rx);
-        let mut shard_txs = vec![dead_tx];
-        let mut shard_handles = vec![tokio::spawn(async {})];
+        let (drain_tx, _drain_rx) = tokio::sync::watch::channel(false);
+        let mut shards = vec![ShardSlot {
+            tx: dead_tx,
+            handle: tokio::spawn(async {}),
+            drain_tx,
+        }];
         assert!(
-            shard_txs[0].is_closed(),
+            shards[0].tx.is_closed(),
             "precondition: shard 0's worker is dead (channel closed)"
         );
 
@@ -5088,17 +5134,11 @@ mod shard_lifecycle_tests {
         };
 
         let mut governor = RespawnGovernor::new(1);
-        route_sample(
-            sample,
-            &mut shard_txs,
-            &mut shard_handles,
-            &mut governor,
-            &ctx,
-        );
+        route_sample(sample, &mut shards, &mut governor, &ctx);
 
         // Respawn must have replaced the dead sender with a live one.
         assert!(
-            !shard_txs[0].is_closed(),
+            !shards[0].tx.is_closed(),
             "shard 0 must be respawned with a live channel"
         );
 
@@ -5117,7 +5157,7 @@ mod shard_lifecycle_tests {
         );
 
         // Tear the respawned shard down cleanly.
-        let _ = sd_tx.send(true);
+        let _ = shards[0].drain_tx.send(true);
     }
 
     #[test]
