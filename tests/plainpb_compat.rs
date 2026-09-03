@@ -1027,6 +1027,48 @@ async fn append_refuses_type_that_differs_from_partition_header() {
     assert_eq!(vals, vec![ArchiverValue::ScalarDouble(1.0)]);
 }
 
+/// The same rule on the cached-writer path: a foreign-type sample for
+/// a partition whose writer is still cached (no restart) is refused
+/// too, and the buffered good sample still lands.
+#[tokio::test]
+async fn append_refuses_type_that_differs_from_cached_writer() {
+    let dir = temp_dir();
+    let plugin =
+        PlainPbStoragePlugin::new("test", dir.path().to_path_buf(), PartitionGranularity::Hour);
+    let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap().into();
+    let pv = "TEST:RetypedCached";
+    plugin
+        .append_event(
+            pv,
+            ArchDbType::ScalarDouble,
+            &ArchiverSample::new(ts1, ArchiverValue::ScalarDouble(1.0)),
+        )
+        .await
+        .unwrap();
+    let err = plugin
+        .append_event(
+            pv,
+            ArchDbType::ScalarInt,
+            &ArchiverSample::new(
+                ts1 + std::time::Duration::from_secs(1),
+                ArchiverValue::ScalarInt(2),
+            ),
+        )
+        .await
+        .expect_err("a foreign-type append must be refused on the cached writer");
+    assert!(
+        err.to_string().contains("holds ScalarDouble"),
+        "unexpected error: {err:#}"
+    );
+    plugin.flush_writes().await.unwrap();
+    let mut rdr = PbFileReader::open(&plugin.file_path_for(pv, ts1)).unwrap();
+    let mut vals = Vec::new();
+    while let Some(s) = rdr.next_event().unwrap() {
+        vals.push(s.value);
+    }
+    assert_eq!(vals, vec![ArchiverValue::ScalarDouble(1.0)]);
+}
+
 /// The partition directory is removed out from under a plugin that
 /// already created it (operator cleanup). The next append must
 /// recreate it and land, not fail on the stale `known_dirs` entry

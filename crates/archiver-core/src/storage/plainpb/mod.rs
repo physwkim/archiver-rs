@@ -121,6 +121,11 @@ impl Drop for WriterFdGuard {
 struct CachedWriter {
     path: PathBuf,
     writer: BufWriter<std::fs::File>,
+    /// The type the partition's header declares (or the type we wrote
+    /// the header with). Every append is checked against it, so the
+    /// "one type per partition" rule holds on the cached-writer path
+    /// too, not only when the file is (re)opened.
+    dbr_type: ArchDbType,
     /// `true` between writes and the next successful flush. Lets
     /// `flush_writes` skip writers that have nothing pending so a
     /// reader-side `get_data` doesn't pay an O(N) syscall storm
@@ -555,6 +560,7 @@ impl PlainPbStoragePlugin {
         let CachedWriter {
             path,
             mut writer,
+            dbr_type: _,
             dirty,
             last_used: _,
             _fd_guard,
@@ -1550,6 +1556,7 @@ impl PlainPbStoragePlugin {
             slot.writer = Some(CachedWriter {
                 path: path_buf,
                 writer: bw,
+                dbr_type,
                 // Header bytes (if any) are buffered but not yet
                 // flushed. Mark dirty so the periodic flush picks
                 // them up — without this, a PV that gets created
@@ -1566,6 +1573,14 @@ impl PlainPbStoragePlugin {
         }
 
         let cached = slot.writer.as_mut().expect("just inserted");
+        if cached.dbr_type != dbr_type {
+            return Err(anyhow::anyhow!(
+                "PB partition {path:?} holds {:?} samples; refusing to append a \
+                 {dbr_type:?} sample (type changed — the partition keeps its \
+                 header type until it rolls)",
+                cached.dbr_type
+            ));
+        }
         cached.last_used = SystemTime::now();
         // Atomic-at-buffer-layer sample frame: a single `write_all`
         // means the BufWriter never splits the sample/newline pair
