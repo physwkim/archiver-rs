@@ -1401,32 +1401,6 @@ impl PlainPbStoragePlugin {
         }
 
         if slot.writer.is_none() {
-            // A partition's header fixes the type readers decode every
-            // frame with. Appending a sample of another type (the PV
-            // was retyped at the IOC, or changeTypeForPV ran without a
-            // partition roll) would write frames the reader cannot
-            // decode — and, worse, ones it stops at, hiding every
-            // later sample in the file. Refuse here, at the one place
-            // partitions are opened for append, so the file stays
-            // decodable and the loss is a counted write error.
-            let header_type = partition_header(path)?;
-            if let Some(existing) = header_type
-                && existing != dbr_type
-            {
-                return Err(anyhow::anyhow!(
-                    "PB partition {path:?} holds {existing:?} samples; refusing to \
-                     append a {dbr_type:?} sample (type changed — the partition \
-                     keeps its header type until it rolls)"
-                ));
-            }
-            let needs_header = header_type.is_none();
-            // Whether the open below will CREATE the file (add a new
-            // directory entry). Reliable under the per-PV slot lock: no
-            // other writer targets this path. Gates the parent-dir
-            // fsync so a plain reopen (post-eviction) of an
-            // already-durable file skips the syscall.
-            let is_new_file = self.fsync_on_flush && !path.exists();
-
             // Atomic fd-cap reservation: loop trying to reserve a
             // permit; each failed reservation triggers one LRU
             // eviction (which drops a CachedWriter, decrementing
@@ -1451,6 +1425,54 @@ impl PlainPbStoragePlugin {
                     ));
                 }
             };
+
+            // A partition's header fixes the type readers decode every
+            // frame with. Appending a sample of another type (the PV
+            // was retyped at the IOC, or changeTypeForPV ran without a
+            // partition roll) would write frames the reader cannot
+            // decode — and, worse, ones it stops at, hiding every
+            // later sample in the file. Refuse here, at the one place
+            // partitions are opened for append, so the file stays
+            // decodable and the loss is a counted write error.
+            // Probe the header only with a slot reserved, and with the
+            // same EMFILE recovery as the writer open below. The probe
+            // opens the partition before the writer does, so under fd
+            // exhaustion it is the first call to fail; without eviction
+            // here every retry hit the same wall until fds freed
+            // elsewhere.
+            let header_type = loop {
+                match partition_header(path) {
+                    Ok(t) => break t,
+                    Err(e)
+                        if e.downcast_ref::<std::io::Error>()
+                            .is_some_and(is_too_many_open_files)
+                            && self.evict_lru_writer(pv) =>
+                    {
+                        tracing::warn!(
+                            ?path,
+                            "Hit OS file-handle limit probing the partition \
+                             header; evicted LRU writer and retrying"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            if let Some(existing) = header_type
+                && existing != dbr_type
+            {
+                return Err(anyhow::anyhow!(
+                    "PB partition {path:?} holds {existing:?} samples; refusing to \
+                     append a {dbr_type:?} sample (type changed — the partition \
+                     keeps its header type until it rolls)"
+                ));
+            }
+            let needs_header = header_type.is_none();
+            // Whether the open below will CREATE the file (add a new
+            // directory entry). Reliable under the per-PV slot lock: no
+            // other writer targets this path. Gates the parent-dir
+            // fsync so a plain reopen (post-eviction) of an
+            // already-durable file skips the syscall.
+            let is_new_file = self.fsync_on_flush && !path.exists();
 
             // Open with EMFILE/ENFILE recovery: even with our
             // internal reservation honoured, the OS-wide fd table

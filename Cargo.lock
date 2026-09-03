@@ -826,6 +826,7 @@ dependencies = [
  "epics-rs",
  "futures",
  "hyper",
+ "libc",
  "metrics-exporter-prometheus",
  "prost",
  "reqwest",

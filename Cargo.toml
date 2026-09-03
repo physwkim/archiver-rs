@@ -155,3 +155,5 @@ urlencoding = { workspace = true }
 epics-rs = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
+# RLIMIT_NOFILE clamping in the PlainPB fd-exhaustion tests.
+libc = "0.2"

@@ -1905,3 +1905,121 @@ async fn fsync_on_flush_rename_persists_across_prefix() {
         "old name must hold no data after rename"
     );
 }
+
+/// Clamp `RLIMIT_NOFILE` to the highest fd currently open and fill
+/// every free slot below it, so the next `open(2)` fails with EMFILE
+/// until some fd is closed. Restored on drop. Relies on nextest's
+/// one-process-per-test isolation: under a threaded `cargo test` it
+/// would starve concurrently running tests of fds for its duration.
+#[cfg(unix)]
+struct FdClamp {
+    orig: libc::rlimit,
+    _fill: Vec<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl FdClamp {
+    fn new() -> Self {
+        let mut orig = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: plain libc calls with a valid out-pointer.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut orig) },
+            0
+        );
+        let scan_max = i32::try_from(orig.rlim_cur.min(65_536)).unwrap();
+        let highest_open = (0..scan_max)
+            // SAFETY: F_GETFD on an arbitrary fd number is harmless; it
+            // only reports whether the fd is open.
+            .filter(|&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1)
+            .max()
+            .expect("at least stdio is open");
+        let clamped = libc::rlimit {
+            rlim_cur: libc::rlim_t::try_from(highest_open + 1).unwrap(),
+            rlim_max: orig.rlim_max,
+        };
+        // SAFETY: lowering the soft limit of the calling process.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &clamped) }, 0);
+        let mut fill = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(f) => fill.push(f),
+                Err(e) => {
+                    assert_eq!(e.raw_os_error(), Some(libc::EMFILE), "{e}");
+                    break;
+                }
+            }
+        }
+        Self { orig, _fill: fill }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FdClamp {
+    fn drop(&mut self) {
+        // SAFETY: restoring the limit read in `new`.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.orig) };
+    }
+}
+
+/// EMFILE at the header probe of a re-opened partition. The probe
+/// opens the file before the writer does, so under fd exhaustion it
+/// fails first; it must trigger the same evict-LRU-and-retry as the
+/// writer open instead of failing the append until fds free elsewhere.
+#[cfg(unix)]
+#[tokio::test]
+async fn append_recovers_from_emfile_at_the_header_probe() {
+    let dir = temp_dir();
+    let plugin = PlainPbStoragePlugin::with_fd_budget(
+        "test",
+        dir.path().to_path_buf(),
+        PartitionGranularity::Hour,
+        FdBudget::new(3),
+    );
+    let ts1: SystemTime = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap().into();
+    let ts2 = ts1 + std::time::Duration::from_secs(60);
+    let (a, b, c) = ("TEST:EmfileA", "TEST:EmfileB", "TEST:EmfileC");
+    for (pv, v) in [(a, 1.0), (b, 2.0), (c, 3.0)] {
+        plugin
+            .append_event(
+                pv,
+                ArchDbType::ScalarDouble,
+                &ArchiverSample::new(ts1, ArchiverValue::ScalarDouble(v)),
+            )
+            .await
+            .unwrap();
+    }
+    plugin.flush_writes().await.unwrap();
+    // A's partition exists with a header but has no cached writer, so
+    // the next append re-probes it. B and C stay open: one free budget
+    // slot, zero free OS fds.
+    let a_path = plugin.file_path_for(a, ts1);
+    assert!(plugin.evict_writer_for_path(&a_path));
+
+    let clamp = FdClamp::new();
+    let appended = plugin
+        .append_event(
+            a,
+            ArchDbType::ScalarDouble,
+            &ArchiverSample::new(ts2, ArchiverValue::ScalarDouble(4.0)),
+        )
+        .await;
+    drop(clamp);
+    appended.expect("header probe must evict an LRU writer on EMFILE and retry");
+    plugin.flush_writes().await.unwrap();
+
+    let mut rdr = PbFileReader::open(&a_path).unwrap();
+    let mut vals = Vec::new();
+    while let Some(s) = rdr.next_event().unwrap() {
+        vals.push(s.value);
+    }
+    assert_eq!(
+        vals,
+        vec![
+            ArchiverValue::ScalarDouble(1.0),
+            ArchiverValue::ScalarDouble(4.0)
+        ]
+    );
+}
