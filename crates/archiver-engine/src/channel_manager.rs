@@ -237,15 +237,15 @@ pub struct PvCounters {
     pub flush_losses: AtomicU64,
     /// Ordering high-water for the shard's out-of-order drop: the
     /// newest timestamp the write pool has handed to storage for this
-    /// archiving task, as unix nanoseconds (0 = none). A sample must be
-    /// strictly newer to be stored. It lives with the task rather than
-    /// in a shard-lifetime map so a dead task's state cannot leak into
-    /// the next one; a new task is seeded from what is already archived
-    /// (`ChannelManager::task_counters`), so a deletePV + re-archive
-    /// starts at zero while a resume or restart drops the current value
-    /// the connect redelivers. Written only by the shard that owns the
-    /// PV (the dispatcher's consistent hash pins each PV to one shard);
-    /// not part of the reported snapshot.
+    /// PV, as unix nanoseconds (0 = none). A sample must be strictly
+    /// newer to be stored. The counters outlive the archiving task
+    /// (`ChannelManager::task_counters`), so a resume continues the
+    /// high-water and drops the current value the connect redelivers;
+    /// the first task in a process is seeded from the registry's
+    /// committed `last_timestamp`, and a deletePV + re-archive starts
+    /// at zero. Written only by the shard that owns the PV (the
+    /// dispatcher's consistent hash pins each PV to one shard); not
+    /// part of the reported snapshot.
     pub ordering_last_ts_nanos: AtomicU64,
 }
 
@@ -398,8 +398,8 @@ pub struct ChannelManager {
     /// PV. Without this, e.g. `pause_pv` racing with `resume_pv` can leave
     /// the registry status and the channel map disagreeing.
     op_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
-    /// Storage backend; read for the last stored sample when a task
-    /// starts (see [`Self::task_counters`]).
+    /// Storage backend.
+    #[allow(dead_code)]
     storage: Arc<dyn StoragePlugin>,
     /// PV metadata registry.
     registry: Arc<PvRegistry>,
@@ -417,6 +417,10 @@ pub struct ChannelManager {
     /// while it spawns; shutdown takes the write side to flip it, so no
     /// producer can be spawned after the sweep that cancels them.
     lifecycle: tokio::sync::RwLock<bool>,
+    /// Per-PV counters for the life of the process, so a pause and
+    /// resume continue the PV's statistics and ordering high-water
+    /// (see [`Self::task_counters`]). `destroy_pv` removes the entry.
+    counters: DashMap<String, Arc<PvCounters>>,
 }
 
 /// A sample ready to be written to storage.
@@ -466,6 +470,7 @@ impl ChannelManager {
             server_ioc_drift_secs,
             tasks: TaskTracker::new(),
             lifecycle: tokio::sync::RwLock::new(false),
+            counters: DashMap::new(),
         };
 
         Ok((mgr, rx))
@@ -503,32 +508,28 @@ impl ChannelManager {
         self.tasks.wait().await;
     }
 
-    /// Counters for a new archiving task, with the ordering high-water
-    /// seeded from what is already archived: the newer of the
-    /// registry's committed `last_timestamp` and the last sample the
-    /// store holds. A task starting at zero would store the current
-    /// value CA and PVA redeliver on connect (its timestamp is the one
-    /// already on disk) a second time, and would accept the older
-    /// timestamps a reconnect backfill carries, which the drift filter
-    /// waives, behind newer samples in the same partition.
-    async fn task_counters(&self, record: &PvRecord) -> Arc<PvCounters> {
-        let stored = match self.storage.get_last_known_event(&record.pv_name).await {
-            Ok(sample) => sample.map(|s| s.timestamp),
-            Err(e) => {
-                warn!(
-                    pv = record.pv_name,
-                    "Could not read the last stored sample; ordering seeded from the registry only: {e}"
-                );
-                None
-            }
-        };
-        let counters = Arc::new(PvCounters::default());
-        if let Some(ts) = record.last_timestamp.into_iter().chain(stored).max() {
-            counters
-                .ordering_last_ts_nanos
-                .store(unix_nanos(ts), Ordering::Relaxed);
-        }
-        counters
+    /// Counters for an archiving task. A PV's counters are kept for
+    /// the life of the process: a resumed task continues the ordering
+    /// high-water, so the current value CA and PVA redeliver on
+    /// connect, whose timestamp the previous task already stored, is
+    /// dropped rather than stored a second time. The first task for a
+    /// PV in this process is seeded from the registry's committed
+    /// `last_timestamp`, which the flush owner advances only for bytes
+    /// on disk. The store is not consulted: that would be a partition
+    /// tail read per PV and per tier on the restore path.
+    fn task_counters(&self, record: &PvRecord) -> Arc<PvCounters> {
+        self.counters
+            .entry(record.pv_name.clone())
+            .or_insert_with(|| {
+                let counters = PvCounters::default();
+                if let Some(ts) = record.last_timestamp {
+                    counters
+                        .ordering_last_ts_nanos
+                        .store(unix_nanos(ts), Ordering::Relaxed);
+                }
+                Arc::new(counters)
+            })
+            .clone()
     }
 
     /// Restore all active PVs from the registry (called on startup).
@@ -781,7 +782,7 @@ impl ChannelManager {
         let extras: Arc<ExtraFieldsCache> = Arc::new(DashMap::new());
         let field_tokens: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
         let update_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let counters = self.task_counters(record).await;
+        let counters = self.task_counters(record);
 
         // Hold update_lock around the whole insert+spawn block so a
         // concurrent update_archive_fields can't observe the empty
@@ -890,7 +891,7 @@ impl ChannelManager {
         let extras: Arc<ExtraFieldsCache> = Arc::new(DashMap::new());
         let field_tokens: Arc<DashMap<String, CancellationToken>> = Arc::new(DashMap::new());
         let update_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let counters = self.task_counters(record).await;
+        let counters = self.task_counters(record);
 
         self.channels.insert(
             pv_name.clone(),
@@ -1155,6 +1156,9 @@ impl ChannelManager {
                 metrics::gauge!("archiver_extra_field_tasks").decrement(extra_count);
             }
         }
+        // The next task under this name is a new PV: its high-water
+        // and statistics must not carry over.
+        self.counters.remove(pv_name);
         self.registry.remove_pv(pv_name)?;
         // Don't remove the op_locks entry here: a concurrent caller may have
         // already taken a clone of this Arc and be queued on it; removing

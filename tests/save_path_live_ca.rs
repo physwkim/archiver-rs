@@ -262,8 +262,9 @@ async fn wait_on_disk(s: &Stack, t0: SystemTime, want: &[f64]) -> Vec<Vec<f64>> 
 
 /// Pause and resume start a new archiving task, and the connect-time
 /// event redelivers the current value with the timestamp already on
-/// disk. The new task's ordering gate is seeded from the store, so the
-/// redelivery is dropped instead of stored a second time.
+/// disk. The PV's counters, and with them the ordering gate, outlive
+/// the task, so the redelivery is dropped instead of stored a second
+/// time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_does_not_re_store_the_current_value() {
     let s = Stack::start().await;
@@ -275,11 +276,12 @@ async fn resume_does_not_re_store_the_current_value() {
         .expect("caput");
     wait_on_disk(&s, t0, &first).await;
 
+    let before = counters(&s.mgr, PV).events_received;
     s.mgr.pause_pv(PV).await.unwrap();
     s.mgr.resume_pv(PV).await.unwrap();
     // The resumed task receives the connect-time redelivery of `first`.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while counters(&s.mgr, PV).events_received == 0 {
+    while counters(&s.mgr, PV).events_received == before {
         assert!(
             tokio::time::Instant::now() < deadline,
             "resumed monitor never delivered"
@@ -302,6 +304,92 @@ async fn resume_does_not_re_store_the_current_value() {
     assert_eq!(c.storage_write_errors, 0, "{c:?}");
 
     s.mgr.stop_pv(PV).await.unwrap();
+    s.finish().await;
+}
+
+/// A restart runs the PV's first task of a new process, whose ordering
+/// gate is seeded from the registry's committed `last_timestamp`. The
+/// connect-time redelivery of the value already on disk is dropped,
+/// not stored again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_does_not_re_store_the_committed_value() {
+    let s = Stack::start().await;
+    let t0 = SystemTime::now();
+    s.archive().await;
+    let first = vec![1.0, 2.0, 3.0];
+    s.ch.put(&EpicsValue::DoubleArray(first.clone()))
+        .await
+        .expect("caput");
+    wait_on_disk(&s, t0, &first).await;
+    // The flush owner commits `last_timestamp` on its next flush.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rec = s.registry.get_pv(PV).unwrap().expect("registry row");
+        if rec.last_timestamp.is_some_and(|t| t >= t0) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "last_timestamp never committed: {rec:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Restart: the first manager's producers stop, and a second
+    // manager with its own write pool restores from the same registry
+    // and store.
+    tokio::time::timeout(Duration::from_secs(10), s.mgr.shutdown())
+        .await
+        .expect("producers stop");
+    let (mgr2, rx2) = ChannelManager::new(s.storage.clone(), s.registry.clone(), None)
+        .await
+        .unwrap();
+    let (pool2_shutdown, shutdown_rx2) = tokio::sync::watch::channel(false);
+    let pool2 = tokio::spawn(run_sharded_write_pool(
+        s.storage.clone(),
+        s.registry.clone(),
+        rx2,
+        shutdown_rx2,
+        ShardedWritePoolConfig {
+            shards: 1,
+            per_shard_buffer: 1024,
+            write_loop: WriteLoopConfig {
+                flush_period: Duration::from_millis(300),
+                ..Default::default()
+            },
+        },
+    ));
+    assert_eq!(mgr2.restore_from_registry().await.unwrap(), 1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while counters(&mgr2, PV).events_received == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "restored monitor never delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let second = vec![4.0, 5.0, 6.0];
+    s.ch.put(&EpicsValue::DoubleArray(second.clone()))
+        .await
+        .expect("caput");
+    let got = wait_on_disk(&s, t0, &second).await;
+    let copies = got.iter().filter(|g| **g == first).count();
+    assert_eq!(
+        copies, 1,
+        "the redelivered committed value was stored again: {got:?}"
+    );
+    let c = counters(&mgr2, PV);
+    assert_eq!(c.timestamp_drops, 1, "{c:?}");
+    assert_eq!(c.events_stored, 1, "{c:?}");
+    assert_eq!(c.storage_write_errors, 0, "{c:?}");
+
+    mgr2.stop_pv(PV).await.unwrap();
+    pool2_shutdown.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), pool2)
+        .await
+        .expect("second write pool exits on shutdown")
+        .unwrap();
     s.finish().await;
 }
 
