@@ -147,11 +147,10 @@ impl Stack {
         )));
     }
 
-    /// Start archiving `PV` and wait for the connect-time event, which
-    /// proves the monitor subscription is active. A put that lands
-    /// while the subscription is still being set up can be reported by
-    /// the in-process server as the new value under the previous
-    /// timestamp, followed by the properly stamped event.
+    /// Start archiving `PV` and wait for the connect-time event, so the
+    /// seed value is the first sample stored and the puts that follow
+    /// are ordered after it. A put that lands before the subscription's
+    /// initial snapshot would be the connect-time event instead.
     async fn archive(&self) {
         self.mgr
             .archive_pv(PV, &SampleMode::Monitor, Protocol::Ca)
