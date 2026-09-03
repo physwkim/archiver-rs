@@ -1861,10 +1861,15 @@ async fn monitor_loop_pva(
                     }
                 }
             };
-            // Not raced against cancellation: dropping this future
-            // mid-subscribe could leave the server-side monitor running
-            // with no handle to stop it. The client timeout bounds it.
-            let handle = match pva_client.pvmonitor_handle(&pv_name, cb, on_conn).await {
+            // Safe to drop mid-call: its only await is the channel
+            // lookup. The subscription task, and with it the server-side
+            // monitor, is spawned synchronously right before the handle
+            // is returned, so a cancelled call has no monitor to leak.
+            let subscribed = tokio::select! {
+                _ = cancel_token.cancelled() => return,
+                r = pva_client.pvmonitor_handle(&pv_name, cb, on_conn) => r,
+            };
+            let handle = match subscribed {
                 Ok(h) => h,
                 Err(e) => {
                     counters
