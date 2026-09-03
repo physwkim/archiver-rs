@@ -130,9 +130,13 @@ pub struct EngineConfig {
     /// shard channel — when a shard is saturated its overflow is
     /// dropped and recorded on the per-PV `buffer_overflow_drops`
     /// counter, while OTHER shards keep flowing (per-shard
-    /// isolation).
-    #[serde(default = "default_per_shard_buffer")]
-    pub per_shard_buffer: usize,
+    /// isolation). Unset (the default) sizes every shard to the main
+    /// sample channel's capacity divided by `write_shards`, so the
+    /// shard layer as a whole holds as many samples as the
+    /// single-worker layout before it starts dropping; set a value
+    /// to override that.
+    #[serde(default)]
+    pub per_shard_buffer: Option<usize>,
 }
 
 fn default_write_period() -> u64 {
@@ -145,10 +149,6 @@ fn default_server_ioc_drift_secs() -> u64 {
 
 fn default_write_shards() -> usize {
     1
-}
-
-fn default_per_shard_buffer() -> usize {
-    4096
 }
 
 impl Default for EngineConfig {
@@ -165,7 +165,7 @@ impl Default for EngineConfig {
             policy_file: None,
             server_ioc_drift_secs: default_server_ioc_drift_secs(),
             write_shards: default_write_shards(),
-            per_shard_buffer: default_per_shard_buffer(),
+            per_shard_buffer: None,
         }
     }
 }
@@ -347,7 +347,7 @@ impl ArchiverConfig {
                 "engine.write_shards must be > 0 (use 1 for the legacy single-worker layout)"
             );
         }
-        if self.engine.per_shard_buffer == 0 && self.engine.write_shards > 1 {
+        if self.engine.per_shard_buffer == Some(0) && self.engine.write_shards > 1 {
             anyhow::bail!(
                 "engine.per_shard_buffer must be > 0 when write_shards > 1; \
                  a 0-capacity shard channel would drop every sample"
@@ -427,6 +427,36 @@ partition_granularity = "year"
 "#;
         let config = ArchiverConfig::from_toml(toml).unwrap();
         assert!(config.cluster.is_none());
+    }
+
+    #[test]
+    fn per_shard_buffer_defaults_to_auto_and_rejects_zero_with_shards() {
+        let base = r#"
+[storage.sts]
+root_folder = "/tmp/sts"
+partition_granularity = "hour"
+
+[storage.mts]
+root_folder = "/tmp/mts"
+partition_granularity = "day"
+
+[storage.lts]
+root_folder = "/tmp/lts"
+partition_granularity = "year"
+
+[engine]
+write_shards = 2
+"#;
+        let config = ArchiverConfig::from_toml(base).unwrap();
+        assert_eq!(config.engine.per_shard_buffer, None);
+        config.validate().unwrap();
+
+        let zero = format!("{base}per_shard_buffer = 0\n");
+        let err = ArchiverConfig::from_toml(&zero)
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("per_shard_buffer"), "{err}");
     }
 
     #[test]

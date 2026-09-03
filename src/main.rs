@@ -172,9 +172,13 @@ async fn main() -> anyhow::Result<()> {
     let write_storage = storage.clone();
     let write_registry = registry.clone();
     let write_shutdown = supervisor.shutdown_rx();
+    let shards = config.engine.write_shards.max(1);
     let pool_cfg = channel_manager::ShardedWritePoolConfig {
-        shards: config.engine.write_shards.max(1),
-        per_shard_buffer: config.engine.per_shard_buffer.max(1),
+        shards,
+        per_shard_buffer: config.engine.per_shard_buffer.map_or_else(
+            || channel_manager::auto_per_shard_buffer(shards),
+            |buffer| buffer.max(1),
+        ),
         write_loop: channel_manager::WriteLoopConfig {
             flush_period,
             ..Default::default()

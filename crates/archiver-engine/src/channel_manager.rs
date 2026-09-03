@@ -3171,6 +3171,8 @@ pub struct ShardedWritePoolConfig {
     /// the dispatcher; samples lost to a closed channel are recorded
     /// separately under `archiver_dispatcher_shard_closed_drops_total`
     /// (a distinct cause, kept out of `buffer_overflow_drops`).
+    /// Production sizes this with [`auto_per_shard_buffer`] unless
+    /// `engine.per_shard_buffer` is set.
     pub per_shard_buffer: usize,
     /// Per-worker config (timeouts, flush period). Cloned into
     /// each shard.
@@ -3181,9 +3183,31 @@ impl Default for ShardedWritePoolConfig {
     fn default() -> Self {
         Self {
             shards: 1,
-            per_shard_buffer: 4096,
+            per_shard_buffer: auto_per_shard_buffer(1),
             write_loop: WriteLoopConfig::default(),
         }
+    }
+}
+
+/// Default per-shard channel capacity for `shards` workers: the main
+/// sample channel's capacity split evenly. The dispatcher drains the
+/// main channel as fast as it can route, so the shard channels are
+/// the only buffer in the multi-shard layout; sizing them to the same
+/// total keeps the burst the engine absorbs before dropping
+/// independent of `shards`.
+pub fn auto_per_shard_buffer(shards: usize) -> usize {
+    (SAMPLE_CHANNEL_CAPACITY / shards.max(1)).max(1)
+}
+
+#[cfg(test)]
+mod shard_sizing_tests {
+    use super::*;
+
+    #[test]
+    fn auto_per_shard_buffer_keeps_the_aggregate_at_the_main_capacity() {
+        assert_eq!(auto_per_shard_buffer(1), SAMPLE_CHANNEL_CAPACITY);
+        assert_eq!(auto_per_shard_buffer(4) * 4, SAMPLE_CHANNEL_CAPACITY);
+        assert_eq!(auto_per_shard_buffer(0), SAMPLE_CHANNEL_CAPACITY);
     }
 }
 
@@ -3944,7 +3968,7 @@ pub async fn write_loop_with_config(
     let pool_cfg = ShardedWritePoolConfig {
         shards: 1,
         // unused on the 1-shard fast path (rx is forwarded directly)
-        per_shard_buffer: 4096,
+        per_shard_buffer: auto_per_shard_buffer(1),
         write_loop: cfg,
     };
     run_sharded_write_pool(storage, registry, rx, shutdown, pool_cfg).await;
