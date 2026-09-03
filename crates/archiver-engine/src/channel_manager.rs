@@ -2097,9 +2097,8 @@ async fn scan_loop_pva(
             Some(elem_count),
             Some(counters.clone()),
         );
-        if let Err(rejected) = send_with_backpressure(&tx, pv_sample).await {
+        if send_with_backpressure(&tx, pv_sample).await.is_err() {
             // Channel closed (write_loop down). Cooperative shutdown.
-            let _ = rejected;
             return;
         }
     }
@@ -2448,8 +2447,7 @@ async fn monitor_loop(
                                 Some(element_count),
                                 Some(counters.clone()),
                             );
-                            if let Err(pv_sample) = send_with_backpressure(&tx, pv_sample).await {
-                                let _ = pv_sample;
+                            if send_with_backpressure(&tx, pv_sample).await.is_err() {
                                 return; // Write loop shut down
                             }
                         }
@@ -2513,18 +2511,22 @@ fn unix_secs(t: SystemTime) -> i64 {
 async fn send_with_backpressure(
     tx: &mpsc::Sender<PvSample>,
     pv_sample: PvSample,
-) -> Result<(), PvSample> {
+) -> Result<(), WriteQueueClosed> {
     match tx.try_send(pv_sample) {
         Ok(()) => Ok(()),
         Err(tokio::sync::mpsc::error::TrySendError::Full(pv_sample)) => {
             metrics::counter!("archiver_write_channel_backpressure_stalls_total").increment(1);
             // Backpressure: await until the writer drains space. The
             // sample is delivered, not dropped — so no drop counter.
-            tx.send(pv_sample).await.map_err(|e| e.0)
+            tx.send(pv_sample).await.map_err(|_| WriteQueueClosed)
         }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(pv_sample)) => Err(pv_sample),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(WriteQueueClosed),
     }
 }
+
+/// The write pool is gone; the sample it refused is dropped with the
+/// producer, which has nothing left to deliver to.
+struct WriteQueueClosed;
 
 /// The newest PVA sample the write queue would not take. The PVA
 /// monitor callback runs on the pvAccess reactor task and cannot wait
